@@ -57,15 +57,17 @@ def main() -> int:
                 continue
             assert FAKE_CODE not in text, f"authorization code persisted at {path}"
 
+        tmux_env = bridge._env()
         tmux = subprocess.run(
             ["tmux", "list-windows", "-t", "agy-gen", "-F", "#{window_name}"],
             capture_output=True,
             text=True,
             check=True,
+            env=tmux_env,
         )
         assert "auth" in tmux.stdout.splitlines(), tmux.stdout
         print(json.dumps({"state": "PASS", "auth_url_projection": "PASS", "code_state_persistence_negative": "PASS"}))
-        subprocess.run(["tmux", "kill-session", "-t", "agy-gen"], check=False)
+        subprocess.run(["tmux", "kill-session", "-t", "agy-gen"], check=False, env=tmux_env)
     return 0
 
 
