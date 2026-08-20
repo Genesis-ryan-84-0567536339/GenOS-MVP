@@ -283,6 +283,7 @@ class NativeProvisioner:
 
         parent = target.parent
         temp = Path(tempfile.mkdtemp(prefix=f".{release.git_sha}.", dir=parent))
+        os.chmod(temp, 0o755)
         try:
             _safe_extract_tar(release.archive, temp)
             if not (temp / "src" / "genos" / "__init__.py").is_file():
@@ -396,6 +397,9 @@ class NativeProvisioner:
             "updated_at": utc_now(),
         }
         self.store.save_manifest(manifest)
+        gid = grp.getgrnam(CORE_GROUP).gr_gid
+        os.chown(self.store.manifest_path, 0, gid)
+        os.chmod(self.store.manifest_path, 0o640)
 
     def _load_resume_state(self) -> None:
         manifest = self.store.load_manifest()
@@ -473,6 +477,7 @@ def _safe_extract_tar(archive: Path, destination: Path) -> None:
             target = destination / member.name
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True, mode=0o755)
+                os.chmod(target, 0o755)
                 continue
             target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
             source = handle.extractfile(member)
@@ -520,7 +525,7 @@ def _http_json(url: str) -> dict[str, Any]:
 
 
 def _systemd_units() -> dict[str, str]:
-    common = """[Unit]\nAfter=network.target postgresql.service\nRequires=postgresql.service\n\n[Service]\nType=simple\nUser=genos\nGroup=genos\nWorkingDirectory=/var/lib/genos\nEnvironmentFile=/etc/genos/genos.env\nEnvironment=PYTHONPATH=/opt/genos/current/src\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nReadWritePaths=/var/lib/genos /var/log/genos\nProtectHome=true\n\n"""
+    common = """[Unit]\nAfter=network.target postgresql.service\nRequires=postgresql.service\n\n[Service]\nType=simple\nUser=genos\nGroup=genos\nWorkingDirectory=/var/lib/genos\nEnvironmentFile=/etc/genos/genos.env\nEnvironment=PYTHONPATH=/opt/genos/current/src\nEnvironment=PYTHONDONTWRITEBYTECODE=1\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nReadWritePaths=/var/lib/genos /var/log/genos\nProtectHome=true\n\n"""
     install = "\n[Install]\nWantedBy=multi-user.target\n"
     return {
         "genos-product-api.service": common
