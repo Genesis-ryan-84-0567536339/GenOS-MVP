@@ -1,0 +1,12 @@
+{
+  "schema_version": "1.0",
+  "status": "MVP_00_REPOSITORY_BOOTSTRAPPED",
+  "repository": "Genesis-ryan-84-0567536339/GenOS-MVP",
+  "visibility": "public",
+  "current_package": "MVP-00",
+  "next_package": "MVP-01",
+  "implementation_rule": "This public repository is the sole implementation authority for the GenOS MVP vertical slice. Do not maintain a parallel MVP implementation in the full-product repository.",
+  "ui_rule": "Mockup-first. Do not implement material MVP UI surfaces until the Owner approves the visual contract.",
+  "truth_rule": "No demo or fabricated current state. Unknown runtime facts remain UNKNOWN until directly observed.",
+  "contains_secrets": false
+}
