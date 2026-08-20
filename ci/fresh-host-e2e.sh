@@ -147,14 +147,19 @@ FIRST_BOOT_ID="$(ssh_guest 'cat /proc/sys/kernel/random/boot_id')"
 
 verify_guest() {
   ssh_guest "sudo systemctl is-active postgresql.service genos-product-api.service genos-runtime.service genos-worker.service genos-mission-control.service"
-  ssh_guest "python3 - <<'PY'
-import json, urllib.request
+  ssh_guest "sudo python3 - <<'PY'
+import json, urllib.error, urllib.request
 for role, port in [('product-api',17880),('runtime',17881),('mission-control',17882)]:
     with urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=5) as response:
         payload=json.load(response)
     assert response.status == 200, (role, response.status)
     assert payload['status'] == 'ok', payload
     assert payload['role'] == role, payload
+try:
+    urllib.request.urlopen('http://127.0.0.1:17882/', timeout=5)
+    raise AssertionError('Mission Control root unexpectedly returned success before MVP-08')
+except urllib.error.HTTPError as exc:
+    assert exc.code == 503, exc.code
 assert json.load(open('/var/lib/genos/worker/heartbeat.json', encoding='utf-8'))['status'] == 'ok'
 manifest=json.load(open('/var/lib/genos/manifest.json', encoding='utf-8'))
 assert manifest['state'] == 'READY_LOCAL_CORE', manifest
