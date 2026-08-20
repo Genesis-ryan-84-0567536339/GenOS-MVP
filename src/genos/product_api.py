@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any
 import json
 import os
 import re
 
 from . import __version__
+from .agent_auth import AgentAuthBridge, AgentAuthError
+from .agent_runtime import AgentNeedsAction, AgentRuntimeError, AgentRuntimeStore
+from .agent_secure_runtime import SecretAwareGeminiAdapter
 from .auth_service import (
     AuthConflict,
     AuthError,
@@ -24,6 +28,8 @@ from .secret_provider import LocalFileSecretProvider, SecretProviderError
 
 MAX_JSON_BODY = 64 * 1024
 _CREDENTIAL_ACTION = re.compile(r"^/api/v1/credentials/([0-9a-fA-F-]{36})/(rotate|test|disable)$")
+_AGENT_ID = "agy-gen"
+_AGENT_AUTH_BASE = f"/api/v1/agents/{_AGENT_ID}/auth"
 
 
 class ProductAPIApp:
@@ -32,10 +38,14 @@ class ProductAPIApp:
         auth: OwnerAuthService,
         credentials: CredentialService,
         store: PostgresProductStore,
+        agent_store: AgentRuntimeStore,
+        agent_auth: AgentAuthBridge,
     ) -> None:
         self.auth = auth
         self.credentials = credentials
         self.store = store
+        self.agent_store = agent_store
+        self.agent_auth = agent_auth
 
     @classmethod
     def from_system(cls) -> "ProductAPIApp":
@@ -43,7 +53,15 @@ class ProductAPIApp:
         store.ensure_schema()
         secret_root = os.environ.get("GENOS_SECRET_DIR", "/var/lib/genos/secrets")
         provider = LocalFileSecretProvider(secret_root)
-        return cls(OwnerAuthService(store), CredentialService(store, provider), store)
+        agent_root = Path(os.environ.get("GENOS_AGY_GEN_DIR", "/var/lib/genos/agents/agy-gen"))
+        agent_store = AgentRuntimeStore(agent_root)
+        return cls(
+            OwnerAuthService(store),
+            CredentialService(store, provider),
+            store,
+            agent_store,
+            AgentAuthBridge(agent_store),
+        )
 
 
 class ProductAPIHandler(BaseHTTPRequestHandler):
@@ -73,6 +91,10 @@ class ProductAPIHandler(BaseHTTPRequestHandler):
             if self.path == "/api/v1/credentials":
                 self.app.auth.authenticate(self._bearer_token())
                 self._json(200, {"credentials": self.app.credentials.list()})
+                return
+            if self.path == _AGENT_AUTH_BASE:
+                self.app.auth.authenticate(self._bearer_token())
+                self._json(200, {"auth": self.app.agent_auth.status()})
                 return
             self._json(404, {"error": "not_found"})
         except Exception as exc:  # mapped centrally; no raw body/header logging
@@ -115,6 +137,26 @@ class ProductAPIHandler(BaseHTTPRequestHandler):
                 )
                 self._json(201, {"credential": record})
                 return
+            if self.path == f"{_AGENT_AUTH_BASE}/start":
+                self.app.auth.authenticate(self._bearer_token())
+                body = self._read_optional_json()
+                projection = self.app.agent_auth.start(restart=bool(body.get("restart", False)))
+                self._json(200, {"auth": projection})
+                return
+            if self.path == f"{_AGENT_AUTH_BASE}/code":
+                self.app.auth.authenticate(self._bearer_token())
+                body = self._read_json()
+                # Authorization code is one-way ingress to tmux stdin. The
+                # response deliberately contains no echo/fingerprint of it.
+                result = self.app.agent_auth.submit_code(_required_text(body, "code"))
+                self._json(200, {"auth": result})
+                return
+            if self.path == f"{_AGENT_AUTH_BASE}/verify":
+                self.app.auth.authenticate(self._bearer_token())
+                self._reject_nonempty_body()
+                probe = SecretAwareGeminiAdapter(self.app.agent_store).activate_with_real_probe()
+                self._json(200, {"provider": probe.to_dict()})
+                return
             action = _CREDENTIAL_ACTION.match(self.path)
             if action:
                 self.app.auth.authenticate(self._bearer_token())
@@ -142,8 +184,8 @@ class ProductAPIHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: object) -> None:
         # Request paths are fixed/typed and never carry credentials. Headers and
-        # bodies are intentionally omitted so Bearer tokens/raw secrets cannot
-        # appear in service logs.
+        # bodies are intentionally omitted so Bearer tokens/raw secrets/auth
+        # codes cannot appear in service logs.
         message = fmt % args
         print(json.dumps({"event": "product_api_http", "message": message}, ensure_ascii=False), flush=True)
 
@@ -178,6 +220,12 @@ class ProductAPIHandler(BaseHTTPRequestHandler):
             raise AuthError("JSON object required")
         return payload
 
+    def _read_optional_json(self) -> dict[str, Any]:
+        raw_length = self.headers.get("Content-Length")
+        if raw_length in {None, "", "0"}:
+            return {}
+        return self._read_json()
+
     def _reject_nonempty_body(self) -> None:
         raw_length = self.headers.get("Content-Length")
         if raw_length and raw_length != "0":
@@ -206,10 +254,13 @@ class ProductAPIHandler(BaseHTTPRequestHandler):
         if isinstance(exc, CredentialNotFound):
             self._json(404, {"error": "credential_not_found"})
             return
-        if isinstance(exc, (AuthError, CredentialError, ValueError)):
+        if isinstance(exc, AgentNeedsAction):
+            self._json(409, {"error": "agent_needs_action"})
+            return
+        if isinstance(exc, (AuthError, CredentialError, AgentAuthError, ValueError)):
             self._json(400, {"error": "invalid_request"})
             return
-        if isinstance(exc, (ProductStoreError, SecretProviderError)):
+        if isinstance(exc, (ProductStoreError, SecretProviderError, AgentRuntimeError)):
             self._json(503, {"error": "backend_unavailable"})
             return
         # Do not echo exception details: they may contain operational data.

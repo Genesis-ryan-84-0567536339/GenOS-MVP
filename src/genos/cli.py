@@ -4,9 +4,16 @@ import argparse
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Any
 
 from . import __version__
+from .agent_auth import AgentAuthBridge, AgentAuthError
+from .agent_permissions import ensure_agent_runtime_ownership
+from .agent_runtime import AgentNeedsAction, AgentRuntimeError, AgentRuntimeStore, GeminiCliAdapter
+from .agent_secure_runtime import SecretAwareGeminiAdapter, SecureTmuxController
+from .agent_tool_links import ensure_system_links
+from .agent_tools import AgentToolError, AgentToolProvisioner
 from .install import InstallError, NativeProvisioner, ReleaseArtifact, build_native_install
 from .recon import collect_all
 from .redaction import redact
@@ -48,6 +55,36 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--json", action="store_true", dest="as_json")
     install.add_argument("--candidate-e2e", action="store_true", help=argparse.SUPPRESS)
 
+    agent = sub.add_parser("agent", help="Operate the single MVP Core Agent agy-gen through typed controls")
+    agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+    for name in ("status", "probe", "restart"):
+        item = agent_sub.add_parser(name)
+        item.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
+        item.add_argument("--json", action="store_true", dest="as_json")
+    activate = agent_sub.add_parser("activate")
+    activate.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
+    activate.add_argument("--credential-id", default=None, help="Optional SecretRef UUID granted to consumer agy-gen")
+    activate.add_argument("--json", action="store_true", dest="as_json")
+    provision = agent_sub.add_parser("provision")
+    provision.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
+    provision.add_argument("--json", action="store_true", dest="as_json")
+    task = agent_sub.add_parser("task")
+    task.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
+    task.add_argument("--prompt", required=True)
+    task.add_argument("--json", action="store_true", dest="as_json")
+
+    auth = agent_sub.add_parser("auth", help="Run Gemini interactive auth in the persistent agy-gen tmux session")
+    auth_sub = auth.add_subparsers(dest="auth_command", required=True)
+    for name in ("start", "status", "verify"):
+        item = auth_sub.add_parser(name)
+        item.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
+        item.add_argument("--json", action="store_true", dest="as_json")
+        if name == "start":
+            item.add_argument("--restart", action="store_true", help="Restart only the agy-gen auth window")
+    submit = auth_sub.add_parser("submit", help="Read one authorization code from stdin and send it to tmux")
+    submit.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
+    submit.add_argument("--json", action="store_true", dest="as_json")
+
     for name in sorted(_RESERVED_MUTATION_COMMANDS):
         sub.add_parser(name, help="Lifecycle surface reserved for later MVP packages")
     return parser
@@ -61,6 +98,8 @@ def main(argv: list[str] | None = None) -> int:
         return _recon(mode=args.command, as_json=args.as_json, cwd=args.cwd)
     if args.command == "install":
         return _install(args)
+    if args.command == "agent":
+        return _agent(args)
     return _not_implemented(args.command)
 
 
@@ -142,6 +181,100 @@ def _install(args: argparse.Namespace) -> int:
         return 4
 
 
+def _agent(args: argparse.Namespace) -> int:
+    store = AgentRuntimeStore(args.state_dir)
+    try:
+        if args.agent_command == "auth":
+            return _agent_auth(args, store)
+        if args.agent_command == "provision":
+            toolchain = AgentToolProvisioner().provision()
+            links = ensure_system_links()
+            probe = GeminiCliAdapter(store).probe_installation()
+            store.write_provider(probe)
+            ensure_agent_runtime_ownership(store.root)
+            payload = {
+                "agent_id": "agy-gen",
+                "state": "NEEDS_ACTION" if probe.state == "INSTALLED" else "DEGRADED",
+                "reason": "PROVIDER_AUTH_REQUIRED" if probe.state == "INSTALLED" else probe.evidence,
+                "toolchain": toolchain.to_dict(),
+                "system_links": links,
+                "provider_probe": probe.to_dict(),
+            }
+            _emit_agent(payload, as_json=args.as_json)
+            return 0 if toolchain.state == "READY" and probe.state == "INSTALLED" else 3
+        if args.agent_command == "status":
+            payload = store.status()
+            _emit_agent(payload, as_json=args.as_json)
+            runtime = payload.get("runtime") if isinstance(payload.get("runtime"), dict) else {}
+            return 0 if runtime.get("state") in {"READY", "BUSY", "NEEDS_ACTION", "DEGRADED"} else 3
+        if args.agent_command == "probe":
+            probe = GeminiCliAdapter(store).probe_installation()
+            store.write_provider(probe)
+            ensure_agent_runtime_ownership(store.root)
+            payload = probe.to_dict()
+            _emit_agent(payload, as_json=args.as_json)
+            return 0 if probe.state == "INSTALLED" else 3
+        if args.agent_command == "activate":
+            probe = SecretAwareGeminiAdapter(store, credential_id=args.credential_id).activate_with_real_probe()
+            ensure_agent_runtime_ownership(store.root)
+            payload = probe.to_dict()
+            _emit_agent(payload, as_json=args.as_json)
+            return 0 if probe.state == "ACTIVE" else 3
+        if args.agent_command == "restart":
+            provider = store.provider() or {}
+            if provider.get("state") != "ACTIVE":
+                raise AgentNeedsAction("provider must be ACTIVE before starting/restarting agy-gen runtime")
+            SecureTmuxController(store).restart_worker_session()
+            ensure_agent_runtime_ownership(store.root)
+            payload = {"agent_id": "agy-gen", "state": "RESTARTED", "tmux_state": "RUNNING"}
+            _emit_agent(payload, as_json=args.as_json)
+            return 0
+        if args.agent_command == "task":
+            task_id = store.queue_task(args.prompt)
+            ensure_agent_runtime_ownership(store.root)
+            payload = {"agent_id": "agy-gen", "task_id": task_id, "state": "QUEUED"}
+            _emit_agent(payload, as_json=args.as_json)
+            return 0
+    except (AgentRuntimeError, AgentToolError, AgentAuthError, PermissionError, OSError) as exc:
+        ensure_agent_runtime_ownership(store.root)
+        payload = {
+            "agent_id": "agy-gen",
+            "state": "NEEDS_ACTION" if isinstance(exc, AgentNeedsAction) else "FAILED",
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+        }
+        _emit_agent(redact(payload), as_json=args.as_json)
+        return 3 if isinstance(exc, AgentNeedsAction) else 4
+    raise SystemExit(2)
+
+
+def _agent_auth(args: argparse.Namespace, store: AgentRuntimeStore) -> int:
+    bridge = AgentAuthBridge(store)
+    if args.auth_command == "start":
+        payload = bridge.start(restart=bool(args.restart))
+        ensure_agent_runtime_ownership(store.root)
+        _emit_agent(payload, as_json=args.as_json)
+        return 0 if payload.get("state") in {"WAITING_BROWSER", "WAITING_CODE", "AUTHENTICATED", "STARTING"} else 3
+    if args.auth_command == "status":
+        payload = bridge.status()
+        _emit_agent(payload, as_json=args.as_json)
+        return 0 if payload.get("state") != "IDLE" else 3
+    if args.auth_command == "submit":
+        # Never accept auth codes on argv: process listings must not expose them.
+        code = sys.stdin.readline()
+        payload = bridge.submit_code(code)
+        ensure_agent_runtime_ownership(store.root)
+        _emit_agent(payload, as_json=args.as_json)
+        return 0
+    if args.auth_command == "verify":
+        probe = SecretAwareGeminiAdapter(store).activate_with_real_probe()
+        ensure_agent_runtime_ownership(store.root)
+        payload = probe.to_dict()
+        _emit_agent(payload, as_json=args.as_json)
+        return 0 if probe.state == "ACTIVE" else 3
+    raise SystemExit(2)
+
+
 def _not_implemented(command: str) -> int:
     payload = {
         "command": command,
@@ -150,6 +283,23 @@ def _not_implemented(command: str) -> int:
     }
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return 2
+
+
+def _emit_agent(payload: dict[str, Any], *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(redact(payload), ensure_ascii=False, sort_keys=True, indent=2))
+        return
+    state = payload.get("state")
+    if state is None and isinstance(payload.get("runtime"), dict):
+        state = payload["runtime"].get("state")
+    print("agent: agy-gen")
+    print(f"state: {state or 'UNKNOWN'}")
+    if payload.get("reason"):
+        print(f"reason: {payload['reason']}")
+    if payload.get("auth_url"):
+        print(f"auth_url: {payload['auth_url']}")
+    if payload.get("evidence"):
+        print(f"evidence: {payload['evidence']}")
 
 
 def _emit(payload: dict[str, Any], as_json: bool) -> None:

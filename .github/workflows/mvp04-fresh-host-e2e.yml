@@ -1,0 +1,79 @@
+name: MVP-04 Fresh Host Agy-gen Auth Tmux
+
+on:
+  pull_request:
+    paths:
+      - "src/genos/**"
+      - "ci/fresh-host-mvp04-e2e.sh"
+      - "ci/mvp04-agent-e2e.py"
+      - ".github/workflows/mvp04-fresh-host-e2e.yml"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu-2404-agy-gen-preauth:
+    name: ubuntu-24.04-agy-gen-preauth
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      MVP04_REQUIRE_PROVIDER: "0"
+    steps:
+      - name: Checkout exact reviewed head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Verify exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "tested_sha=$(git rev-parse HEAD)"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+          fi
+
+      - name: Install isolated VM tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            qemu-utils \
+            cloud-image-utils \
+            openssh-client \
+            curl
+
+      - name: Fresh-host agy-gen pre-auth tmux acceptance
+        shell: bash
+        run: bash ci/fresh-host-mvp04-e2e.sh
+
+      - name: Collect failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          WORK_DIR="${RUNNER_TEMP}/genos-mvp04-fresh-host-0"
+          echo "--- qemu serial tail ---"
+          tail -n 300 "$WORK_DIR/qemu-serial.log" 2>/dev/null || true
+          echo "--- provision output ---"
+          cat "$WORK_DIR/provision.json" 2>/dev/null || true
+          echo "--- post-reboot status ---"
+          cat "$WORK_DIR/status-after-reboot.json" 2>/dev/null || true
+
+      - name: Upload sanitized MVP-04 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mvp04-fresh-host-preauth-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            ${{ runner.temp }}/genos-mvp04-fresh-host-0/mvp04-fresh-host-evidence.json
+            ${{ runner.temp }}/genos-mvp04-fresh-host-0/install.json
+            ${{ runner.temp }}/genos-mvp04-fresh-host-0/provision.json
+            ${{ runner.temp }}/genos-mvp04-fresh-host-0/status-after-reboot.json
+          if-no-files-found: ignore
+          retention-days: 14

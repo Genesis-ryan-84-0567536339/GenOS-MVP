@@ -64,8 +64,6 @@ def serve_http(role: str, port: int) -> int:
     handler: type[BaseHTTPRequestHandler] = HealthHandler
     product_app = None
     if role == "product-api":
-        # Import only for the Product API role so runtime/mission-control health
-        # processes have no credential/database authority attached to them.
         from .product_api import ProductAPIApp, ProductAPIHandler
 
         product_app = ProductAPIApp.from_system()
@@ -101,6 +99,80 @@ def serve_http(role: str, port: int) -> int:
     return 0
 
 
+def _reconcile_core_agent(state_dir: Path, instance_id: str) -> dict[str, object]:
+    """One watchdog reconciliation tick for the single MVP Core Agent.
+
+    Once Gemini CLI is installed, the worker keeps the persistent `agy-gen:auth`
+    tmux window available under the unprivileged service identity. The Owner can
+    copy the projected OAuth URL outside the execution boundary and submit a
+    one-time code through the typed bridge. When Gemini reports authentication
+    success, the worker performs the direct target-model probe automatically.
+    Only a verified provider may start/restore the separate `runtime` window.
+    """
+    from .agent_auth import AgentAuthBridge
+    from .agent_runtime import AgentRuntimeError, AgentRuntimeStore, GeminiCliAdapter
+    from .agent_secure_runtime import SecretAwareGeminiAdapter, SecureTmuxController
+
+    store = AgentRuntimeStore(state_dir / "agents" / "agy-gen")
+    store.ensure_seed(instance_id=instance_id)
+    provider = store.provider()
+    if provider is None:
+        installed = GeminiCliAdapter(store).probe_installation()
+        store.write_provider(installed)
+        provider = installed.to_dict()
+
+    tmux = SecureTmuxController(store)
+    claim = store.status().get("claim")
+    auth_reason: str | None = None
+
+    if provider.get("state") == "INSTALLED":
+        try:
+            auth = AgentAuthBridge(store)
+            projection = auth.status()
+            if projection.get("state") == "IDLE":
+                projection = auth.start()
+            auth_state = str(projection.get("state") or "UNKNOWN")
+            auth_reason = f"AUTH_{auth_state}"
+            if auth_state == "AUTHENTICATED":
+                verified = SecretAwareGeminiAdapter(store).activate_with_real_probe()
+                provider = verified.to_dict()
+                auth_reason = str(provider.get("evidence") or "AUTH_MODEL_VERIFY_REQUIRED")
+        except AgentRuntimeError:
+            auth_reason = "AUTH_TERMINAL_START_FAILED"
+
+    if provider.get("state") != "ACTIVE":
+        store.write_runtime(
+            state="NEEDS_ACTION",
+            reason=auth_reason or str(provider.get("evidence") or "PROVIDER_NOT_ACTIVE"),
+            tmux_state="RUNNING" if tmux.has_session() else "STOPPED",
+            task_id=str(claim.get("task_id")) if isinstance(claim, dict) and claim.get("task_id") else None,
+        )
+    else:
+        try:
+            tmux.ensure_worker_session()
+            store.write_runtime(
+                state="BUSY" if claim else "READY",
+                reason="WORK_CLAIM_ACTIVE" if claim else "PROVIDER_AND_TMUX_ACTIVE",
+                tmux_state="RUNNING",
+                task_id=str(claim.get("task_id")) if isinstance(claim, dict) and claim.get("task_id") else None,
+            )
+        except AgentRuntimeError:
+            store.write_runtime(
+                state="DEGRADED",
+                reason="TMUX_WORKER_START_FAILED",
+                tmux_state="STOPPED",
+                task_id=str(claim.get("task_id")) if isinstance(claim, dict) and claim.get("task_id") else None,
+            )
+    status = store.status()
+    runtime = status.get("runtime") if isinstance(status.get("runtime"), dict) else {}
+    return {
+        "agent_id": "agy-gen",
+        "state": runtime.get("state", "UNKNOWN"),
+        "reason": runtime.get("reason", "UNKNOWN"),
+        "tmux_state": runtime.get("tmux_state", "UNKNOWN"),
+    }
+
+
 def run_worker(state_dir: Path, interval_seconds: float) -> int:
     heartbeat = state_dir / "worker" / "heartbeat.json"
     heartbeat.parent.mkdir(parents=True, exist_ok=True)
@@ -112,11 +184,22 @@ def run_worker(state_dir: Path, interval_seconds: float) -> int:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     while not stop_event.is_set():
+        instance_id = os.environ.get("GENOS_INSTANCE_ID") or "UNKNOWN"
+        try:
+            agent = _reconcile_core_agent(state_dir, instance_id)
+        except Exception as exc:
+            agent = {
+                "agent_id": "agy-gen",
+                "state": "DEGRADED",
+                "reason": f"RECONCILE_{type(exc).__name__}",
+                "tmux_state": "UNKNOWN",
+            }
         payload = {
             "status": "ok",
             "role": "worker",
             "version": __version__,
-            "instance_id": os.environ.get("GENOS_INSTANCE_ID") or "UNKNOWN",
+            "instance_id": instance_id,
+            "core_agent": agent,
             "observed_at": _utc_now(),
         }
         temp = heartbeat.with_suffix(".tmp")
