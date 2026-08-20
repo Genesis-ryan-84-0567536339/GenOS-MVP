@@ -78,6 +78,7 @@ class AgentToolProvisioner:
         tmux_bin = shutil.which("tmux")
         tmux_version = self._version([tmux_bin, "-V"]) if tmux_bin else None
         persisted = self._read_state()
+        gemini_meta = persisted.get("gemini_cli") if persisted and isinstance(persisted.get("gemini_cli"), dict) else {}
         ready = (
             node_version == f"v{NODE_VERSION}"
             and gemini_version == GEMINI_CLI_VERSION
@@ -90,7 +91,7 @@ class AgentToolProvisioner:
             tmux_version=tmux_version,
             node_bin=str(self.node_bin) if self.node_bin.is_file() else None,
             gemini_bin=str(self.gemini_bin) if self.gemini_bin.exists() else None,
-            npm_integrity=str(persisted.get("npm_integrity")) if persisted and persisted.get("npm_integrity") else None,
+            npm_integrity=str(gemini_meta.get("npm_integrity")) if gemini_meta.get("npm_integrity") else None,
             evidence="PINNED_TOOLCHAIN_VERIFIED" if ready else "TOOLCHAIN_INCOMPLETE",
         )
 
@@ -170,7 +171,8 @@ class AgentToolProvisioner:
         env = self._tool_env()
         if self.gemini_bin.exists() and self._version([str(self.gemini_bin), "--version"], env=env) == GEMINI_CLI_VERSION:
             persisted = self._read_state()
-            return str(persisted.get("npm_integrity") or "UNKNOWN") if persisted else "UNKNOWN"
+            gemini_meta = persisted.get("gemini_cli") if persisted and isinstance(persisted.get("gemini_cli"), dict) else {}
+            return str(gemini_meta.get("npm_integrity") or "UNKNOWN")
         try:
             genos_user = pwd.getpwnam("genos")
         except KeyError as exc:
