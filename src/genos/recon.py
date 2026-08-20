@@ -57,6 +57,8 @@ class ReadOnlyCommandRunner:
             return CommandResult(ObservationState.TIMEOUT)
         except PermissionError:
             return CommandResult(ObservationState.NO_PERMISSION)
+        except OSError:
+            return CommandResult(ObservationState.UNKNOWN)
         state = ObservationState.PASS if completed.returncode == 0 else ObservationState.WARN
         return CommandResult(
             state=state,
@@ -155,6 +157,9 @@ def _network_observation() -> Observation:
 
 
 def _ports_observation() -> Observation:
+    sources = [Path("/proc/net/tcp"), Path("/proc/net/tcp6")]
+    if not any(path.exists() for path in sources):
+        return Observation("ports", ObservationState.NOT_FOUND, observed={}, source="/proc/net/tcp*")
     try:
         listeners = sorted(_proc_listening_ports())
         return Observation("ports", ObservationState.PASS, observed={"tcp_listen_ports": listeners}, source="/proc/net/tcp*")
