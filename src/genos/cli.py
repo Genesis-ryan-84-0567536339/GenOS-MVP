@@ -4,9 +4,11 @@ import argparse
 import json
 import os
 from pathlib import Path
+import sys
 from typing import Any
 
 from . import __version__
+from .agent_auth import AgentAuthBridge, AgentAuthError
 from .agent_permissions import ensure_agent_runtime_ownership
 from .agent_runtime import AgentNeedsAction, AgentRuntimeError, AgentRuntimeStore, GeminiCliAdapter
 from .agent_secure_runtime import SecretAwareGeminiAdapter, SecureTmuxController
@@ -70,6 +72,18 @@ def build_parser() -> argparse.ArgumentParser:
     task.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
     task.add_argument("--prompt", required=True)
     task.add_argument("--json", action="store_true", dest="as_json")
+
+    auth = agent_sub.add_parser("auth", help="Run Gemini interactive auth in the persistent agy-gen tmux session")
+    auth_sub = auth.add_subparsers(dest="auth_command", required=True)
+    for name in ("start", "status", "verify"):
+        item = auth_sub.add_parser(name)
+        item.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
+        item.add_argument("--json", action="store_true", dest="as_json")
+        if name == "start":
+            item.add_argument("--restart", action="store_true", help="Restart only the agy-gen auth window")
+    submit = auth_sub.add_parser("submit", help="Read one authorization code from stdin and send it to tmux")
+    submit.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
+    submit.add_argument("--json", action="store_true", dest="as_json")
 
     for name in sorted(_RESERVED_MUTATION_COMMANDS):
         sub.add_parser(name, help="Lifecycle surface reserved for later MVP packages")
@@ -170,6 +184,8 @@ def _install(args: argparse.Namespace) -> int:
 def _agent(args: argparse.Namespace) -> int:
     store = AgentRuntimeStore(args.state_dir)
     try:
+        if args.agent_command == "auth":
+            return _agent_auth(args, store)
         if args.agent_command == "provision":
             toolchain = AgentToolProvisioner().provision()
             links = ensure_system_links()
@@ -207,7 +223,7 @@ def _agent(args: argparse.Namespace) -> int:
         if args.agent_command == "restart":
             provider = store.provider() or {}
             if provider.get("state") != "ACTIVE":
-                raise AgentNeedsAction("provider must be ACTIVE before starting/restarting agy-gen tmux")
+                raise AgentNeedsAction("provider must be ACTIVE before starting/restarting agy-gen runtime")
             SecureTmuxController(store).restart_worker_session()
             ensure_agent_runtime_ownership(store.root)
             payload = {"agent_id": "agy-gen", "state": "RESTARTED", "tmux_state": "RUNNING"}
@@ -219,7 +235,7 @@ def _agent(args: argparse.Namespace) -> int:
             payload = {"agent_id": "agy-gen", "task_id": task_id, "state": "QUEUED"}
             _emit_agent(payload, as_json=args.as_json)
             return 0
-    except (AgentRuntimeError, AgentToolError, PermissionError, OSError) as exc:
+    except (AgentRuntimeError, AgentToolError, AgentAuthError, PermissionError, OSError) as exc:
         ensure_agent_runtime_ownership(store.root)
         payload = {
             "agent_id": "agy-gen",
@@ -229,6 +245,33 @@ def _agent(args: argparse.Namespace) -> int:
         }
         _emit_agent(redact(payload), as_json=args.as_json)
         return 3 if isinstance(exc, AgentNeedsAction) else 4
+    raise SystemExit(2)
+
+
+def _agent_auth(args: argparse.Namespace, store: AgentRuntimeStore) -> int:
+    bridge = AgentAuthBridge(store)
+    if args.auth_command == "start":
+        payload = bridge.start(restart=bool(args.restart))
+        ensure_agent_runtime_ownership(store.root)
+        _emit_agent(payload, as_json=args.as_json)
+        return 0 if payload.get("state") in {"WAITING_BROWSER", "WAITING_CODE", "AUTHENTICATED", "STARTING"} else 3
+    if args.auth_command == "status":
+        payload = bridge.status()
+        _emit_agent(payload, as_json=args.as_json)
+        return 0 if payload.get("state") != "IDLE" else 3
+    if args.auth_command == "submit":
+        # Never accept auth codes on argv: process listings must not expose them.
+        code = sys.stdin.readline()
+        payload = bridge.submit_code(code)
+        ensure_agent_runtime_ownership(store.root)
+        _emit_agent(payload, as_json=args.as_json)
+        return 0
+    if args.auth_command == "verify":
+        probe = SecretAwareGeminiAdapter(store).activate_with_real_probe()
+        ensure_agent_runtime_ownership(store.root)
+        payload = probe.to_dict()
+        _emit_agent(payload, as_json=args.as_json)
+        return 0 if probe.state == "ACTIVE" else 3
     raise SystemExit(2)
 
 
@@ -253,6 +296,8 @@ def _emit_agent(payload: dict[str, Any], *, as_json: bool) -> None:
     print(f"state: {state or 'UNKNOWN'}")
     if payload.get("reason"):
         print(f"reason: {payload['reason']}")
+    if payload.get("auth_url"):
+        print(f"auth_url: {payload['auth_url']}")
     if payload.get("evidence"):
         print(f"evidence: {payload['evidence']}")
 
