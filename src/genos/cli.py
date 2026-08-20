@@ -14,6 +14,8 @@ from .agent_runtime import (
     GeminiCliAdapter,
     TmuxController,
 )
+from .agent_tool_links import ensure_system_links
+from .agent_tools import AgentToolError, AgentToolProvisioner
 from .install import InstallError, NativeProvisioner, ReleaseArtifact, build_native_install
 from .recon import collect_all
 from .redaction import redact
@@ -61,6 +63,9 @@ def build_parser() -> argparse.ArgumentParser:
         item = agent_sub.add_parser(name)
         item.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
         item.add_argument("--json", action="store_true", dest="as_json")
+    provision = agent_sub.add_parser("provision")
+    provision.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
+    provision.add_argument("--json", action="store_true", dest="as_json")
     task = agent_sub.add_parser("task")
     task.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
     task.add_argument("--prompt", required=True)
@@ -165,6 +170,21 @@ def _install(args: argparse.Namespace) -> int:
 def _agent(args: argparse.Namespace) -> int:
     store = AgentRuntimeStore(args.state_dir)
     try:
+        if args.agent_command == "provision":
+            toolchain = AgentToolProvisioner().provision()
+            links = ensure_system_links()
+            probe = GeminiCliAdapter(store).probe_installation()
+            store.write_provider(probe)
+            payload = {
+                "agent_id": "agy-gen",
+                "state": "NEEDS_ACTION" if probe.state == "INSTALLED" else "DEGRADED",
+                "reason": "PROVIDER_AUTH_REQUIRED" if probe.state == "INSTALLED" else probe.evidence,
+                "toolchain": toolchain.to_dict(),
+                "system_links": links,
+                "provider_probe": probe.to_dict(),
+            }
+            _emit_agent(payload, as_json=args.as_json)
+            return 0 if toolchain.state == "READY" and probe.state == "INSTALLED" else 3
         if args.agent_command == "status":
             payload = store.status()
             _emit_agent(payload, as_json=args.as_json)
@@ -194,7 +214,7 @@ def _agent(args: argparse.Namespace) -> int:
             payload = {"agent_id": "agy-gen", "task_id": task_id, "state": "QUEUED"}
             _emit_agent(payload, as_json=args.as_json)
             return 0
-    except (AgentRuntimeError, PermissionError, OSError) as exc:
+    except (AgentRuntimeError, AgentToolError, PermissionError, OSError) as exc:
         payload = {
             "agent_id": "agy-gen",
             "state": "NEEDS_ACTION" if isinstance(exc, AgentNeedsAction) else "FAILED",
@@ -223,8 +243,10 @@ def _emit_agent(payload: dict[str, Any], *, as_json: bool) -> None:
     state = payload.get("state")
     if state is None and isinstance(payload.get("runtime"), dict):
         state = payload["runtime"].get("state")
-    print(f"agent: agy-gen")
+    print("agent: agy-gen")
     print(f"state: {state or 'UNKNOWN'}")
+    if payload.get("reason"):
+        print(f"reason: {payload['reason']}")
     if payload.get("evidence"):
         print(f"evidence: {payload['evidence']}")
 
