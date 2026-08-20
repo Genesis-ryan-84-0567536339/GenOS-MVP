@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
 import os
 from pathlib import Path
 import shlex
@@ -11,6 +10,7 @@ import subprocess
 import time
 from typing import Any
 
+from .agent_auth import RUNTIME_WINDOW
 from .agent_runtime import (
     AgentRuntimeError,
     AgentRuntimeStore,
@@ -103,11 +103,12 @@ class SecretAwareGeminiAdapter(GeminiCliAdapter):
     def activate_with_real_probe(self, *, timeout: float = 90.0) -> BoundProviderProbe:
         # Parent implementation performs the direct marker round-trip. _env()
         # below injects raw API material only into the child process when a
-        # SecretRef is explicitly bound. Raw material is never serialized.
+        # SecretRef is explicitly bound. OAuth uses Gemini's provider-owned
+        # cached credential under agy-gen HOME and needs no SecretRef.
         probe = super().activate_with_real_probe(timeout=timeout)
         bound = BoundProviderProbe.from_probe(
             probe,
-            self.credential_id if probe.state == "ACTIVE" else None,
+            self.credential_id if probe.state == "ACTIVE" and self.credential_id else None,
         )
         self.store.write_provider(bound)  # duck-typed safe public metadata
         return bound
@@ -121,17 +122,66 @@ class SecretAwareGeminiAdapter(GeminiCliAdapter):
 
 
 class SecureTmuxController(TmuxController):
+    """Owns the persistent `agy-gen` tmux session.
+
+    The session may contain an interactive `auth` window and a supervised
+    `runtime` window. Restarting runtime must never destroy an in-progress auth
+    flow or the session identity.
+    """
+
+    def has_runtime_window(self) -> bool:
+        if not self.binary:
+            return False
+        completed = subprocess.run(
+            [self.binary, "list-windows", "-t", CORE_AGENT_SESSION, "-F", "#{window_name}"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=5,
+            shell=False,
+            env=self._env(),
+        )
+        if completed.returncode != 0:
+            return False
+        return RUNTIME_WINDOW in {line.strip() for line in completed.stdout.splitlines()}
+
     def ensure_worker_session(self) -> bool:
         if not self.binary:
             raise AgentRuntimeError("tmux is not installed")
-        if self.has_session():
+        if self.has_runtime_window():
             return False
         python = shutil.which("python3") or "/usr/bin/python3"
         command = shlex.join(
             [python, "-m", "genos.agent_secure_runtime", "worker", "--state-dir", str(self.store.root)]
         )
+        if self.has_session():
+            argv = [
+                self.binary,
+                "new-window",
+                "-d",
+                "-t",
+                CORE_AGENT_SESSION,
+                "-n",
+                RUNTIME_WINDOW,
+                "-c",
+                str(self.store.workspace),
+                command,
+            ]
+        else:
+            argv = [
+                self.binary,
+                "new-session",
+                "-d",
+                "-s",
+                CORE_AGENT_SESSION,
+                "-n",
+                RUNTIME_WINDOW,
+                "-c",
+                str(self.store.workspace),
+                command,
+            ]
         completed = subprocess.run(
-            [self.binary, "new-session", "-d", "-s", CORE_AGENT_SESSION, "-c", str(self.store.workspace), command],
+            argv,
             capture_output=True,
             text=True,
             check=False,
@@ -140,8 +190,23 @@ class SecureTmuxController(TmuxController):
             env=self._env(),
         )
         if completed.returncode != 0:
-            raise AgentRuntimeError("tmux secure worker session could not be created")
+            raise AgentRuntimeError("tmux secure runtime window could not be created")
         return True
+
+    def restart_worker_session(self) -> None:
+        if not self.binary:
+            raise AgentRuntimeError("tmux is not installed")
+        if self.has_runtime_window():
+            subprocess.run(
+                [self.binary, "kill-window", "-t", f"{CORE_AGENT_SESSION}:{RUNTIME_WINDOW}"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=5,
+                shell=False,
+                env=self._env(),
+            )
+        self.ensure_worker_session()
 
 
 def worker_loop(store: AgentRuntimeStore, *, interval: float = 1.0) -> int:
