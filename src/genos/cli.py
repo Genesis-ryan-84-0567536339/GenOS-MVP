@@ -7,12 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
-from .agent_runtime import (
-    AgentNeedsAction,
-    AgentRuntimeError,
-    AgentRuntimeStore,
-    GeminiCliAdapter,
-)
+from .agent_permissions import ensure_agent_runtime_ownership
+from .agent_runtime import AgentNeedsAction, AgentRuntimeError, AgentRuntimeStore, GeminiCliAdapter
 from .agent_secure_runtime import SecretAwareGeminiAdapter, SecureTmuxController
 from .agent_tool_links import ensure_system_links
 from .agent_tools import AgentToolError, AgentToolProvisioner
@@ -179,6 +175,7 @@ def _agent(args: argparse.Namespace) -> int:
             links = ensure_system_links()
             probe = GeminiCliAdapter(store).probe_installation()
             store.write_provider(probe)
+            ensure_agent_runtime_ownership(store.root)
             payload = {
                 "agent_id": "agy-gen",
                 "state": "NEEDS_ACTION" if probe.state == "INSTALLED" else "DEGRADED",
@@ -197,11 +194,13 @@ def _agent(args: argparse.Namespace) -> int:
         if args.agent_command == "probe":
             probe = GeminiCliAdapter(store).probe_installation()
             store.write_provider(probe)
+            ensure_agent_runtime_ownership(store.root)
             payload = probe.to_dict()
             _emit_agent(payload, as_json=args.as_json)
             return 0 if probe.state == "INSTALLED" else 3
         if args.agent_command == "activate":
             probe = SecretAwareGeminiAdapter(store, credential_id=args.credential_id).activate_with_real_probe()
+            ensure_agent_runtime_ownership(store.root)
             payload = probe.to_dict()
             _emit_agent(payload, as_json=args.as_json)
             return 0 if probe.state == "ACTIVE" else 3
@@ -210,15 +209,18 @@ def _agent(args: argparse.Namespace) -> int:
             if provider.get("state") != "ACTIVE":
                 raise AgentNeedsAction("provider must be ACTIVE before starting/restarting agy-gen tmux")
             SecureTmuxController(store).restart_worker_session()
+            ensure_agent_runtime_ownership(store.root)
             payload = {"agent_id": "agy-gen", "state": "RESTARTED", "tmux_state": "RUNNING"}
             _emit_agent(payload, as_json=args.as_json)
             return 0
         if args.agent_command == "task":
             task_id = store.queue_task(args.prompt)
+            ensure_agent_runtime_ownership(store.root)
             payload = {"agent_id": "agy-gen", "task_id": task_id, "state": "QUEUED"}
             _emit_agent(payload, as_json=args.as_json)
             return 0
     except (AgentRuntimeError, AgentToolError, PermissionError, OSError) as exc:
+        ensure_agent_runtime_ownership(store.root)
         payload = {
             "agent_id": "agy-gen",
             "state": "NEEDS_ACTION" if isinstance(exc, AgentNeedsAction) else "FAILED",
