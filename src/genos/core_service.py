@@ -64,8 +64,6 @@ def serve_http(role: str, port: int) -> int:
     handler: type[BaseHTTPRequestHandler] = HealthHandler
     product_app = None
     if role == "product-api":
-        # Import only for the Product API role so runtime/mission-control health
-        # processes have no credential/database authority attached to them.
         from .product_api import ProductAPIApp, ProductAPIHandler
 
         product_app = ProductAPIApp.from_system()
@@ -104,12 +102,12 @@ def serve_http(role: str, port: int) -> int:
 def _reconcile_core_agent(state_dir: Path, instance_id: str) -> dict[str, object]:
     """One watchdog reconciliation tick for the single MVP Core Agent.
 
-    This intentionally does not perform a provider auth/model request. External
-    auth activation is an explicit Owner action; the background worker only
-    preserves identity, observes installed/provider state, and restores tmux
-    after provider activation has already been verified.
+    External provider activation remains an explicit Owner action. The worker
+    only preserves identity, observes provider state, and restores the secure
+    tmux worker after ACTIVE evidence already exists.
     """
-    from .agent_runtime import AgentRuntimeError, AgentRuntimeStore, GeminiCliAdapter, TmuxController
+    from .agent_runtime import AgentRuntimeError, AgentRuntimeStore, GeminiCliAdapter
+    from .agent_secure_runtime import SecureTmuxController
 
     store = AgentRuntimeStore(state_dir / "agents" / "agy-gen")
     store.ensure_seed(instance_id=instance_id)
@@ -119,7 +117,7 @@ def _reconcile_core_agent(state_dir: Path, instance_id: str) -> dict[str, object
         store.write_provider(installed)
         provider = installed.to_dict()
 
-    tmux = TmuxController(store)
+    tmux = SecureTmuxController(store)
     claim = store.status().get("claim")
     if provider.get("state") != "ACTIVE":
         store.write_runtime(
@@ -168,7 +166,7 @@ def run_worker(state_dir: Path, interval_seconds: float) -> int:
         instance_id = os.environ.get("GENOS_INSTANCE_ID") or "UNKNOWN"
         try:
             agent = _reconcile_core_agent(state_dir, instance_id)
-        except Exception as exc:  # watchdog must not take down the core worker
+        except Exception as exc:
             agent = {
                 "agent_id": "agy-gen",
                 "state": "DEGRADED",
