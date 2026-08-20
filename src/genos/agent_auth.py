@@ -263,6 +263,10 @@ class AgentAuthBridge:
     def _env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["HOME"] = str(self.store.root)
+        # Keep the service account non-login at the OS boundary. tmux still
+        # needs a valid shell to execute its typed window command, so pin only
+        # the tmux process environment to a non-interactive system shell.
+        env["SHELL"] = "/bin/sh"
         # systemd services use PrivateTmp for sandboxing. Pin tmux's socket root
         # to durable Agent state so worker/API/CLI attach to one shared session
         # instead of process-private /tmp namespaces.
