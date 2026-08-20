@@ -43,7 +43,7 @@ class JsonStateStore:
         if not self.manifest_path.exists():
             return None
         with self.manifest_path.open("r", encoding="utf-8") as handle:
-            return json.load(handle)
+            return redact(json.load(handle))
 
     def _atomic_write(self, path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
