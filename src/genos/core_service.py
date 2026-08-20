@@ -8,7 +8,7 @@ import os
 from pathlib import Path
 import signal
 import sys
-import time
+import threading
 
 from . import __version__
 
@@ -63,36 +63,47 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 def serve_http(role: str, port: int) -> int:
     server = ThreadingHTTPServer(("127.0.0.1", port), HealthHandler)
+    server.daemon_threads = True
     server.genos_role = role  # type: ignore[attr-defined]
-    stop = False
+    stop_event = threading.Event()
 
     def _stop(_signum: int, _frame: object) -> None:
-        nonlocal stop
-        stop = True
-        server.shutdown()
+        stop_event.set()
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     print(json.dumps({"event": "service_start", "role": role, "port": port, "observed_at": _utc_now()}), flush=True)
+
+    server_thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.25},
+        name=f"genos-{role}-http",
+        daemon=True,
+    )
+    server_thread.start()
     try:
-        server.serve_forever(poll_interval=0.5)
+        stop_event.wait()
     finally:
+        # shutdown() is intentionally called from the main thread while
+        # serve_forever() is running in a separate thread; BaseServer warns
+        # that calling shutdown() from the serving thread can deadlock.
+        server.shutdown()
         server.server_close()
-    return 0 if stop else 0
+        server_thread.join(timeout=5)
+    return 0
 
 
 def run_worker(state_dir: Path, interval_seconds: float) -> int:
     heartbeat = state_dir / "worker" / "heartbeat.json"
     heartbeat.parent.mkdir(parents=True, exist_ok=True)
-    stop = False
+    stop_event = threading.Event()
 
     def _stop(_signum: int, _frame: object) -> None:
-        nonlocal stop
-        stop = True
+        stop_event.set()
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-    while not stop:
+    while not stop_event.is_set():
         payload = {
             "status": "ok",
             "role": "worker",
@@ -103,7 +114,7 @@ def run_worker(state_dir: Path, interval_seconds: float) -> int:
         temp = heartbeat.with_suffix(".tmp")
         temp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
         os.replace(temp, heartbeat)
-        time.sleep(interval_seconds)
+        stop_event.wait(interval_seconds)
     return 0
 
 
