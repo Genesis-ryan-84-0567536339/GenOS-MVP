@@ -48,7 +48,6 @@ class HealthHandler(BaseHTTPRequestHandler):
         self._json(404, {"status": "not_found"})
 
     def log_message(self, fmt: str, *args: object) -> None:
-        # Keep systemd logs compact and structured without request headers/secrets.
         sys.stdout.write(json.dumps({"event": "http", "message": fmt % args}, ensure_ascii=False) + "\n")
         sys.stdout.flush()
 
@@ -62,9 +61,21 @@ class HealthHandler(BaseHTTPRequestHandler):
 
 
 def serve_http(role: str, port: int) -> int:
-    server = ThreadingHTTPServer(("127.0.0.1", port), HealthHandler)
+    handler: type[BaseHTTPRequestHandler] = HealthHandler
+    product_app = None
+    if role == "product-api":
+        # Import only for the Product API role so runtime/mission-control health
+        # processes have no credential/database authority attached to them.
+        from .product_api import ProductAPIApp, ProductAPIHandler
+
+        product_app = ProductAPIApp.from_system()
+        handler = ProductAPIHandler
+
+    server = ThreadingHTTPServer(("127.0.0.1", port), handler)
     server.daemon_threads = True
     server.genos_role = role  # type: ignore[attr-defined]
+    if product_app is not None:
+        server.genos_app = product_app  # type: ignore[attr-defined]
     stop_event = threading.Event()
 
     def _stop(_signum: int, _frame: object) -> None:
@@ -84,9 +95,6 @@ def serve_http(role: str, port: int) -> int:
     try:
         stop_event.wait()
     finally:
-        # shutdown() is intentionally called from the main thread while
-        # serve_forever() is running in a separate thread; BaseServer warns
-        # that calling shutdown() from the serving thread can deadlock.
         server.shutdown()
         server.server_close()
         server_thread.join(timeout=5)

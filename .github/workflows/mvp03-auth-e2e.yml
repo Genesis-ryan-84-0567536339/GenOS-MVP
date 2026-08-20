@@ -1,0 +1,77 @@
+name: MVP-03 Auth SecretRef E2E
+
+on:
+  pull_request:
+    paths:
+      - "src/genos/**"
+      - "tests/**"
+      - "ci/mvp03-auth-e2e.py"
+      - "ci/fresh-host-mvp03-e2e.sh"
+      - ".github/workflows/mvp03-auth-e2e.yml"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ubuntu-2404-auth-secretref:
+    name: ubuntu-24.04-auth-secretref
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout exact reviewed head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+
+      - name: Verify exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "tested_sha=$(git rev-parse HEAD)"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+          fi
+
+      - name: Install isolated VM tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 \
+            qemu-utils \
+            cloud-image-utils \
+            openssh-client \
+            curl
+
+      - name: Owner auth and SecretRef fresh-host acceptance
+        shell: bash
+        run: bash ci/fresh-host-mvp03-e2e.sh
+
+      - name: Collect failure diagnostics
+        if: failure()
+        shell: bash
+        run: |
+          set +e
+          WORK_DIR="${RUNNER_TEMP}/genos-mvp03-fresh-host"
+          echo "--- qemu serial tail ---"
+          tail -n 300 "$WORK_DIR/qemu-serial.log" 2>/dev/null || true
+          echo "--- install output ---"
+          cat "$WORK_DIR/install.json" 2>/dev/null || true
+          echo "--- rerun output ---"
+          cat "$WORK_DIR/rerun.json" 2>/dev/null || true
+
+      - name: Upload sanitized MVP-03 evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mvp03-auth-secretref-${{ github.event.pull_request.head.sha || github.sha }}
+          path: |
+            ${{ runner.temp }}/genos-mvp03-fresh-host/mvp03-fresh-host-evidence.json
+            ${{ runner.temp }}/genos-mvp03-fresh-host/install.json
+            ${{ runner.temp }}/genos-mvp03-fresh-host/rerun.json
+          if-no-files-found: ignore
+          retention-days: 14
