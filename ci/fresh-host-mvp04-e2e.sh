@@ -49,6 +49,28 @@ scp_guest() {
     -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$@"
 }
 
+dump_guest_auth_diagnostics() {
+  set +e
+  echo "--- MVP-04 guest worker heartbeat ---"
+  ssh_guest "sudo cat /var/lib/genos/worker/heartbeat.json" 2>&1 || true
+  echo "--- MVP-04 guest runtime projection ---"
+  ssh_guest "sudo cat /var/lib/genos/agents/agy-gen/runtime.json" 2>&1 || true
+  echo "--- MVP-04 guest provider projection ---"
+  ssh_guest "sudo cat /var/lib/genos/agents/agy-gen/provider.json" 2>&1 || true
+  echo "--- MVP-04 guest worker service status ---"
+  ssh_guest "sudo systemctl status genos-worker.service --no-pager -l" 2>&1 || true
+  echo "--- MVP-04 guest worker journal ---"
+  ssh_guest "sudo journalctl -u genos-worker.service --no-pager -n 120" 2>&1 || true
+  echo "--- MVP-04 typed auth status ---"
+  ssh_guest "sudo -u genos env PATH=$GUEST_TOOL_PATH PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 -m genos agent auth status --json" 2>&1 || true
+  echo "--- MVP-04 tmux durable namespace ---"
+  ssh_guest "sudo -u genos env TMUX_TMPDIR=$GUEST_TMUX_TMPDIR tmux list-sessions" 2>&1 || true
+  ssh_guest "sudo -u genos env TMUX_TMPDIR=$GUEST_TMUX_TMPDIR tmux list-windows -a -F '#{session_name}:#{window_name}:#{pane_dead}:#{pane_dead_status}:#{pane_current_command}'" 2>&1 || true
+  echo "--- MVP-04 service-identity tool visibility ---"
+  ssh_guest "sudo -u genos env PATH=$GUEST_TOOL_PATH sh -c 'command -v node; command -v gemini; command -v tmux; node --version; gemini --version; tmux -V'" 2>&1 || true
+  set -e
+}
+
 echo "==> Verify pinned Ubuntu 24.04 image"
 curl --fail --location --retry 3 --retry-delay 2 "$IMAGE_URL" -o "$BASE_IMAGE"
 echo "$IMAGE_SHA256  $BASE_IMAGE" | sha256sum -c -
@@ -163,7 +185,11 @@ else
     fi
     sleep 1
   done
-  [[ "$auth_ready" == "1" ]]
+  if [[ "$auth_ready" != "1" ]]; then
+    echo "MVP04_PREAUTH_TMUX_NOT_READY" >&2
+    dump_guest_auth_diagnostics
+    exit 1
+  fi
   ssh_guest "sudo -u genos env PATH=$GUEST_TOOL_PATH PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 - <<'PY'
 import json, subprocess
 p=subprocess.run(['python3','-m','genos','agent','status','--json'],capture_output=True,text=True,check=True,env={'PYTHONPATH':'/opt/genos/current/src','PATH':'/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin','HOME':'/var/lib/genos','LANG':'C.UTF-8'})
@@ -214,7 +240,11 @@ else
     fi
     sleep 1
   done
-  [[ "$auth_recovered" == "1" ]]
+  if [[ "$auth_recovered" != "1" ]]; then
+    echo "MVP04_PREAUTH_TMUX_NOT_RECOVERED_AFTER_REBOOT" >&2
+    dump_guest_auth_diagnostics
+    exit 1
+  fi
   ssh_guest "sudo -u genos env PATH=$GUEST_TOOL_PATH PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 -m genos agent status --json" > "$WORK_DIR/status-after-reboot.json"
   if ssh_guest "sudo -u genos env TMUX_TMPDIR=$GUEST_TMUX_TMPDIR tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx runtime"; then
     echo "pre-auth reboot unexpectedly created runtime window" >&2
