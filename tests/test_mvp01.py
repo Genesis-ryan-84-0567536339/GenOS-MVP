@@ -8,7 +8,7 @@ import tempfile
 import subprocess
 import sys
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 
 from genos.cli import main
 from genos.contracts import JobRun, Observation, ObservationState, RunState, SupportClass
@@ -143,13 +143,19 @@ class ReconTests(unittest.TestCase):
                 else:
                     os.environ["GENOS_STATE_DIR"] = old
 
-    def test_future_mutation_surface_remains_disabled(self) -> None:
-        buffer = io.StringIO()
-        with redirect_stdout(buffer):
-            code = main(["repair"])
-        payload = json.loads(buffer.getvalue())
-        self.assertEqual(code, 2)
-        self.assertEqual(payload["state"], "NOT_IMPLEMENTED_IN_CURRENT_PACKAGE")
+    def test_future_mutation_surfaces_other_than_repair_remain_disabled(self) -> None:
+        for command in ("update", "reconfigure", "backup", "restore", "support-bundle", "uninstall", "purge"):
+            buffer = io.StringIO()
+            with redirect_stdout(buffer):
+                code = main([command])
+            payload = json.loads(buffer.getvalue())
+            self.assertEqual(code, 2)
+            self.assertEqual(payload["state"], "NOT_IMPLEMENTED_IN_CURRENT_PACKAGE")
+
+    def test_repair_surface_now_requires_typed_action_and_target(self) -> None:
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            main(["repair"])
+        self.assertEqual(raised.exception.code, 2)
 
 
 if __name__ == "__main__":
