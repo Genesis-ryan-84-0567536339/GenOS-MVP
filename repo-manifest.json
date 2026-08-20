@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "status": "MVP_00_01_02_PASS_MVP_03_ACTIVE",
+  "status": "MVP_00_01_02_03_PASS_MVP_04_ACTIVE",
   "repository": "Genesis-ryan-84-0567536339/GenOS-MVP",
   "visibility": "public",
   "license": "Apache-2.0",
@@ -9,8 +9,10 @@
   "mvp_01_merge": "f1b17fb9c578376553f81665584b73b5200376ba",
   "mvp_02_status": "PASS",
   "mvp_02_merge": "113cc89a7b961167575bfc229d8d00cccd874b60",
-  "current_package": "MVP-03",
-  "next_package": "MVP-04",
+  "mvp_03_status": "PASS",
+  "mvp_03_merge": "12a622b94aee611b27036b5df8c2b3c24c17224b",
+  "current_package": "MVP-04",
+  "next_package": "MVP-05",
   "supported_platforms": [
     {
       "profile_id": "ubuntu-24.04-amd64-native",
@@ -31,5 +33,6 @@
   "ui_rule": "Mockup-first. Do not implement material MVP UI surfaces until the Owner approves the visual contract.",
   "truth_rule": "No demo or fabricated current state. Unknown runtime facts remain UNKNOWN until directly observed.",
   "secret_rule": "Raw credential values are one-way ingress into a local SecretProvider and must never be persisted in Product DB, Git, Drive, reports or logs.",
+  "mvp_04_gate": "Configured provider/model/tmux targets are not live truth until direct Gemini CLI auth/model probe and real task evidence pass.",
   "contains_secrets": false
 }
