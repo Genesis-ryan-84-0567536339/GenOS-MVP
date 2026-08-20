@@ -16,6 +16,7 @@ RELEASE="$WORK_DIR/genos-release.tar.gz"
 EVIDENCE="$WORK_DIR/mvp04-fresh-host-evidence.json"
 TESTED_SHA="$(git rev-parse HEAD)"
 REQUIRE_PROVIDER="${MVP04_REQUIRE_PROVIDER:-0}"
+GUEST_TOOL_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 mkdir -p "$WORK_DIR"
 chmod 700 "$WORK_DIR"
@@ -126,9 +127,9 @@ IDENTITY_BEFORE="$(ssh_guest "sudo python3 -c \"import json; print(json.load(ope
 
 echo "==> Provision pinned Node/Gemini/tmux toolchain"
 ssh_guest "sudo env PYTHONPATH=/opt/genos/current/src python3 -m genos agent provision --json" > "$WORK_DIR/provision.json"
-ssh_guest "node --version | grep -qx 'v24.19.0'"
-ssh_guest "gemini --version | grep -qx '0.53.0'"
-ssh_guest "tmux -V | grep -q '^tmux '"
+ssh_guest "env PATH=$GUEST_TOOL_PATH node --version | grep -qx 'v24.19.0'"
+ssh_guest "env PATH=$GUEST_TOOL_PATH gemini --version | grep -qx '0.53.0'"
+ssh_guest "env PATH=$GUEST_TOOL_PATH tmux -V | grep -q '^tmux '"
 ssh_guest "sudo python3 - <<'PY'
 import json
 p=json.load(open('/var/lib/genos/tools/agy-gen-toolchain.json'))
