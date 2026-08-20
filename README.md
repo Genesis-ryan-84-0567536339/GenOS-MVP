@@ -28,4 +28,8 @@ The MVP is intentionally small. It will provide:
 
 ## Status
 
-Repository bootstrap is active. Production MVP runtime is not released yet.
+MVP-00 repository bootstrap is complete. MVP-01 — Lifecycle Core / Typed Recon Foundation — is the active build package. Production MVP runtime is not released yet.
+
+## License
+
+Apache License 2.0. See `LICENSE`.
