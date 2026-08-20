@@ -263,6 +263,10 @@ class AgentAuthBridge:
     def _env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["HOME"] = str(self.store.root)
+        # systemd services use PrivateTmp for sandboxing. Pin tmux's socket root
+        # to durable Agent state so worker/API/CLI attach to one shared session
+        # instead of process-private /tmp namespaces.
+        env["TMUX_TMPDIR"] = str(self.store.root)
         return env
 
     def _run_tmux(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
