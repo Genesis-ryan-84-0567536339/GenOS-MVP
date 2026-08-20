@@ -7,6 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from .agent_runtime import (
+    AgentNeedsAction,
+    AgentRuntimeError,
+    AgentRuntimeStore,
+    GeminiCliAdapter,
+    TmuxController,
+)
 from .install import InstallError, NativeProvisioner, ReleaseArtifact, build_native_install
 from .recon import collect_all
 from .redaction import redact
@@ -48,6 +55,17 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--json", action="store_true", dest="as_json")
     install.add_argument("--candidate-e2e", action="store_true", help=argparse.SUPPRESS)
 
+    agent = sub.add_parser("agent", help="Operate the single MVP Core Agent agy-gen through typed controls")
+    agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+    for name in ("status", "probe", "activate", "restart"):
+        item = agent_sub.add_parser(name)
+        item.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
+        item.add_argument("--json", action="store_true", dest="as_json")
+    task = agent_sub.add_parser("task")
+    task.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
+    task.add_argument("--prompt", required=True)
+    task.add_argument("--json", action="store_true", dest="as_json")
+
     for name in sorted(_RESERVED_MUTATION_COMMANDS):
         sub.add_parser(name, help="Lifecycle surface reserved for later MVP packages")
     return parser
@@ -61,6 +79,8 @@ def main(argv: list[str] | None = None) -> int:
         return _recon(mode=args.command, as_json=args.as_json, cwd=args.cwd)
     if args.command == "install":
         return _install(args)
+    if args.command == "agent":
+        return _agent(args)
     return _not_implemented(args.command)
 
 
@@ -142,6 +162,50 @@ def _install(args: argparse.Namespace) -> int:
         return 4
 
 
+def _agent(args: argparse.Namespace) -> int:
+    store = AgentRuntimeStore(args.state_dir)
+    try:
+        if args.agent_command == "status":
+            payload = store.status()
+            _emit_agent(payload, as_json=args.as_json)
+            runtime = payload.get("runtime") if isinstance(payload.get("runtime"), dict) else {}
+            return 0 if runtime.get("state") in {"READY", "BUSY", "NEEDS_ACTION", "DEGRADED"} else 3
+        if args.agent_command == "probe":
+            probe = GeminiCliAdapter(store).probe_installation()
+            store.write_provider(probe)
+            payload = probe.to_dict()
+            _emit_agent(payload, as_json=args.as_json)
+            return 0 if probe.state == "INSTALLED" else 3
+        if args.agent_command == "activate":
+            probe = GeminiCliAdapter(store).activate_with_real_probe()
+            payload = probe.to_dict()
+            _emit_agent(payload, as_json=args.as_json)
+            return 0 if probe.state == "ACTIVE" else 3
+        if args.agent_command == "restart":
+            provider = store.provider() or {}
+            if provider.get("state") != "ACTIVE":
+                raise AgentNeedsAction("provider must be ACTIVE before starting/restarting agy-gen tmux")
+            TmuxController(store).restart_worker_session()
+            payload = {"agent_id": "agy-gen", "state": "RESTARTED", "tmux_state": "RUNNING"}
+            _emit_agent(payload, as_json=args.as_json)
+            return 0
+        if args.agent_command == "task":
+            task_id = store.queue_task(args.prompt)
+            payload = {"agent_id": "agy-gen", "task_id": task_id, "state": "QUEUED"}
+            _emit_agent(payload, as_json=args.as_json)
+            return 0
+    except (AgentRuntimeError, PermissionError, OSError) as exc:
+        payload = {
+            "agent_id": "agy-gen",
+            "state": "NEEDS_ACTION" if isinstance(exc, AgentNeedsAction) else "FAILED",
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+        }
+        _emit_agent(redact(payload), as_json=args.as_json)
+        return 3 if isinstance(exc, AgentNeedsAction) else 4
+    raise SystemExit(2)
+
+
 def _not_implemented(command: str) -> int:
     payload = {
         "command": command,
@@ -150,6 +214,19 @@ def _not_implemented(command: str) -> int:
     }
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
     return 2
+
+
+def _emit_agent(payload: dict[str, Any], *, as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(redact(payload), ensure_ascii=False, sort_keys=True, indent=2))
+        return
+    state = payload.get("state")
+    if state is None and isinstance(payload.get("runtime"), dict):
+        state = payload["runtime"].get("state")
+    print(f"agent: agy-gen")
+    print(f"state: {state or 'UNKNOWN'}")
+    if payload.get("evidence"):
+        print(f"evidence: {payload['evidence']}")
 
 
 def _emit(payload: dict[str, Any], as_json: bool) -> None:
