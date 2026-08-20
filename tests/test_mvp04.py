@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 import stat
 import tempfile
 import unittest
+import uuid
 
 from genos.agent_runtime import (
     AgentBusyError,
@@ -16,6 +16,14 @@ from genos.agent_runtime import (
     TARGET_APPROVAL_MODE,
     TARGET_MODEL,
     TARGET_THINKING_LEVEL,
+)
+from genos.agent_secure_runtime import SecretAwareGeminiAdapter
+from genos.agent_tools import (
+    GEMINI_CLI_VERSION,
+    GEMINI_NPM_SPEC,
+    NODE_SHA256,
+    NODE_URL,
+    NODE_VERSION,
 )
 
 
@@ -167,6 +175,44 @@ class GeminiAdapterTests(unittest.TestCase):
             text = store.provider_path.read_text(encoding="utf-8").lower()
             for forbidden in ("password", "refresh_token", "api_key", "authorization"):
                 self.assertNotIn(forbidden, text)
+
+    def test_secretref_api_key_is_process_only_and_binding_is_safe(self) -> None:
+        class FakeResolver:
+            def resolve_api_key(self, secret_id: str) -> str:
+                self.secret_id = secret_id
+                return "raw-test-api-key-never-persist"
+
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            store = AgentRuntimeStore(root / "agy-gen")
+            store.ensure_seed(instance_id="instance-a")
+            binary = self._fake_gemini(root, activation_pass=True)
+            secret_id = str(uuid.uuid4())
+            resolver = FakeResolver()
+            adapter = SecretAwareGeminiAdapter(
+                store,
+                binary=str(binary),
+                credential_id=secret_id,
+                resolver=resolver,  # type: ignore[arg-type]
+            )
+            child_env = adapter._env()
+            self.assertEqual(child_env["GEMINI_API_KEY"], "raw-test-api-key-never-persist")
+            probe = adapter.activate_with_real_probe(timeout=10)
+            self.assertEqual(probe.state, "ACTIVE")
+            self.assertEqual(probe.credential_ref, secret_id)
+            persisted = store.provider_path.read_text(encoding="utf-8")
+            self.assertIn(secret_id, persisted)
+            self.assertNotIn("raw-test-api-key-never-persist", persisted)
+            self.assertNotIn("GEMINI_API_KEY", persisted)
+
+
+class ToolchainPinTests(unittest.TestCase):
+    def test_agent_toolchain_is_exactly_pinned(self) -> None:
+        self.assertEqual(NODE_VERSION, "24.19.0")
+        self.assertEqual(GEMINI_CLI_VERSION, "0.53.0")
+        self.assertEqual(GEMINI_NPM_SPEC, "@google/gemini-cli@0.53.0")
+        self.assertEqual(len(NODE_SHA256), 64)
+        self.assertEqual(NODE_URL, "https://nodejs.org/dist/v24.19.0/node-v24.19.0-linux-x64.tar.xz")
 
 
 if __name__ == "__main__":
