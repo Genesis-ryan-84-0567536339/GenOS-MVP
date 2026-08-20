@@ -109,6 +109,20 @@ class ReleaseAndPlanTests(unittest.TestCase):
             self.assertEqual(first.plan.plan_hash, second.plan.plan_hash)
             self.assertEqual(len(first.plan.steps), 12)
 
+    def test_unresolved_boundary_has_no_native_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release = make_release(Path(tmp))
+            planned = build_native_install(candidate_observations(), requested_mode=None, release=release)
+            self.assertEqual(planned.decision.state, "NEEDS_ACTION")
+            self.assertEqual(planned.plan.steps, [])
+
+    def test_vm_boundary_has_no_native_steps(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            release = make_release(Path(tmp))
+            planned = build_native_install(candidate_observations(), requested_mode="vm", release=release)
+            self.assertEqual(planned.decision.mode, BoundaryMode.VM)
+            self.assertEqual(planned.plan.steps, [])
+
     def test_normal_candidate_plan_cannot_execute(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release = make_release(Path(tmp))
