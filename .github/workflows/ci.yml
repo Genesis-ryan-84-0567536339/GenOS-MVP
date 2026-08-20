@@ -1,0 +1,37 @@
+name: MVP CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  mvp01:
+    name: mvp01-python-${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile package
+        run: PYTHONPATH=src python -m compileall -q src tests
+      - name: Unit and fixture tests
+        run: PYTHONPATH=src python -m unittest discover -s tests -v
+      - name: Read-only CLI smoke
+        run: |
+          PYTHONPATH=src python -m genos status --json
+          PYTHONPATH=src python -m genos recon --json > /tmp/genos-recon.json
+          python - <<'PY'
+          import json
+          payload = json.load(open('/tmp/genos-recon.json', encoding='utf-8'))
+          assert payload['read_only'] is True
+          assert payload['observations']
+          PY
