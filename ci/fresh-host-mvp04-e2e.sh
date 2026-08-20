@@ -152,7 +152,16 @@ if [[ "$REQUIRE_PROVIDER" == "1" ]]; then
   ssh_guest "sudo -u genos tmux has-session -t agy-gen"
   ssh_guest "sudo -u genos env PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 /opt/genos/current/ci/mvp04-agent-e2e.py task-before-reboot"
 else
-  echo "==> Verify truthful pre-auth NEEDS_ACTION gate"
+  echo "==> Verify truthful pre-auth NEEDS_ACTION with persistent auth tmux"
+  auth_ready=0
+  for _ in $(seq 1 60); do
+    if ssh_guest "sudo -u genos tmux has-session -t agy-gen && sudo -u genos tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx auth" >/dev/null 2>&1; then
+      auth_ready=1
+      break
+    fi
+    sleep 1
+  done
+  [[ "$auth_ready" == "1" ]]
   ssh_guest "sudo -u genos env PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 - <<'PY'
 import json, subprocess
 p=subprocess.run(['python3','-m','genos','agent','status','--json'],capture_output=True,text=True,check=True,env={'PYTHONPATH':'/opt/genos/current/src','PATH':'/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin','HOME':'/var/lib/genos','LANG':'C.UTF-8'})
@@ -160,9 +169,12 @@ s=json.loads(p.stdout)
 assert s['identity']['agent_id']=='agy-gen', s
 assert s['provider']['state']=='INSTALLED', s
 assert s['runtime']['state']=='NEEDS_ACTION', s
+assert s['runtime']['tmux_state']=='RUNNING', s
+assert str(s['runtime']['reason']).startswith('AUTH_'), s
 PY"
-  if ssh_guest "sudo -u genos tmux has-session -t agy-gen" >/dev/null 2>&1; then
-    echo "tmux session must not be treated live before provider activation" >&2
+  ssh_guest "sudo -u genos tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx auth"
+  if ssh_guest "sudo -u genos tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx runtime"; then
+    echo "runtime window must not start before provider verification" >&2
     exit 1
   fi
 fi
@@ -192,12 +204,21 @@ if [[ "$REQUIRE_PROVIDER" == "1" ]]; then
   ssh_guest "sudo -u genos env PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 /opt/genos/current/ci/mvp04-agent-e2e.py after-reboot"
   RESULT="PASS_REAL_PROVIDER"
 else
+  auth_recovered=0
+  for _ in $(seq 1 60); do
+    if ssh_guest "sudo -u genos tmux has-session -t agy-gen && sudo -u genos tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx auth" >/dev/null 2>&1; then
+      auth_recovered=1
+      break
+    fi
+    sleep 1
+  done
+  [[ "$auth_recovered" == "1" ]]
   ssh_guest "sudo -u genos env PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 -m genos agent status --json" > "$WORK_DIR/status-after-reboot.json"
-  if ssh_guest "sudo -u genos tmux has-session -t agy-gen" >/dev/null 2>&1; then
-    echo "pre-auth reboot unexpectedly created an agent tmux" >&2
+  if ssh_guest "sudo -u genos tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx runtime"; then
+    echo "pre-auth reboot unexpectedly created runtime window" >&2
     exit 1
   fi
-  RESULT="PASS_PREAUTH_NEEDS_ACTION"
+  RESULT="PASS_PREAUTH_AUTH_TMUX_NEEDS_ACTION"
 fi
 
 python3 - "$EVIDENCE" <<PY
@@ -216,6 +237,7 @@ payload={
   'provider_required': '$REQUIRE_PROVIDER' == '1',
   'result':'$RESULT',
   'identity_survived_reboot': True,
+  'preauth_tmux_policy':'AUTH_WINDOW_PERSISTENT_RUNTIME_WINDOW_GATED'
 }
 with open(sys.argv[1],'w',encoding='utf-8') as h:
   json.dump(payload,h,indent=2,sort_keys=True); h.write('\n')
