@@ -143,14 +143,13 @@ class ReconTests(unittest.TestCase):
                 else:
                     os.environ["GENOS_STATE_DIR"] = old
 
-    def test_mutation_surface_is_disabled_in_mvp01(self) -> None:
+    def test_future_mutation_surface_remains_disabled(self) -> None:
         buffer = io.StringIO()
         with redirect_stdout(buffer):
-            code = main(["install"])
+            code = main(["repair"])
         payload = json.loads(buffer.getvalue())
         self.assertEqual(code, 2)
-        self.assertEqual(payload["state"], "NOT_IMPLEMENTED_IN_MVP_01")
-        self.assertTrue(payload["read_only"])
+        self.assertEqual(payload["state"], "NOT_IMPLEMENTED_IN_CURRENT_PACKAGE")
 
 
 if __name__ == "__main__":
