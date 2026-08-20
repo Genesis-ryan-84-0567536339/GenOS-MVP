@@ -13,8 +13,9 @@ import tempfile
 import time
 import unittest
 import urllib.request
+from unittest.mock import patch
 
-from genos.boundary import BoundaryMode, decide_boundary
+from genos.boundary import BoundaryMode, HostProfile, ProfileState, decide_boundary
 from genos.contracts import Observation, ObservationState, SupportClass
 from genos.install import (
     InstallError,
@@ -28,7 +29,7 @@ from genos.install import (
 GIT_SHA = "1" * 40
 
 
-def candidate_observations() -> list[Observation]:
+def ubuntu_observations() -> list[Observation]:
     return [
         Observation(
             "platform",
@@ -42,6 +43,19 @@ def candidate_observations() -> list[Observation]:
         ),
         Observation("systemd", ObservationState.PASS, observed={"status": "running"}),
     ]
+
+
+def candidate_profile() -> HostProfile:
+    return HostProfile(
+        profile_id="ubuntu-24.04-amd64-native",
+        distribution="ubuntu",
+        version="24.04",
+        architecture="x86_64",
+        mode=BoundaryMode.NATIVE,
+        state=ProfileState.CANDIDATE,
+        package_manager="apt",
+        notes="test candidate",
+    )
 
 
 def make_release(root: Path) -> ReleaseArtifact:
@@ -60,32 +74,41 @@ def make_release(root: Path) -> ReleaseArtifact:
 
 class BoundaryTests(unittest.TestCase):
     def test_missing_mode_requires_action_without_mutation(self) -> None:
-        decision = decide_boundary(candidate_observations(), None)
+        decision = decide_boundary(ubuntu_observations(), None)
         self.assertEqual(decision.state, "NEEDS_ACTION")
         self.assertFalse(decision.mutation_allowed)
         self.assertTrue(decision.requires_confirmation)
 
+    def test_verified_profile_is_supported_for_normal_install(self) -> None:
+        decision = decide_boundary(ubuntu_observations(), "native")
+        self.assertEqual(decision.support_class, SupportClass.SUPPORTED)
+        self.assertEqual(decision.state, "SUPPORTED")
+        self.assertEqual(decision.profile_id, "ubuntu-24.04-amd64-native")
+        self.assertTrue(decision.mutation_allowed)
+
     def test_candidate_profile_is_not_supported_for_normal_install(self) -> None:
-        decision = decide_boundary(candidate_observations(), "native")
+        with patch("genos.boundary.REFERENCE_PROFILES", (candidate_profile(),)):
+            decision = decide_boundary(ubuntu_observations(), "native")
         self.assertEqual(decision.support_class, SupportClass.SUPPORTED_WITH_ACTION)
         self.assertEqual(decision.state, "SUPPORTED_WITH_ACTION")
         self.assertFalse(decision.mutation_allowed)
 
     def test_candidate_profile_can_only_be_opened_for_e2e(self) -> None:
-        decision = decide_boundary(candidate_observations(), "native", allow_candidate_e2e=True)
+        with patch("genos.boundary.REFERENCE_PROFILES", (candidate_profile(),)):
+            decision = decide_boundary(ubuntu_observations(), "native", allow_candidate_e2e=True)
         self.assertEqual(decision.mode, BoundaryMode.NATIVE)
         self.assertEqual(decision.state, "CANDIDATE_E2E_ONLY")
-        self.assertFalse(decision.support_class is SupportClass.SUPPORTED)
+        self.assertNotEqual(decision.support_class, SupportClass.SUPPORTED)
         self.assertTrue(decision.mutation_allowed)
 
     def test_vm_mode_does_not_fake_certification(self) -> None:
-        decision = decide_boundary(candidate_observations(), "vm")
+        decision = decide_boundary(ubuntu_observations(), "vm")
         self.assertEqual(decision.mode, BoundaryMode.VM)
         self.assertEqual(decision.support_class, SupportClass.SUPPORTED_WITH_ACTION)
         self.assertFalse(decision.mutation_allowed)
 
     def test_offline_systemd_blocks_before_mutation(self) -> None:
-        observations = candidate_observations()
+        observations = ubuntu_observations()
         observations[1] = Observation("systemd", ObservationState.FAIL, observed={"status": "offline"})
         decision = decide_boundary(observations, "native", allow_candidate_e2e=True)
         self.assertEqual(decision.support_class, SupportClass.UNSUPPORTED)
@@ -103,30 +126,34 @@ class ReleaseAndPlanTests(unittest.TestCase):
     def test_plan_hash_is_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release = make_release(Path(tmp))
-            first = build_native_install(candidate_observations(), requested_mode="native", release=release)
-            second = build_native_install(candidate_observations(), requested_mode="native", release=release)
+            first = build_native_install(ubuntu_observations(), requested_mode="native", release=release)
+            second = build_native_install(ubuntu_observations(), requested_mode="native", release=release)
             self.assertNotEqual(first.plan.plan_id, second.plan.plan_id)
             self.assertEqual(first.plan.plan_hash, second.plan.plan_hash)
             self.assertEqual(len(first.plan.steps), 12)
+            self.assertEqual(first.plan.support_class, SupportClass.SUPPORTED)
 
     def test_unresolved_boundary_has_no_native_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release = make_release(Path(tmp))
-            planned = build_native_install(candidate_observations(), requested_mode=None, release=release)
+            planned = build_native_install(ubuntu_observations(), requested_mode=None, release=release)
             self.assertEqual(planned.decision.state, "NEEDS_ACTION")
             self.assertEqual(planned.plan.steps, [])
 
     def test_vm_boundary_has_no_native_steps(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release = make_release(Path(tmp))
-            planned = build_native_install(candidate_observations(), requested_mode="vm", release=release)
+            planned = build_native_install(ubuntu_observations(), requested_mode="vm", release=release)
             self.assertEqual(planned.decision.mode, BoundaryMode.VM)
             self.assertEqual(planned.plan.steps, [])
 
-    def test_normal_candidate_plan_cannot_execute(self) -> None:
+    def test_candidate_plan_cannot_execute_without_e2e_gate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             release = make_release(Path(tmp))
-            planned = build_native_install(candidate_observations(), requested_mode="native", release=release)
+            with patch("genos.boundary.REFERENCE_PROFILES", (candidate_profile(),)), patch(
+                "genos.install.get_profile", return_value=candidate_profile()
+            ):
+                planned = build_native_install(ubuntu_observations(), requested_mode="native", release=release)
             with self.assertRaisesRegex(InstallError, "mutation blocked"):
                 NativeProvisioner(planned, state_root=Path(tmp) / "state").execute()
 
