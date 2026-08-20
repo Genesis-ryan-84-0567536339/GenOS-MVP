@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 import grp
@@ -17,7 +16,7 @@ import urllib.request
 import uuid
 
 from .boundary import BoundaryDecision, BoundaryMode, decide_boundary, get_profile
-from .contracts import InstallPlan, InstallRun, Observation, RunState, SupportClass, utc_now
+from .contracts import InstallPlan, InstallRun, Observation, RunState, utc_now
 from .redaction import redact
 from .state import JsonStateStore
 
@@ -144,7 +143,7 @@ class NativeProvisioner:
         self,
         planned: PlannedInstall,
         *,
-        state_root: Path = Path("/var/lib/genos/install"),
+        state_root: Path = Path("/var/lib/genos"),
         runner: SystemCommandRunner | None = None,
     ) -> None:
         self.planned = planned
@@ -408,9 +407,9 @@ class NativeProvisioner:
             return
         with self.run_path.open("r", encoding="utf-8") as handle:
             payload = redact(json.load(handle))
-        if payload.get("plan_id") and payload.get("plan_id") != self.planned.plan.plan_id:
-            # plan_id is ephemeral; plan_hash is the durable equivalence check.
-            pass
+        existing_run_hash = payload.get("plan_hash")
+        if existing_run_hash and existing_run_hash != self.planned.plan.plan_hash:
+            raise InstallError("incomplete install run belongs to a different plan; explicit recovery is required")
         for item in payload.get("evidence", []):
             if item.get("state") == "PASS" and item.get("step_id"):
                 self._completed.add(str(item["step_id"]))
@@ -460,7 +459,8 @@ def _dpkg_packages_present(runner: SystemCommandRunner, packages: list[str]) -> 
 def _safe_extract_tar(archive: Path, destination: Path) -> None:
     root = destination.resolve()
     with tarfile.open(archive, "r:*") as handle:
-        for member in handle.getmembers():
+        members = handle.getmembers()
+        for member in members:
             if member.issym() or member.islnk() or member.isdev():
                 raise InstallError(f"release archive contains unsupported link/device entry: {member.name}")
             target = (destination / member.name).resolve()
@@ -468,7 +468,19 @@ def _safe_extract_tar(archive: Path, destination: Path) -> None:
                 raise InstallError(f"release archive path escapes destination: {member.name}")
             if not (member.isdir() or member.isfile()):
                 raise InstallError(f"release archive contains unsupported entry: {member.name}")
-        handle.extractall(destination)
+
+        for member in members:
+            target = destination / member.name
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True, mode=0o755)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True, mode=0o755)
+            source = handle.extractfile(member)
+            if source is None:
+                raise InstallError(f"release archive file has no readable payload: {member.name}")
+            with source, target.open("wb") as output:
+                shutil.copyfileobj(source, output)
+            os.chmod(target, 0o644)
 
 
 def _replace_symlink(link: Path, target: Path) -> None:
@@ -501,7 +513,7 @@ def _atomic_json(path: Path, payload: dict[str, Any], *, mode: int) -> None:
 
 
 def _http_json(url: str) -> dict[str, Any]:
-    with urllib.request.urlopen(url, timeout=5) as response:  # noqa: S310 - fixed loopback URLs only
+    with urllib.request.urlopen(url, timeout=5) as response:  # noqa: S310 - caller provides fixed loopback URLs only
         if response.status != 200:
             raise InstallError(f"health endpoint returned HTTP {response.status}: {url}")
         return json.loads(response.read().decode("utf-8"))
