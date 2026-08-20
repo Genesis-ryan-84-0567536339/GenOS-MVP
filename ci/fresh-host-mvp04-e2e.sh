@@ -127,9 +127,9 @@ IDENTITY_BEFORE="$(ssh_guest "sudo python3 -c \"import json; print(json.load(ope
 
 echo "==> Provision pinned Node/Gemini/tmux toolchain"
 ssh_guest "sudo env PYTHONPATH=/opt/genos/current/src python3 -m genos agent provision --json" > "$WORK_DIR/provision.json"
-ssh_guest "env PATH=$GUEST_TOOL_PATH node --version | grep -qx 'v24.19.0'"
-ssh_guest "env PATH=$GUEST_TOOL_PATH gemini --version | grep -qx '0.53.0'"
-ssh_guest "env PATH=$GUEST_TOOL_PATH tmux -V | grep -q '^tmux '"
+ssh_guest "sudo -u genos env PATH=$GUEST_TOOL_PATH node --version | grep -qx 'v24.19.0'"
+ssh_guest "sudo -u genos env PATH=$GUEST_TOOL_PATH gemini --version | grep -qx '0.53.0'"
+ssh_guest "sudo -u genos env PATH=$GUEST_TOOL_PATH tmux -V | grep -q '^tmux '"
 ssh_guest "sudo python3 - <<'PY'
 import json
 p=json.load(open('/var/lib/genos/tools/agy-gen-toolchain.json'))
@@ -147,11 +147,11 @@ if [[ "$REQUIRE_PROVIDER" == "1" ]]; then
   fi
   echo "==> Bind SecretRef and verify real Gemini model"
   printf '%s' "$GENOS_MVP_GEMINI_API_KEY" | ssh_guest \
-    "sudo -u genos env PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 /opt/genos/current/ci/mvp04-agent-e2e.py bootstrap" \
+    "sudo -u genos env PATH=$GUEST_TOOL_PATH PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 /opt/genos/current/ci/mvp04-agent-e2e.py bootstrap" \
     > "$WORK_DIR/credential-ref.txt"
-  ssh_guest "sudo -u genos env PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 -m genos agent restart --json" >/dev/null
+  ssh_guest "sudo -u genos env PATH=$GUEST_TOOL_PATH PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 -m genos agent restart --json" >/dev/null
   ssh_guest "sudo -u genos tmux has-session -t agy-gen"
-  ssh_guest "sudo -u genos env PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 /opt/genos/current/ci/mvp04-agent-e2e.py task-before-reboot"
+  ssh_guest "sudo -u genos env PATH=$GUEST_TOOL_PATH PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 /opt/genos/current/ci/mvp04-agent-e2e.py task-before-reboot"
 else
   echo "==> Verify truthful pre-auth NEEDS_ACTION with persistent auth tmux"
   auth_ready=0
@@ -163,7 +163,7 @@ else
     sleep 1
   done
   [[ "$auth_ready" == "1" ]]
-  ssh_guest "sudo -u genos env PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 - <<'PY'
+  ssh_guest "sudo -u genos env PATH=$GUEST_TOOL_PATH PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 - <<'PY'
 import json, subprocess
 p=subprocess.run(['python3','-m','genos','agent','status','--json'],capture_output=True,text=True,check=True,env={'PYTHONPATH':'/opt/genos/current/src','PATH':'/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin','HOME':'/var/lib/genos','LANG':'C.UTF-8'})
 s=json.loads(p.stdout)
@@ -202,7 +202,7 @@ if [[ "$REQUIRE_PROVIDER" == "1" ]]; then
     sleep 1
   done
   ssh_guest "sudo -u genos tmux has-session -t agy-gen"
-  ssh_guest "sudo -u genos env PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 /opt/genos/current/ci/mvp04-agent-e2e.py after-reboot"
+  ssh_guest "sudo -u genos env PATH=$GUEST_TOOL_PATH PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 /opt/genos/current/ci/mvp04-agent-e2e.py after-reboot"
   RESULT="PASS_REAL_PROVIDER"
 else
   auth_recovered=0
@@ -214,7 +214,7 @@ else
     sleep 1
   done
   [[ "$auth_recovered" == "1" ]]
-  ssh_guest "sudo -u genos env PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 -m genos agent status --json" > "$WORK_DIR/status-after-reboot.json"
+  ssh_guest "sudo -u genos env PATH=$GUEST_TOOL_PATH PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 -m genos agent status --json" > "$WORK_DIR/status-after-reboot.json"
   if ssh_guest "sudo -u genos tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx runtime"; then
     echo "pre-auth reboot unexpectedly created runtime window" >&2
     exit 1
