@@ -17,6 +17,7 @@ EVIDENCE="$WORK_DIR/mvp04-fresh-host-evidence.json"
 TESTED_SHA="$(git rev-parse HEAD)"
 REQUIRE_PROVIDER="${MVP04_REQUIRE_PROVIDER:-0}"
 GUEST_TOOL_PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+GUEST_TMUX_TMPDIR="/var/lib/genos/agents/agy-gen"
 
 mkdir -p "$WORK_DIR"
 chmod 700 "$WORK_DIR"
@@ -150,13 +151,13 @@ if [[ "$REQUIRE_PROVIDER" == "1" ]]; then
     "sudo -u genos env PATH=$GUEST_TOOL_PATH PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 /opt/genos/current/ci/mvp04-agent-e2e.py bootstrap" \
     > "$WORK_DIR/credential-ref.txt"
   ssh_guest "sudo -u genos env PATH=$GUEST_TOOL_PATH PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 -m genos agent restart --json" >/dev/null
-  ssh_guest "sudo -u genos tmux has-session -t agy-gen"
+  ssh_guest "sudo -u genos env TMUX_TMPDIR=$GUEST_TMUX_TMPDIR tmux has-session -t agy-gen"
   ssh_guest "sudo -u genos env PATH=$GUEST_TOOL_PATH PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 /opt/genos/current/ci/mvp04-agent-e2e.py task-before-reboot"
 else
   echo "==> Verify truthful pre-auth NEEDS_ACTION with persistent auth tmux"
   auth_ready=0
   for _ in $(seq 1 60); do
-    if ssh_guest "sudo -u genos tmux has-session -t agy-gen && sudo -u genos tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx auth" >/dev/null 2>&1; then
+    if ssh_guest "sudo -u genos env TMUX_TMPDIR=$GUEST_TMUX_TMPDIR tmux has-session -t agy-gen && sudo -u genos env TMUX_TMPDIR=$GUEST_TMUX_TMPDIR tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx auth" >/dev/null 2>&1; then
       auth_ready=1
       break
     fi
@@ -173,8 +174,8 @@ assert s['runtime']['state']=='NEEDS_ACTION', s
 assert s['runtime']['tmux_state']=='RUNNING', s
 assert str(s['runtime']['reason']).startswith('AUTH_'), s
 PY"
-  ssh_guest "sudo -u genos tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx auth"
-  if ssh_guest "sudo -u genos tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx runtime"; then
+  ssh_guest "sudo -u genos env TMUX_TMPDIR=$GUEST_TMUX_TMPDIR tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx auth"
+  if ssh_guest "sudo -u genos env TMUX_TMPDIR=$GUEST_TMUX_TMPDIR tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx runtime"; then
     echo "runtime window must not start before provider verification" >&2
     exit 1
   fi
@@ -198,16 +199,16 @@ IDENTITY_AFTER="$(ssh_guest "sudo python3 -c \"import json; print(json.load(open
 
 if [[ "$REQUIRE_PROVIDER" == "1" ]]; then
   for _ in $(seq 1 60); do
-    if ssh_guest "sudo -u genos tmux has-session -t agy-gen" >/dev/null 2>&1; then break; fi
+    if ssh_guest "sudo -u genos env TMUX_TMPDIR=$GUEST_TMUX_TMPDIR tmux has-session -t agy-gen" >/dev/null 2>&1; then break; fi
     sleep 1
   done
-  ssh_guest "sudo -u genos tmux has-session -t agy-gen"
+  ssh_guest "sudo -u genos env TMUX_TMPDIR=$GUEST_TMUX_TMPDIR tmux has-session -t agy-gen"
   ssh_guest "sudo -u genos env PATH=$GUEST_TOOL_PATH PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 /opt/genos/current/ci/mvp04-agent-e2e.py after-reboot"
   RESULT="PASS_REAL_PROVIDER"
 else
   auth_recovered=0
   for _ in $(seq 1 60); do
-    if ssh_guest "sudo -u genos tmux has-session -t agy-gen && sudo -u genos tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx auth" >/dev/null 2>&1; then
+    if ssh_guest "sudo -u genos env TMUX_TMPDIR=$GUEST_TMUX_TMPDIR tmux has-session -t agy-gen && sudo -u genos env TMUX_TMPDIR=$GUEST_TMUX_TMPDIR tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx auth" >/dev/null 2>&1; then
       auth_recovered=1
       break
     fi
@@ -215,7 +216,7 @@ else
   done
   [[ "$auth_recovered" == "1" ]]
   ssh_guest "sudo -u genos env PATH=$GUEST_TOOL_PATH PYTHONPATH=/opt/genos/current/src HOME=/var/lib/genos python3 -m genos agent status --json" > "$WORK_DIR/status-after-reboot.json"
-  if ssh_guest "sudo -u genos tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx runtime"; then
+  if ssh_guest "sudo -u genos env TMUX_TMPDIR=$GUEST_TMUX_TMPDIR tmux list-windows -t agy-gen -F '#{window_name}' | grep -qx runtime"; then
     echo "pre-auth reboot unexpectedly created runtime window" >&2
     exit 1
   fi

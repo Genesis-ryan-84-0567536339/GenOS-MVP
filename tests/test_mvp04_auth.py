@@ -13,6 +13,7 @@ from genos.agent_auth import (
     parse_auth_terminal,
 )
 from genos.agent_runtime import AgentRuntimeStore
+from genos.agent_secure_runtime import SecureTmuxController
 
 
 class AuthProjectionTests(unittest.TestCase):
@@ -67,6 +68,17 @@ class AuthSettingsTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8").lower()
             for forbidden in ("access_token", "refresh_token", "api_key", "authorization_code"):
                 self.assertNotIn(forbidden, text)
+
+    def test_auth_and_runtime_share_durable_tmux_namespace(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = AgentRuntimeStore(Path(temp) / "agy-gen")
+            store.ensure_seed(instance_id="instance-a")
+            auth = AgentAuthBridge(store, tmux_binary="/bin/false", gemini_binary="/bin/false")
+            runtime = SecureTmuxController(store, tmux_binary="/bin/false")
+            self.assertEqual(auth._env()["TMUX_TMPDIR"], str(store.root))
+            self.assertEqual(runtime._env()["TMUX_TMPDIR"], str(store.root))
+            self.assertEqual(auth._env()["HOME"], str(store.root))
+            self.assertEqual(runtime._env()["HOME"], str(store.root))
 
 
 if __name__ == "__main__":
