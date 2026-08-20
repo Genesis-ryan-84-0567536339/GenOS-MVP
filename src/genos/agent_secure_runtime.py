@@ -38,10 +38,10 @@ class BoundProviderProbe:
     approval_mode: str
     observed_at: str
     evidence: str
-    credential_ref: str | None
+    binding_ref: str | None
 
     @classmethod
-    def from_probe(cls, probe: ProviderProbe, credential_ref: str | None) -> "BoundProviderProbe":
+    def from_probe(cls, probe: ProviderProbe, binding_ref: str | None) -> "BoundProviderProbe":
         return cls(
             state=probe.state,
             cli_path=probe.cli_path,
@@ -51,10 +51,14 @@ class BoundProviderProbe:
             approval_mode=probe.approval_mode,
             observed_at=probe.observed_at,
             evidence=probe.evidence,
-            credential_ref=credential_ref,
+            binding_ref=binding_ref,
         )
 
     def to_dict(self) -> dict[str, Any]:
+        # `binding_ref` is the UUID of a SecretRef metadata record, never raw
+        # secret material. The name intentionally avoids generic secret-field
+        # redaction so the runtime can rebind after reboot without persisting a
+        # provider key/token itself.
         return {
             "state": self.state,
             "cli_path": self.cli_path,
@@ -64,7 +68,7 @@ class BoundProviderProbe:
             "approval_mode": self.approval_mode,
             "observed_at": self.observed_at,
             "evidence": self.evidence,
-            "credential_ref": self.credential_ref,
+            "binding_ref": self.binding_ref,
         }
 
 
@@ -96,7 +100,7 @@ class SecretAwareGeminiAdapter(GeminiCliAdapter):
         super().__init__(store, binary=binary)
         persisted = store.provider() or {}
         self.credential_id = credential_id or (
-            str(persisted.get("credential_ref")) if persisted.get("credential_ref") else None
+            str(persisted.get("binding_ref")) if persisted.get("binding_ref") else None
         )
         self.resolver = resolver
 
