@@ -12,7 +12,7 @@ from contextlib import redirect_stdout
 
 from genos.cli import main
 from genos.contracts import JobRun, Observation, ObservationState, RunState, SupportClass
-from genos.recon import ReadOnlyCommandRunner, collect_all
+from genos.recon import ReadOnlyCommandRunner, classify_support, collect_all
 from genos.redaction import redact
 from genos.state import JsonStateStore
 
@@ -106,6 +106,14 @@ class ReconTests(unittest.TestCase):
         runner = ReadOnlyCommandRunner()
         with self.assertRaises(ValueError):
             runner.run(["git", "clean", "-fdx"])
+
+    def test_offline_systemd_is_not_supported(self) -> None:
+        observations = [
+            Observation("platform", ObservationState.PASS, observed={"system": "Linux"}),
+            Observation("systemd", ObservationState.FAIL, observed={"status": "offline"}),
+        ]
+        support, _ = classify_support(observations)
+        self.assertEqual(support, SupportClass.UNSUPPORTED)
 
     def test_collectors_return_required_ids(self) -> None:
         observations, support, reason = collect_all(cwd=None)
