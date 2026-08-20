@@ -135,6 +135,10 @@ class SecureTmuxController(TmuxController):
 
     def _env(self) -> dict[str, str]:
         env = super()._env()
+        # `genos` intentionally has /usr/sbin/nologin as its account shell.
+        # tmux still needs a valid shell to execute typed window commands, so
+        # pin only the tmux process environment instead of weakening the user.
+        env["SHELL"] = "/bin/sh"
         # systemd PrivateTmp must not split the one authoritative agy-gen tmux
         # server into per-service namespaces. Keep the socket below durable
         # Agent state so every typed controller sees the same session.
