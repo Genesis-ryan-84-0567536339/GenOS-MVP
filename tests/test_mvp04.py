@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import stat
 import tempfile
@@ -18,13 +19,7 @@ from genos.agent_runtime import (
     TARGET_THINKING_LEVEL,
 )
 from genos.agent_secure_runtime import SecretAwareGeminiAdapter
-from genos.agent_tools import (
-    GEMINI_CLI_VERSION,
-    GEMINI_NPM_SPEC,
-    NODE_SHA256,
-    NODE_URL,
-    NODE_VERSION,
-)
+from genos.agent_tools import GEMINI_CLI_VERSION, GEMINI_NPM_SPEC, NODE_SHA256, NODE_URL, NODE_VERSION
 
 
 class AgentIdentityTests(unittest.TestCase):
@@ -103,7 +98,7 @@ class GeminiAdapterTests(unittest.TestCase):
         binary = root / "gemini"
         binary.write_text(
             "#!/usr/bin/env python3\n"
-            "import json, sys\n"
+            "import json, os, sys\n"
             "if '--version' in sys.argv:\n"
             "    print('9.9.9-test')\n"
             "    raise SystemExit(0)\n"
@@ -199,11 +194,14 @@ class GeminiAdapterTests(unittest.TestCase):
             self.assertEqual(child_env["GEMINI_API_KEY"], "raw-test-api-key-never-persist")
             probe = adapter.activate_with_real_probe(timeout=10)
             self.assertEqual(probe.state, "ACTIVE")
-            self.assertEqual(probe.credential_ref, secret_id)
+            self.assertEqual(probe.binding_ref, secret_id)
             persisted = store.provider_path.read_text(encoding="utf-8")
             self.assertIn(secret_id, persisted)
+            self.assertIn('"binding_ref"', persisted)
             self.assertNotIn("raw-test-api-key-never-persist", persisted)
             self.assertNotIn("GEMINI_API_KEY", persisted)
+            reopened = SecretAwareGeminiAdapter(store, binary=str(binary), resolver=resolver)  # type: ignore[arg-type]
+            self.assertEqual(reopened.credential_id, secret_id)
 
 
 class ToolchainPinTests(unittest.TestCase):
