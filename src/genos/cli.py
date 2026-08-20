@@ -12,8 +12,8 @@ from .agent_runtime import (
     AgentRuntimeError,
     AgentRuntimeStore,
     GeminiCliAdapter,
-    TmuxController,
 )
+from .agent_secure_runtime import SecretAwareGeminiAdapter, SecureTmuxController
 from .agent_tool_links import ensure_system_links
 from .agent_tools import AgentToolError, AgentToolProvisioner
 from .install import InstallError, NativeProvisioner, ReleaseArtifact, build_native_install
@@ -59,10 +59,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent = sub.add_parser("agent", help="Operate the single MVP Core Agent agy-gen through typed controls")
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
-    for name in ("status", "probe", "activate", "restart"):
+    for name in ("status", "probe", "restart"):
         item = agent_sub.add_parser(name)
         item.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
         item.add_argument("--json", action="store_true", dest="as_json")
+    activate = agent_sub.add_parser("activate")
+    activate.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
+    activate.add_argument("--credential-id", default=None, help="Optional SecretRef UUID granted to consumer agy-gen")
+    activate.add_argument("--json", action="store_true", dest="as_json")
     provision = agent_sub.add_parser("provision")
     provision.add_argument("--state-dir", default="/var/lib/genos/agents/agy-gen")
     provision.add_argument("--json", action="store_true", dest="as_json")
@@ -197,7 +201,7 @@ def _agent(args: argparse.Namespace) -> int:
             _emit_agent(payload, as_json=args.as_json)
             return 0 if probe.state == "INSTALLED" else 3
         if args.agent_command == "activate":
-            probe = GeminiCliAdapter(store).activate_with_real_probe()
+            probe = SecretAwareGeminiAdapter(store, credential_id=args.credential_id).activate_with_real_probe()
             payload = probe.to_dict()
             _emit_agent(payload, as_json=args.as_json)
             return 0 if probe.state == "ACTIVE" else 3
@@ -205,7 +209,7 @@ def _agent(args: argparse.Namespace) -> int:
             provider = store.provider() or {}
             if provider.get("state") != "ACTIVE":
                 raise AgentNeedsAction("provider must be ACTIVE before starting/restarting agy-gen tmux")
-            TmuxController(store).restart_worker_session()
+            SecureTmuxController(store).restart_worker_session()
             payload = {"agent_id": "agy-gen", "state": "RESTARTED", "tmux_state": "RUNNING"}
             _emit_agent(payload, as_json=args.as_json)
             return 0
