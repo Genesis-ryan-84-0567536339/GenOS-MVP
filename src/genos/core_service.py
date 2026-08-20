@@ -102,12 +102,16 @@ def serve_http(role: str, port: int) -> int:
 def _reconcile_core_agent(state_dir: Path, instance_id: str) -> dict[str, object]:
     """One watchdog reconciliation tick for the single MVP Core Agent.
 
-    External provider activation remains an explicit Owner action. The worker
-    only preserves identity, observes provider state, and restores the secure
-    tmux worker after ACTIVE evidence already exists.
+    Once Gemini CLI is installed, the worker keeps the persistent `agy-gen:auth`
+    tmux window available under the unprivileged service identity. The Owner can
+    copy the projected OAuth URL outside the execution boundary and submit a
+    one-time code through the typed bridge. When Gemini reports authentication
+    success, the worker performs the direct target-model probe automatically.
+    Only a verified provider may start/restore the separate `runtime` window.
     """
+    from .agent_auth import AgentAuthBridge
     from .agent_runtime import AgentRuntimeError, AgentRuntimeStore, GeminiCliAdapter
-    from .agent_secure_runtime import SecureTmuxController
+    from .agent_secure_runtime import SecretAwareGeminiAdapter, SecureTmuxController
 
     store = AgentRuntimeStore(state_dir / "agents" / "agy-gen")
     store.ensure_seed(instance_id=instance_id)
@@ -119,10 +123,27 @@ def _reconcile_core_agent(state_dir: Path, instance_id: str) -> dict[str, object
 
     tmux = SecureTmuxController(store)
     claim = store.status().get("claim")
+    auth_reason: str | None = None
+
+    if provider.get("state") == "INSTALLED":
+        try:
+            auth = AgentAuthBridge(store)
+            projection = auth.status()
+            if projection.get("state") == "IDLE":
+                projection = auth.start()
+            auth_state = str(projection.get("state") or "UNKNOWN")
+            auth_reason = f"AUTH_{auth_state}"
+            if auth_state == "AUTHENTICATED":
+                verified = SecretAwareGeminiAdapter(store).activate_with_real_probe()
+                provider = verified.to_dict()
+                auth_reason = str(provider.get("evidence") or "AUTH_MODEL_VERIFY_REQUIRED")
+        except AgentRuntimeError:
+            auth_reason = "AUTH_TERMINAL_START_FAILED"
+
     if provider.get("state") != "ACTIVE":
         store.write_runtime(
             state="NEEDS_ACTION",
-            reason=str(provider.get("evidence") or "PROVIDER_NOT_ACTIVE"),
+            reason=auth_reason or str(provider.get("evidence") or "PROVIDER_NOT_ACTIVE"),
             tmux_state="RUNNING" if tmux.has_session() else "STOPPED",
             task_id=str(claim.get("task_id")) if isinstance(claim, dict) and claim.get("task_id") else None,
         )
