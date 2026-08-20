@@ -1,6 +1,6 @@
 {
   "schema_version": "1.0",
-  "status": "MVP_00_01_PASS_MVP_02_ACTIVE",
+  "status": "MVP_00_01_PASS_MVP_02_VERIFYING",
   "repository": "Genesis-ryan-84-0567536339/GenOS-MVP",
   "visibility": "public",
   "license": "Apache-2.0",
@@ -9,8 +9,21 @@
   "mvp_01_merge": "f1b17fb9c578376553f81665584b73b5200376ba",
   "current_package": "MVP-02",
   "next_package": "MVP-03",
-  "supported_platforms": [],
-  "support_rule": "A distro/version is added to supported_platforms only after real fresh-host install, rerun, and reboot E2E evidence passes.",
+  "supported_platforms": [
+    {
+      "profile_id": "ubuntu-24.04-amd64-native",
+      "distribution": "ubuntu",
+      "version": "24.04",
+      "architecture": "x86_64",
+      "mode": "native",
+      "status": "SUPPORTED",
+      "verification_head": "c515a4a9834afc52b48b72d91272de3a0ab97750",
+      "fresh_host_run": 32347653052,
+      "image_url": "https://cloud-images.ubuntu.com/releases/noble/release-20260801/ubuntu-24.04-server-cloudimg-amd64.img",
+      "image_sha256": "0533b0655c32e68b31d792ecd6ccfca95abdbc536c4446874fe0513bd4140ffe"
+    }
+  ],
+  "support_rule": "A distro/version is added to supported_platforms only after real fresh-host install, idempotent rerun, reboot recovery, exact release provenance, and normal public install-path E2E all pass.",
   "implementation_rule": "This public repository is the sole implementation authority for the GenOS MVP vertical slice. Do not maintain a parallel MVP implementation in the full-product repository.",
   "ui_rule": "Mockup-first. Do not implement material MVP UI surfaces until the Owner approves the visual contract.",
   "truth_rule": "No demo or fabricated current state. Unknown runtime facts remain UNKNOWN until directly observed.",
