@@ -29,8 +29,10 @@ class HostProfile:
     notes: str
 
 
-# The first reference profile is deliberately CANDIDATE until the fresh-host
-# workflow proves install + rerun + reboot. Candidate does not mean SUPPORTED.
+# Promotion rule: a profile may become VERIFIED only after an isolated fresh
+# systemd host proves first install + idempotent rerun + reboot recovery with
+# exact release provenance. The final verified head is re-tested without the
+# candidate-only bypass before MVP-02 may close.
 REFERENCE_PROFILES: tuple[HostProfile, ...] = (
     HostProfile(
         profile_id="ubuntu-24.04-amd64-native",
@@ -38,9 +40,9 @@ REFERENCE_PROFILES: tuple[HostProfile, ...] = (
         version="24.04",
         architecture="x86_64",
         mode=BoundaryMode.NATIVE,
-        state=ProfileState.CANDIDATE,
+        state=ProfileState.VERIFIED,
         package_manager="apt",
-        notes="Reference candidate; must pass real VM fresh-host E2E before support claim.",
+        notes="Fresh-host install/rerun/reboot acceptance established; final verified-head regression gate remains mandatory before release.",
     ),
 )
 
@@ -76,8 +78,8 @@ def decide_boundary(
     """Resolve a boundary without guessing an irreversible host mutation.
 
     `allow_candidate_e2e` exists only so a controlled fresh-host acceptance lane
-    can exercise a candidate profile. It does not convert that profile to
-    SUPPORTED and must not be exposed as a normal user install shortcut.
+    can exercise a candidate profile. It never converts a candidate to
+    SUPPORTED; normal installs only mutate a VERIFIED matching profile.
     """
     by_id = {item.check_id: item for item in observations}
     platform_obs = by_id.get("platform")
