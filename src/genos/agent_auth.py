@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import time
 from typing import Any
+import uuid
 
 from .agent_runtime import (
     AgentNeedsAction,
@@ -97,8 +98,9 @@ class AgentAuthBridge:
 
     The Gemini process lives in the persistent `agy-gen` tmux session. The
     browser-facing layer receives only a short-lived authorization URL and a
-    typed code-submission surface. Authorization codes are sent directly to
-    tmux stdin and are never persisted, logged, placed in argv, or returned.
+    typed code-submission surface. Authorization codes are streamed to tmux via
+    stdin and are never persisted in GenOS state, logged, put in a process argv,
+    or returned by the API.
     """
 
     def __init__(
@@ -125,8 +127,6 @@ class AgentAuthBridge:
         if not self.has_auth_window():
             self._create_auth_window()
 
-        # Give the TUI a brief opportunity to emit the manual-auth URL. This is
-        # bounded and does not claim authentication success.
         deadline = time.monotonic() + 2.0
         projection = self.status()
         while projection["state"] == "STARTING" and time.monotonic() < deadline:
@@ -153,17 +153,40 @@ class AgentAuthBridge:
         if projection["state"] not in {"WAITING_CODE", "WAITING_BROWSER"}:
             raise AgentAuthError("authentication terminal is not waiting for an authorization code")
         code = normalize_auth_code(value)
-        # `-l` sends literal bytes. The code is intentionally never placed in a
-        # shell command, process argv for Gemini, state file, or response body.
-        self._run_tmux(["send-keys", "-t", f"{CORE_AGENT_SESSION}:{AUTH_WINDOW}", "-l", code])
-        self._run_tmux(["send-keys", "-t", f"{CORE_AGENT_SESSION}:{AUTH_WINDOW}", "Enter"])
+        buffer_name = f"genos-auth-{uuid.uuid4().hex}"
+        env = self._env()
+        try:
+            # tmux load-buffer reads the sensitive code from stdin; unlike
+            # send-keys with a literal argument, the code is absent from ps/argv.
+            loaded = subprocess.run(
+                [self.tmux, "load-buffer", "-b", buffer_name, "-"],
+                input=code,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+                shell=False,
+                env=env,
+            )
+            if loaded.returncode != 0:
+                raise AgentAuthError("authorization code could not be staged for agy-gen")
+            pasted = self._run_tmux(
+                ["paste-buffer", "-d", "-b", buffer_name, "-t", f"{CORE_AGENT_SESSION}:{AUTH_WINDOW}"],
+                check=False,
+            )
+            if pasted.returncode != 0:
+                raise AgentAuthError("authorization code could not be delivered to agy-gen")
+            self._run_tmux(["send-keys", "-t", f"{CORE_AGENT_SESSION}:{AUTH_WINDOW}", "Enter"])
+        finally:
+            # Defensive cleanup if paste-buffer did not delete the buffer.
+            self._run_tmux(["delete-buffer", "-b", buffer_name], check=False)
         return {
             "agent_id": "agy-gen",
             "state": "SUBMITTED",
             "tmux_session": CORE_AGENT_SESSION,
             "tmux_window": AUTH_WINDOW,
             "observed_at": utc_now(),
-            "evidence": "AUTH_CODE_SENT_TO_TMUX_STDIN",
+            "evidence": "AUTH_CODE_STREAMED_TO_TMUX_STDIN",
         }
 
     def has_auth_window(self) -> bool:
@@ -237,11 +260,14 @@ class AgentAuthBridge:
         completed = self._run_tmux(["has-session", "-t", CORE_AGENT_SESSION], check=False)
         return completed.returncode == 0
 
+    def _env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["HOME"] = str(self.store.root)
+        return env
+
     def _run_tmux(self, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess[str]:
         if not self.tmux:
             raise AgentNeedsAction("tmux is not installed")
-        env = os.environ.copy()
-        env["HOME"] = str(self.store.root)
         return subprocess.run(
             [self.tmux, *args],
             capture_output=True,
@@ -249,7 +275,7 @@ class AgentAuthBridge:
             check=check,
             timeout=10,
             shell=False,
-            env=env,
+            env=self._env(),
         )
 
     def _ensure_user_auth_settings(self) -> None:
