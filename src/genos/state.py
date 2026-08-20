@@ -34,7 +34,7 @@ class JsonStateStore:
     def load_job(self, job_id: str) -> JobRun:
         path = self.jobs_dir / f"{job_id}.json"
         with path.open("r", encoding="utf-8") as handle:
-            return JobRun.from_dict(json.load(handle))
+            return JobRun.from_dict(redact(json.load(handle)))
 
     def save_manifest(self, payload: dict[str, Any]) -> None:
         self._atomic_write(self.manifest_path, redact(payload))
