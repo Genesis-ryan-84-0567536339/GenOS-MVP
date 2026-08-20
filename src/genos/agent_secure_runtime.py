@@ -133,6 +133,14 @@ class SecureTmuxController(TmuxController):
     flow or the session identity.
     """
 
+    def _env(self) -> dict[str, str]:
+        env = super()._env()
+        # systemd PrivateTmp must not split the one authoritative agy-gen tmux
+        # server into per-service namespaces. Keep the socket below durable
+        # Agent state so every typed controller sees the same session.
+        env["TMUX_TMPDIR"] = str(self.store.root)
+        return env
+
     def has_runtime_window(self) -> bool:
         if not self.binary:
             return False
