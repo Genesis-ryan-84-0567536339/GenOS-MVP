@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
+import urllib.error
 import urllib.request
 import uuid
 
@@ -103,7 +105,7 @@ def build_native_install(
         requested_mode,
         allow_candidate_e2e=allow_candidate_e2e,
     )
-    steps = [
+    native_steps = [
         {"step_id": "prepare_install_state", "action": "filesystem_state_root"},
         {"step_id": "install_packages", "action": "apt_postgresql_packages"},
         {"step_id": "create_service_identity", "action": "system_user_group"},
@@ -117,6 +119,9 @@ def build_native_install(
         {"step_id": "verify_local_core", "action": "local_health_gate"},
         {"step_id": "finalize_manifest", "action": "install_manifest"},
     ]
+    # A VM or unresolved boundary must never be rendered as a native mutation
+    # plan. The VM provider is a separate future implementation lane.
+    steps = native_steps if decision.mode is BoundaryMode.NATIVE else []
     profile = get_profile(decision.profile_id) if decision.profile_id else None
     canonical = {
         "mode": decision.mode.value if decision.mode else None,
@@ -353,17 +358,27 @@ class NativeProvisioner:
             self.runner.run(["systemctl", "enable", "--now", service])
 
     def _verify_local_core(self) -> None:
-        for role, port in (
-            ("product-api", PRODUCT_API_PORT),
-            ("runtime", RUNTIME_PORT),
-            ("mission-control", MISSION_CONTROL_PORT),
+        for role, service, port in (
+            ("product-api", "genos-product-api.service", PRODUCT_API_PORT),
+            ("runtime", "genos-runtime.service", RUNTIME_PORT),
+            ("mission-control", "genos-mission-control.service", MISSION_CONTROL_PORT),
         ):
-            payload = _http_json(f"http://127.0.0.1:{port}/health")
+            try:
+                payload = _http_json_wait(f"http://127.0.0.1:{port}/health", timeout_seconds=15.0)
+            except InstallError as exc:
+                status = self.runner.run(["systemctl", "is-active", service], check=False)
+                raise InstallError(
+                    f"{role} health gate failed; systemd={status.stdout.strip() or 'UNKNOWN'}: {exc}"
+                ) from exc
             if payload.get("status") != "ok" or payload.get("role") != role:
-                raise InstallError(f"{role} health gate failed: {payload}")
+                raise InstallError(f"{role} health gate returned unexpected payload: {payload}")
         heartbeat = Path("/var/lib/genos/worker/heartbeat.json")
+        deadline = time.monotonic() + 15.0
+        while not heartbeat.is_file() and time.monotonic() < deadline:
+            time.sleep(0.25)
         if not heartbeat.is_file():
-            raise InstallError("worker heartbeat missing")
+            status = self.runner.run(["systemctl", "is-active", "genos-worker.service"], check=False)
+            raise InstallError(f"worker heartbeat missing; systemd={status.stdout.strip() or 'UNKNOWN'}")
         worker = json.loads(heartbeat.read_text(encoding="utf-8"))
         if worker.get("status") != "ok" or worker.get("role") != "worker":
             raise InstallError("worker heartbeat invalid")
@@ -517,11 +532,19 @@ def _atomic_json(path: Path, payload: dict[str, Any], *, mode: int) -> None:
     _atomic_text(path, json.dumps(redact(payload), sort_keys=True, indent=2) + "\n", mode=mode)
 
 
-def _http_json(url: str) -> dict[str, Any]:
-    with urllib.request.urlopen(url, timeout=5) as response:  # noqa: S310 - caller provides fixed loopback URLs only
-        if response.status != 200:
-            raise InstallError(f"health endpoint returned HTTP {response.status}: {url}")
-        return json.loads(response.read().decode("utf-8"))
+def _http_json_wait(url: str, *, timeout_seconds: float) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as response:  # noqa: S310 - fixed loopback URLs only
+                if response.status != 200:
+                    raise InstallError(f"health endpoint returned HTTP {response.status}: {url}")
+                return json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            last_error = exc
+            time.sleep(0.25)
+    raise InstallError(f"health endpoint did not become ready within {timeout_seconds:.0f}s: {type(last_error).__name__ if last_error else 'UNKNOWN'}")
 
 
 def _systemd_units() -> dict[str, str]:
