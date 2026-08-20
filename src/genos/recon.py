@@ -169,8 +169,17 @@ def _ports_observation() -> Observation:
 
 def _systemd_observation(runner: ReadOnlyCommandRunner) -> Observation:
     result = runner.run(["systemctl", "is-system-running"])
-    observed = {"status": result.stdout or None, "returncode": result.returncode}
-    return Observation("systemd", result.state, observed=observed, source="systemctl is-system-running")
+    status = (result.stdout or "").strip().lower()
+    state = result.state
+    if result.state not in {ObservationState.NOT_FOUND, ObservationState.TIMEOUT, ObservationState.NO_PERMISSION, ObservationState.UNKNOWN}:
+        if status == "running":
+            state = ObservationState.PASS
+        elif status in {"degraded", "starting"}:
+            state = ObservationState.WARN
+        else:
+            state = ObservationState.FAIL
+    observed = {"status": status or None, "returncode": result.returncode}
+    return Observation("systemd", state, observed=observed, source="systemctl is-system-running")
 
 
 def _container_observation(runner: ReadOnlyCommandRunner) -> Observation:
@@ -181,7 +190,7 @@ def _container_observation(runner: ReadOnlyCommandRunner) -> Observation:
         states.append(result.state)
         if result.state != ObservationState.NOT_FOUND:
             found[tool] = result.stdout or {"state": result.state.value}
-    if found:
+    if any(item == ObservationState.PASS for item in states):
         state = ObservationState.PASS
     elif all(item == ObservationState.NOT_FOUND for item in states):
         state = ObservationState.NOT_INSTALLED
@@ -265,4 +274,17 @@ def _proc_listening_ports() -> set[int]:
 
 def _minimal_env() -> dict[str, str]:
     allowed = ("PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE")
-    return {key: os.environ[key] for key in allowed if key in os.environ}
+    env = {key: os.environ[key] for key in allowed if key in os.environ}
+    # Keep Git probes non-interactive and suppress optional index writes/hooks/fsmonitor.
+    env.update({
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_CONFIG_GLOBAL": os.devnull,
+        "GIT_CONFIG_COUNT": "2",
+        "GIT_CONFIG_KEY_0": "core.fsmonitor",
+        "GIT_CONFIG_VALUE_0": "false",
+        "GIT_CONFIG_KEY_1": "core.hooksPath",
+        "GIT_CONFIG_VALUE_1": os.devnull,
+    })
+    return env
