@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
+import os
 from pathlib import Path
+import socket
+import subprocess
+import sys
 import tarfile
 import tempfile
+import time
 import unittest
+import urllib.request
 
 from genos.boundary import BoundaryMode, decide_boundary
 from genos.contracts import Observation, ObservationState, SupportClass
@@ -137,6 +144,42 @@ class ReleaseAndPlanTests(unittest.TestCase):
             destination.mkdir()
             with self.assertRaisesRegex(InstallError, "unsupported link/device"):
                 _safe_extract_tar(archive, destination)
+
+
+class CoreServiceTests(unittest.TestCase):
+    def test_http_service_exits_cleanly_on_sigterm(self) -> None:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = int(probe.getsockname()[1])
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+        process = subprocess.Popen(
+            [sys.executable, "-m", "genos.core_service", "product-api", "--port", str(port)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        try:
+            payload = None
+            for _ in range(50):
+                if process.poll() is not None:
+                    break
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=0.2) as response:
+                        payload = json.load(response)
+                    break
+                except OSError:
+                    time.sleep(0.05)
+            self.assertIsNotNone(payload, "core service did not become healthy")
+            self.assertEqual(payload["role"], "product-api")
+            process.terminate()
+            returncode = process.wait(timeout=5)
+            self.assertEqual(returncode, 0)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=5)
 
 
 if __name__ == "__main__":
