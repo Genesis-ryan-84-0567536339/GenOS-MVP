@@ -80,6 +80,15 @@ class AuthSettingsTests(unittest.TestCase):
             self.assertEqual(auth._env()["HOME"], str(store.root))
             self.assertEqual(runtime._env()["HOME"], str(store.root))
 
+    def test_tmux_uses_explicit_shell_without_enabling_service_login(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            store = AgentRuntimeStore(Path(temp) / "agy-gen")
+            store.ensure_seed(instance_id="instance-a")
+            auth = AgentAuthBridge(store, tmux_binary="/bin/false", gemini_binary="/bin/false")
+            runtime = SecureTmuxController(store, tmux_binary="/bin/false")
+            self.assertEqual(auth._env()["SHELL"], "/bin/sh")
+            self.assertEqual(runtime._env()["SHELL"], "/bin/sh")
+
 
 if __name__ == "__main__":
     unittest.main()
