@@ -101,6 +101,59 @@ def serve_http(role: str, port: int) -> int:
     return 0
 
 
+def _reconcile_core_agent(state_dir: Path, instance_id: str) -> dict[str, object]:
+    """One watchdog reconciliation tick for the single MVP Core Agent.
+
+    This intentionally does not perform a provider auth/model request. External
+    auth activation is an explicit Owner action; the background worker only
+    preserves identity, observes installed/provider state, and restores tmux
+    after provider activation has already been verified.
+    """
+    from .agent_runtime import AgentRuntimeError, AgentRuntimeStore, GeminiCliAdapter, TmuxController
+
+    store = AgentRuntimeStore(state_dir / "agents" / "agy-gen")
+    store.ensure_seed(instance_id=instance_id)
+    provider = store.provider()
+    if provider is None:
+        installed = GeminiCliAdapter(store).probe_installation()
+        store.write_provider(installed)
+        provider = installed.to_dict()
+
+    tmux = TmuxController(store)
+    claim = store.status().get("claim")
+    if provider.get("state") != "ACTIVE":
+        store.write_runtime(
+            state="NEEDS_ACTION",
+            reason=str(provider.get("evidence") or "PROVIDER_NOT_ACTIVE"),
+            tmux_state="RUNNING" if tmux.has_session() else "STOPPED",
+            task_id=str(claim.get("task_id")) if isinstance(claim, dict) and claim.get("task_id") else None,
+        )
+    else:
+        try:
+            tmux.ensure_worker_session()
+            store.write_runtime(
+                state="BUSY" if claim else "READY",
+                reason="WORK_CLAIM_ACTIVE" if claim else "PROVIDER_AND_TMUX_ACTIVE",
+                tmux_state="RUNNING",
+                task_id=str(claim.get("task_id")) if isinstance(claim, dict) and claim.get("task_id") else None,
+            )
+        except AgentRuntimeError:
+            store.write_runtime(
+                state="DEGRADED",
+                reason="TMUX_WORKER_START_FAILED",
+                tmux_state="STOPPED",
+                task_id=str(claim.get("task_id")) if isinstance(claim, dict) and claim.get("task_id") else None,
+            )
+    status = store.status()
+    runtime = status.get("runtime") if isinstance(status.get("runtime"), dict) else {}
+    return {
+        "agent_id": "agy-gen",
+        "state": runtime.get("state", "UNKNOWN"),
+        "reason": runtime.get("reason", "UNKNOWN"),
+        "tmux_state": runtime.get("tmux_state", "UNKNOWN"),
+    }
+
+
 def run_worker(state_dir: Path, interval_seconds: float) -> int:
     heartbeat = state_dir / "worker" / "heartbeat.json"
     heartbeat.parent.mkdir(parents=True, exist_ok=True)
@@ -112,11 +165,22 @@ def run_worker(state_dir: Path, interval_seconds: float) -> int:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     while not stop_event.is_set():
+        instance_id = os.environ.get("GENOS_INSTANCE_ID") or "UNKNOWN"
+        try:
+            agent = _reconcile_core_agent(state_dir, instance_id)
+        except Exception as exc:  # watchdog must not take down the core worker
+            agent = {
+                "agent_id": "agy-gen",
+                "state": "DEGRADED",
+                "reason": f"RECONCILE_{type(exc).__name__}",
+                "tmux_state": "UNKNOWN",
+            }
         payload = {
             "status": "ok",
             "role": "worker",
             "version": __version__,
-            "instance_id": os.environ.get("GENOS_INSTANCE_ID") or "UNKNOWN",
+            "instance_id": instance_id,
+            "core_agent": agent,
             "observed_at": _utc_now(),
         }
         temp = heartbeat.with_suffix(".tmp")
