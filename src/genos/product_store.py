@@ -274,15 +274,19 @@ VALUES (1, {owner_uuid}, {_text_expr(username)}, {_bytea_expr(salt)}, {_bytea_ex
         fingerprint: str,
         source: str,
     ) -> CredentialRecord:
+        # Update and revision insert share one data-modifying CTE. If the
+        # optimistic revision check misses, no revision row is inserted.
         changed = self._scalar(
-            "BEGIN;"
-            "INSERT INTO credential_revision(secret_id,revision,fingerprint,source) VALUES ("
-            f"{_uuid_literal(secret_id)},{int(new_revision)},{_text_expr(fingerprint)},{_text_expr(source)});"
-            "WITH updated AS (UPDATE secret_ref SET active_revision="
+            "WITH updated AS ("
+            "UPDATE secret_ref SET active_revision="
             f"{int(new_revision)}, fingerprint={_text_expr(fingerprint)}, status='ACTIVE', updated_at=NOW() "
-            f"WHERE secret_id={_uuid_literal(secret_id)} AND active_revision={int(expected_revision)} RETURNING 1) "
-            "SELECT COUNT(*)::text FROM updated;"
-            "COMMIT;"
+            f"WHERE secret_id={_uuid_literal(secret_id)} AND active_revision={int(expected_revision)} "
+            "RETURNING secret_id"
+            "), inserted AS ("
+            "INSERT INTO credential_revision(secret_id,revision,fingerprint,source) "
+            f"SELECT secret_id,{int(new_revision)},{_text_expr(fingerprint)},{_text_expr(source)} FROM updated "
+            "RETURNING 1"
+            ") SELECT COUNT(*)::text FROM inserted;"
         )
         if int(changed or "0") != 1:
             raise ProductStoreConflict("credential revision changed concurrently")
@@ -351,8 +355,8 @@ VALUES (1, {owner_uuid}, {_text_expr(username)}, {_bytea_expr(salt)}, {_bytea_ex
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise ProductStoreError("Product DB command unavailable") from exc
         if completed.returncode != 0:
-            # Never bubble SQL/stdout/stderr: future caller data is represented
-            # as encoded literals and operational DB messages do not belong in
+            # Never bubble SQL/stdout/stderr: caller data is represented as
+            # encoded literals and operational DB messages do not belong in
             # public API/log surfaces.
             raise ProductStoreError("Product DB operation failed")
         return completed.stdout if return_stdout else ""
