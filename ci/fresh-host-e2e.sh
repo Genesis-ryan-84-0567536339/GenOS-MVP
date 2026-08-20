@@ -138,7 +138,9 @@ RELEASE_SHA256="$(sha256sum "$RELEASE" | awk '{print $1}')"
 scp_guest "$RELEASE" "$SSH_USER@127.0.0.1:/tmp/genos-release.tar.gz"
 ssh_guest "rm -rf /tmp/genos-bootstrap && mkdir /tmp/genos-bootstrap && tar -xzf /tmp/genos-release.tar.gz -C /tmp/genos-bootstrap"
 
-INSTALL_CMD="sudo env GENOS_FRESH_HOST_E2E=1 PYTHONPATH=/tmp/genos-bootstrap/src python3 -m genos install --mode native --release /tmp/genos-release.tar.gz --release-sha256 $RELEASE_SHA256 --git-sha $TESTED_SHA --candidate-e2e --json"
+# Final verification intentionally uses the normal public install path: no
+# candidate-only environment variable and no hidden candidate flag.
+INSTALL_CMD="sudo env PYTHONPATH=/tmp/genos-bootstrap/src python3 -m genos install --mode native --release /tmp/genos-release.tar.gz --release-sha256 $RELEASE_SHA256 --git-sha $TESTED_SHA --json"
 
 echo "==> First one-command install"
 ssh_guest "$INSTALL_CMD" | tee "$WORK_DIR/install.json"
@@ -166,7 +168,8 @@ assert manifest['state'] == 'READY_LOCAL_CORE', manifest
 assert manifest['release']['git_sha'] == '$TESTED_SHA', manifest
 assert manifest['release']['sha256'] == '$RELEASE_SHA256', manifest
 assert manifest['profile_id'] == 'ubuntu-24.04-amd64-native', manifest
-assert manifest['support_evidence'] == 'CANDIDATE_E2E', manifest
+assert manifest['support_class'] == 'SUPPORTED', manifest
+assert manifest['support_evidence'] == 'VERIFIED_PROFILE', manifest
 assert manifest['services']['mission_control_ui'] == 'NOT_IMPLEMENTED_BEFORE_MVP_08_VISUAL_APPROVAL', manifest
 PY"
   ssh_guest "sudo -u genos psql -d genos -tAc 'SELECT 1' | grep -qx 1"
@@ -214,7 +217,7 @@ import json, sys
 payload = {
     "schema_version": "1.0",
     "profile_id": "ubuntu-24.04-amd64-native",
-    "profile_state_during_run": "CANDIDATE_E2E_ONLY",
+    "profile_state_during_run": "VERIFIED",
     "image_url": "$IMAGE_URL",
     "image_sha256": "$IMAGE_SHA256",
     "tested_git_sha": "$TESTED_SHA",
@@ -226,6 +229,8 @@ payload = {
     "rerun": "PASS",
     "reboot_recovery": "PASS",
     "local_core_health": "PASS",
+    "support_class": "SUPPORTED",
+    "support_evidence": "VERIFIED_PROFILE",
     "mission_control_ui": "NOT_IMPLEMENTED_BEFORE_MVP_08_VISUAL_APPROVAL"
 }
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
