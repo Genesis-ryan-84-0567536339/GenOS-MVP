@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import subprocess
+import sys
 import unittest
 from contextlib import redirect_stdout
 
@@ -44,17 +46,51 @@ class RedactionTests(unittest.TestCase):
 
 
 class StateTests(unittest.TestCase):
-    def test_jobrun_survives_store_restart(self) -> None:
+    def test_jobrun_survives_process_restart(self) -> None:
         with tempfile.TemporaryDirectory() as root:
             first = JsonStateStore(root)
             job = JobRun(kind="recon", state=RunState.RUNNING, progress_percent=41, current_step="ports")
             first.save_job(job)
-            second = JsonStateStore(root)
-            loaded = second.load_job(job.job_id)
-            self.assertEqual(loaded.job_id, job.job_id)
-            self.assertEqual(loaded.state, RunState.RUNNING)
-            self.assertEqual(loaded.progress_percent, 41)
-            self.assertEqual(loaded.current_step, "ports")
+            code = (
+                "import json,sys; from genos.state import JsonStateStore; "
+                "job=JsonStateStore(sys.argv[1]).load_job(sys.argv[2]); "
+                "print(json.dumps(job.to_dict(), sort_keys=True))"
+            )
+            env = os.environ.copy()
+            env["PYTHONPATH"] = str(Path(__file__).resolve().parents[1] / "src")
+            completed = subprocess.run(
+                [sys.executable, "-c", code, root, job.job_id],
+                capture_output=True,
+                text=True,
+                check=True,
+                env=env,
+            )
+            loaded = json.loads(completed.stdout)
+            self.assertEqual(loaded["job_id"], job.job_id)
+            self.assertEqual(loaded["state"], RunState.RUNNING.value)
+            self.assertEqual(loaded["progress_percent"], 41)
+            self.assertEqual(loaded["current_step"], "ports")
+
+    def test_status_redacts_preexisting_manifest_secret(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            store = JsonStateStore(root)
+            store.manifest_path.parent.mkdir(parents=True, exist_ok=True)
+            store.manifest_path.write_text('{"state":"READY","api_key":"raw-value"}', encoding="utf-8")
+            old = os.environ.get("GENOS_STATE_DIR")
+            os.environ["GENOS_STATE_DIR"] = root
+            try:
+                buffer = io.StringIO()
+                with redirect_stdout(buffer):
+                    code = main(["status", "--json"])
+                output = buffer.getvalue()
+                self.assertEqual(code, 0)
+                self.assertNotIn("raw-value", output)
+                self.assertIn("[REDACTED]", output)
+            finally:
+                if old is None:
+                    os.environ.pop("GENOS_STATE_DIR", None)
+                else:
+                    os.environ["GENOS_STATE_DIR"] = old
 
     def test_manifest_write_redacts_secret(self) -> None:
         with tempfile.TemporaryDirectory() as root:
