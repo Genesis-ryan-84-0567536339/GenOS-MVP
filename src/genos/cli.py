@@ -23,7 +23,7 @@ from .kanban import InvalidCardTransition, KanbanError, build_kanban_system
 from .kanban_store import CARD_STATES, CardConflict, CardNotFound, KanbanStoreError
 from .mcp_store import McpConflict, McpNotFound, McpStoreError, PostgresMcpStore
 from .observability import GENOS_SERVICES, ObservabilityService
-from .product_store import ProductStoreError
+from .product_store import PostgresProductStore, ProductStoreError
 from .recon import collect_all
 from .redaction import redact
 from .repair import RepairError, RepairService

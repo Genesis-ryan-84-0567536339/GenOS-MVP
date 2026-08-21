@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from argparse import Namespace
+from contextlib import redirect_stdout
 from http.client import HTTPConnection
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from io import StringIO
 from threading import Event, Thread
 import base64
 import hashlib
@@ -11,7 +14,9 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+from unittest.mock import patch
 
+from genos import cli as genos_cli
 from genos.mcp_hub import (
     GenOSMcpHub,
     McpForbidden,
@@ -408,6 +413,31 @@ class McpHubContractTests(unittest.TestCase):
             hashlib.sha256(raw).hexdigest(),
             "ef70b61f99b6d2e5e3b46863822eab08dff6a45bedc7a08914e0e5b133f40203",
         )
+
+    def test_mcp_cli_constructs_product_store_before_mcp_store(self):
+        class FakeProductStore:
+            def ensure_schema(self):
+                return None
+
+        class FakeMcpStore:
+            def __init__(self, product):
+                self.product = product
+
+            def ensure_schema(self):
+                return None
+
+            def list_principals(self):
+                return [{"principal_id": "fixture"}]
+
+        output = StringIO()
+        with (
+            patch.object(genos_cli, "PostgresProductStore", FakeProductStore),
+            patch.object(genos_cli, "PostgresMcpStore", FakeMcpStore),
+            redirect_stdout(output),
+        ):
+            status = genos_cli._mcp(Namespace(mcp_command="principal-list", as_json=True))
+        self.assertEqual(status, 0)
+        self.assertEqual(json.loads(output.getvalue()), {"principals": [{"principal_id": "fixture"}]})
 
     def test_tool_schema_external_references_are_rejected_without_network(self):
         SchemaFetchProbeHandler.hits = []
