@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import time
 from typing import Any
+from urllib.parse import urlsplit
 import uuid
 
 from .agent_runtime import AgentNeedsAction, AgentRuntimeError, AgentRuntimeStore, CORE_AGENT_SESSION, utc_now
@@ -22,7 +23,7 @@ MAX_AUTH_URL_CHARS = 8192
 
 _ANSI_RE = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 _URL_RE = re.compile(r"https://[^\s\x00-\x1f]+")
-_ALLOWED_AUTH_HOSTS = ("accounts.google.com", "antigravity.google")
+_ALLOWED_AUTH_HOSTS = frozenset({"accounts.google.com", "antigravity.google"})
 
 
 class AgentAuthError(AgentRuntimeError):
@@ -60,12 +61,27 @@ def normalize_auth_code(value: str) -> str:
     return code
 
 
+def _allowed_auth_url(candidate: str) -> bool:
+    try:
+        parsed = urlsplit(candidate)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname in _ALLOWED_AUTH_HOSTS
+        and parsed.username is None
+        and parsed.password is None
+        and port in {None, 443}
+    )
+
+
 def parse_auth_terminal(text: str) -> AuthProjection:
     clean = _ANSI_RE.sub("", text).replace("\r", "")
     auth_url: str | None = None
     for match in _URL_RE.finditer(clean):
         candidate = match.group(0).rstrip(")]}>.,;'\"")[:MAX_AUTH_URL_CHARS]
-        if any(host in candidate for host in _ALLOWED_AUTH_HOSTS):
+        if _allowed_auth_url(candidate):
             auth_url = candidate
             break
     lowered = clean.lower()
@@ -101,8 +117,6 @@ class AgentAuthBridge:
     ) -> None:
         self.store = store
         self.tmux = tmux_binary or shutil.which("tmux")
-        # `gemini_binary` remains a constructor compatibility alias for older
-        # fixtures; it is treated as an agy-compatible test binary only.
         managed = Path("/var/lib/genos/tools/antigravity-cli/current/agy")
         self.agy = agy_binary or gemini_binary or (str(managed) if managed.is_file() else shutil.which("agy"))
 
@@ -170,10 +184,6 @@ class AgentAuthBridge:
 
     def _create_auth_window(self) -> None:
         assert self.tmux is not None and self.agy is not None
-        # Antigravity officially uses a manual URL/code flow when it detects a
-        # remote SSH session. The service itself is not reached through SSH, so
-        # we project a minimal SSH environment into this typed auth process to
-        # select the documented remote flow without enabling a browser shell.
         env_command = [
             "/usr/bin/env",
             "NO_COLOR=1",
