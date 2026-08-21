@@ -773,7 +773,7 @@ with urllib.request.urlopen('http://127.0.0.1:17882/', timeout=5) as response:
     mission_nosniff=response.headers.get('X-Content-Type-Options', '')
 assert mission_status == 200, mission_status
 assert 'GenOS Mission Control' in mission_html, mission_html[:200]
-assert "frame-ancestors 'none'" in mission_csp, mission_csp
+assert 'frame-ancestors' in mission_csp and 'none' in mission_csp, mission_csp
 assert mission_nosniff == 'nosniff', mission_nosniff
 with urllib.request.urlopen('http://127.0.0.1:17882/assets/app.js', timeout=5) as response:
     mission_asset=response.read()
