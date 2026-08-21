@@ -146,12 +146,14 @@ echo "==> First one-command install"
 ssh_guest "$INSTALL_CMD" | tee "$WORK_DIR/install.json"
 FIRST_INSTANCE_ID="$(ssh_guest 'sudo cat /etc/genos/instance-id')"
 FIRST_BOOT_ID="$(ssh_guest 'cat /proc/sys/kernel/random/boot_id')"
+FIRST_MCP_PORT="$(ssh_guest 'sudo cat /etc/genos/mcp-port')"
 
 verify_guest() {
-  ssh_guest "sudo systemctl is-active postgresql.service genos-product-api.service genos-runtime.service genos-worker.service genos-mission-control.service"
+  ssh_guest "sudo systemctl is-active postgresql.service genos-product-api.service genos-runtime.service genos-worker.service genos-mcp.service genos-mission-control.service"
   ssh_guest "sudo python3 - <<'PY'
 import json, urllib.error, urllib.request
-for role, port in [('product-api',17880),('runtime',17881),('mission-control',17882)]:
+mcp_port=int(open('/etc/genos/mcp-port', encoding='utf-8').read().strip())
+for role, port in [('product-api',17880),('runtime',17881),('mcp-hub',mcp_port),('mission-control',17882)]:
     with urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=5) as response:
         payload=json.load(response)
     assert response.status == 200, (role, response.status)
@@ -162,13 +164,21 @@ try:
     raise AssertionError('Mission Control root unexpectedly returned success before MVP-08')
 except urllib.error.HTTPError as exc:
     assert exc.code == 503, exc.code
+for protected in ('/api/v1/drive', '/api/v1/cards', '/api/v1/mcp'):
+    try:
+        urllib.request.urlopen('http://127.0.0.1:17880' + protected, timeout=5)
+        raise AssertionError(f'{protected} unexpectedly allowed unauthenticated access')
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 401, (protected, exc.code)
+        error_payload = json.loads(exc.read().decode('utf-8'))
+        assert error_payload['error'] == 'unauthorized', error_payload
+mcp_body=json.dumps({'jsonrpc':'2.0','id':1,'method':'tools/list','params':{}}).encode()
+mcp_req=urllib.request.Request(f'http://127.0.0.1:{mcp_port}/mcp', data=mcp_body, method='POST', headers={'Content-Type':'application/json','MCP-Protocol-Version':'2026-07-28','Mcp-Method':'tools/list'})
 try:
-    urllib.request.urlopen('http://127.0.0.1:17880/api/v1/drive', timeout=5)
-    raise AssertionError('Drive API unexpectedly allowed unauthenticated access')
+    urllib.request.urlopen(mcp_req, timeout=5)
+    raise AssertionError('MCP Hub unexpectedly allowed unauthenticated access')
 except urllib.error.HTTPError as exc:
     assert exc.code == 401, exc.code
-    error_payload = json.loads(exc.read().decode('utf-8'))
-    assert error_payload['error'] == 'unauthorized', error_payload
 assert json.load(open('/var/lib/genos/worker/heartbeat.json', encoding='utf-8'))['status'] == 'ok'
 manifest=json.load(open('/var/lib/genos/manifest.json', encoding='utf-8'))
 assert manifest['state'] == 'READY_LOCAL_CORE', manifest
@@ -182,6 +192,10 @@ PY"
   ssh_guest "sudo -u genos psql -d genos -tAc 'SELECT 1' | grep -qx 1"
   ssh_guest "sudo -u genos psql -d genos -tAc \"SELECT CASE WHEN to_regclass('public.drive_binding') IS NOT NULL THEN 1 ELSE 0 END\" | grep -qx 1"
   ssh_guest "sudo -u genos psql -d genos -tAc \"SELECT CASE WHEN EXISTS (SELECT 1 FROM genos_schema_migration WHERE version=4) THEN 1 ELSE 0 END\" | grep -qx 1"
+  ssh_guest "sudo -u genos psql -d genos -tAc \"SELECT CASE WHEN to_regclass('public.card') IS NOT NULL AND to_regclass('public.card_event') IS NOT NULL AND to_regclass('public.card_artifact') IS NOT NULL THEN 1 ELSE 0 END\" | grep -qx 1"
+  ssh_guest "sudo -u genos psql -d genos -tAc \"SELECT CASE WHEN EXISTS (SELECT 1 FROM genos_schema_migration WHERE version=5) THEN 1 ELSE 0 END\" | grep -qx 1"
+  ssh_guest "sudo -u genos psql -d genos -tAc \"SELECT CASE WHEN to_regclass('public.mcp_principal') IS NOT NULL AND to_regclass('public.mcp_upstream') IS NOT NULL AND to_regclass('public.mcp_audit_event') IS NOT NULL THEN 1 ELSE 0 END\" | grep -qx 1"
+  ssh_guest "sudo -u genos psql -d genos -tAc \"SELECT CASE WHEN EXISTS (SELECT 1 FROM genos_schema_migration WHERE version=6) THEN 1 ELSE 0 END\" | grep -qx 1"
 }
 verify_guest
 
@@ -192,6 +206,8 @@ if [[ "$SECOND_INSTANCE_ID" != "$FIRST_INSTANCE_ID" ]]; then
   echo "instance_id changed across rerun" >&2
   exit 1
 fi
+SECOND_MCP_PORT="$(ssh_guest 'sudo cat /etc/genos/mcp-port')"
+if [[ "$SECOND_MCP_PORT" != "$FIRST_MCP_PORT" ]]; then echo "MCP port changed across rerun" >&2; exit 1; fi
 verify_guest
 
 echo "==> Reboot recovery"
@@ -219,6 +235,8 @@ if [[ "$THIRD_INSTANCE_ID" != "$FIRST_INSTANCE_ID" ]]; then
   echo "instance_id changed across reboot" >&2
   exit 1
 fi
+THIRD_MCP_PORT="$(ssh_guest 'sudo cat /etc/genos/mcp-port')"
+if [[ "$THIRD_MCP_PORT" != "$FIRST_MCP_PORT" ]]; then echo "MCP port changed across reboot" >&2; exit 1; fi
 verify_guest
 
 python3 - "$EVIDENCE" <<PY
@@ -240,6 +258,11 @@ payload = {
     "local_core_health": "PASS",
     "drive_schema_v4": "PASS",
     "drive_api_owner_auth_boundary": "PASS",
+    "kanban_schema_v5": "PASS",
+    "card_api_owner_auth_boundary": "PASS",
+    "mcp_schema_v6": "PASS",
+    "mcp_hub_local_auth_boundary": "PASS",
+    "mcp_port_persistence": "PASS",
     "support_class": "SUPPORTED",
     "support_evidence": "VERIFIED_PROFILE",
     "mission_control_ui": "NOT_IMPLEMENTED_BEFORE_MVP_08_VISUAL_APPROVAL"

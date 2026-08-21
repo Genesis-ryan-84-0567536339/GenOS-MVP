@@ -4,7 +4,9 @@ from dataclasses import dataclass
 import hashlib
 import json
 from typing import Any, Callable, Protocol
+from urllib import error as urlerror
 from urllib import parse as urlparse
+from urllib import request as urlrequest
 
 from .artifact_store import CardArtifactStore, MAX_ATTACHMENT_BYTES
 from .auth_service import CredentialService
@@ -111,10 +113,18 @@ class GoogleDriveCollaborationRemote(GoogleDriveRemote):
         return result
 
     def read_bytes(self, file_id: str, *, max_bytes: int) -> bytes:
-        data = self._bytes_request("GET", f"{self.API}/files/{urlparse.quote(file_id)}?alt=media")  # noqa: SLF001
-        if len(data) > max_bytes:
-            return data[: max_bytes + 1]
-        return data
+        request = urlrequest.Request(
+            f"{self.API}/files/{urlparse.quote(file_id)}?alt=media", method="GET",
+            headers={"Authorization": f"Bearer {self._token}", "Accept": "application/octet-stream"},  # noqa: SLF001
+        )
+        try:
+            with urlrequest.urlopen(request, timeout=self.timeout) as response:  # noqa: S310 - fixed Google Drive endpoint
+                return response.read(max_bytes + 1)
+        except urlerror.HTTPError as exc:
+            if exc.code in {401, 403}: raise DriveNeedsAction("Drive credential rejected") from exc
+            raise DriveRemoteError(f"Drive HTTP status {exc.code}") from exc
+        except (urlerror.URLError, TimeoutError, OSError) as exc:
+            raise DriveRemoteError("Drive network request failed") from exc
 
     def upsert_bytes(
         self,

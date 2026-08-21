@@ -165,6 +165,13 @@ def run_worker(state_dir: Path, interval_seconds: float) -> int:
     stop_event = threading.Event(); first_tick = True
     next_drive_scan = time.monotonic() + DRIVE_SCAN_INTERVAL_SECONDS
     drive_projection: dict[str, object] = {"state": "SCHEDULED", "remote_write": False, "observed_at": _utc_now()}
+    try:
+        from .kanban import build_kanban_system
+        kanban_system = build_kanban_system()
+        kanban_projection: dict[str, object] = {"state": "IDLE", "reason": "NOT_TICKED", "observed_at": _utc_now()}
+    except Exception as exc:
+        kanban_system = None
+        kanban_projection = {"state": "DEGRADED", "reason": f"KANBAN_INIT_{type(exc).__name__}", "observed_at": _utc_now()}
     def _stop(_signum: int, _frame: object) -> None: stop_event.set()
     signal.signal(signal.SIGTERM, _stop); signal.signal(signal.SIGINT, _stop)
     while not stop_event.is_set():
@@ -178,7 +185,13 @@ def run_worker(state_dir: Path, interval_seconds: float) -> int:
         if now >= next_drive_scan:
             drive_projection = _scheduled_drive_scan()
             next_drive_scan = now + DRIVE_SCAN_INTERVAL_SECONDS
-        payload = {"status": "ok", "role": "worker", "version": __version__, "instance_id": instance_id, "core_agent": agent, "drive_report": drive_projection, "observed_at": _utc_now()}
+        if kanban_system is not None:
+            try:
+                tick = kanban_system.agent_tick()
+                kanban_projection = {**tick, "observed_at": _utc_now()}
+            except Exception as exc:
+                kanban_projection = {"state": "DEGRADED", "reason": f"KANBAN_TICK_{type(exc).__name__}", "observed_at": _utc_now()}
+        payload = {"status": "ok", "role": "worker", "version": __version__, "instance_id": instance_id, "core_agent": agent, "drive_report": drive_projection, "kanban_agent": kanban_projection, "observed_at": _utc_now()}
         temp = heartbeat.with_suffix(".tmp"); temp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"); os.replace(temp, heartbeat)
         stop_event.wait(interval_seconds)
     return 0
@@ -186,7 +199,7 @@ def run_worker(state_dir: Path, interval_seconds: float) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m genos.core_service")
-    parser.add_argument("role", choices=("product-api", "runtime", "worker", "mission-control"))
+    parser.add_argument("role", choices=("product-api", "runtime", "worker", "mcp", "mission-control"))
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--state-dir", default=os.environ.get("GENOS_STATE_DIR", "/var/lib/genos"))
     parser.add_argument("--worker-interval", type=float, default=5.0)
@@ -196,6 +209,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.role == "worker": return run_worker(Path(args.state_dir), args.worker_interval)
+    if args.role == "mcp":
+        from .mcp_transport import serve_mcp
+        port = args.port or int(os.environ.get("GENOS_MCP_PORT", "0") or "0")
+        if not port: raise SystemExit("GENOS_MCP_PORT or --port is required for MCP role")
+        return serve_mcp(port=port)
     if args.port is None: raise SystemExit("--port is required for HTTP roles")
     return serve_http(args.role, args.port)
 
