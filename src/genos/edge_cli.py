@@ -16,7 +16,7 @@ from .secret_provider import LocalFileSecretProvider
 
 
 KEY_URL = "https://pkg.cloudflare.com/cloudflare-main.gpg"
-APT_REPO = "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared noble main\n"
+APT_REPO = "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main\n"
 EDGE_UNIT = """[Unit]
 Description=GenOS optional Cloudflare Edge runtime
 After=network.target postgresql.service genos-mission-control.service
@@ -79,7 +79,16 @@ def _emit(payload: object, *, as_json: bool) -> None:
 
 
 def _run_checked(argv: list[str]) -> None:
-    completed = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=180, shell=False, check=False)
+    completed = subprocess.run(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=180,
+        shell=False,
+        check=False,
+    )
     if completed.returncode != 0:
         raise EdgeError(f"typed system action failed: {argv[0]} {argv[1] if len(argv) > 1 else ''}")
 
@@ -106,7 +115,15 @@ def _provision() -> dict[str, object]:
     binary = shutil.which("cloudflared")
     if not binary:
         raise EdgeError("cloudflared package installed without executable")
-    version = subprocess.run([binary, "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=10, shell=False, check=False)
+    version = subprocess.run(
+        [binary, "--version"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=10,
+        shell=False,
+        check=False,
+    )
     if version.returncode != 0:
         raise EdgeError("cloudflared version probe failed")
     unit_path = Path("/etc/systemd/system/genos-edge.service")
@@ -114,7 +131,12 @@ def _provision() -> dict[str, object]:
     os.chmod(unit_path, 0o644)
     _run_checked(["/usr/bin/systemctl", "daemon-reload"])
     _run_checked(["/usr/bin/systemctl", "enable", "--now", "genos-edge.service"])
-    return {"state": "READY", "cloudflared": version.stdout.strip()[:200], "service": "genos-edge.service", "token_in_argv": False}
+    return {
+        "state": "READY",
+        "cloudflared": version.stdout.strip()[:200],
+        "service": "genos-edge.service",
+        "token_in_argv": False,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -127,7 +149,13 @@ def main(argv: list[str] | None = None) -> int:
             if args.command == "status":
                 result = service.status()
             elif args.command == "configure":
-                result = service.configure(api_secret_id=args.api_secret_id, account_id=args.account_id, zone_id=args.zone_id, hostname=args.hostname, tunnel_name=args.tunnel_name)
+                result = service.configure(
+                    api_secret_id=args.api_secret_id,
+                    account_id=args.account_id,
+                    zone_id=args.zone_id,
+                    hostname=args.hostname,
+                    tunnel_name=args.tunnel_name,
+                )
             elif args.command == "verify":
                 result = service.verify()
             elif args.command == "disable":
@@ -139,7 +167,10 @@ def main(argv: list[str] | None = None) -> int:
         _emit(result, as_json=args.as_json)
         return 0
     except EdgeError as exc:
-        _emit({"state": "NEEDS_ACTION", "error_type": type(exc).__name__, "message": str(exc)}, as_json=getattr(args, "as_json", False))
+        _emit(
+            {"state": "NEEDS_ACTION", "error_type": type(exc).__name__, "message": str(exc)},
+            as_json=getattr(args, "as_json", False),
+        )
         return 4
 
 
