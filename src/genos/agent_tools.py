@@ -21,8 +21,6 @@ NODE_VERSION = "24.19.0"
 NODE_ARCHIVE = f"node-v{NODE_VERSION}-linux-x64.tar.xz"
 NODE_URL = f"https://nodejs.org/dist/v{NODE_VERSION}/{NODE_ARCHIVE}"
 NODE_SHA256 = "14b342e71204f811bde6153be8e04b62aef63c236fef92b55f9c83154b409647"
-# Historical MVP-04 constants are retained only for migration/test provenance.
-# Forward personal-account runtime uses Google Antigravity CLI (`agy`).
 GEMINI_CLI_VERSION = "0.53.0"
 GEMINI_NPM_SPEC = f"@google/gemini-cli@{GEMINI_CLI_VERSION}"
 DEFAULT_TOOLS_ROOT = Path("/var/lib/genos/tools")
@@ -73,14 +71,7 @@ class AgentToolState:
 
 
 class AgentToolProvisioner:
-    """Typed toolchain provisioner for resident `agy-gen`.
-
-    Node remains a reproducible pinned dependency with official checksum
-    verification. Forward provider CLI is Google Antigravity (`agy`), installed
-    from the official stable release manifest into a GenOS-owned version store.
-    The provider binary is not pinned forever: GenOS manages stable-channel
-    updates, atomic cutover and rollback through AntigravityCliManager.
-    """
+    """Typed toolchain provisioner for resident `agy-gen`."""
 
     def __init__(self, root: Path | str = DEFAULT_TOOLS_ROOT) -> None:
         self.root = Path(root)
@@ -118,13 +109,18 @@ class AgentToolProvisioner:
             raise AgentToolError("supported Linux host evidence unavailable")
         if not _is_verified_ubuntu_x64():
             raise AgentToolError("tool provisioner currently supports only verified Ubuntu 24.04 x86_64 native profile")
+        cpu = self._agy_cpu_feature_evidence()
+        if not cpu["aes"] or not cpu["pclmulqdq"]:
+            raise AgentToolError(
+                "Antigravity CLI CPU prerequisites unavailable: "
+                f"CPU_AES={int(cpu['aes'])}; CPU_PCLMUL={int(cpu['pclmulqdq'])}"
+            )
         self.root.mkdir(parents=True, exist_ok=True, mode=0o755)
         self._ensure_tmux()
         self._ensure_node()
         self.agy_root.mkdir(parents=True, exist_ok=True, mode=0o755)
         update = self.agy.ensure_latest(force=True)
         if update.update_state in {"FAILED", "ROLLED_BACK"} or not self.agy.active_binary.is_file():
-            cpu = self._agy_cpu_feature_evidence()
             raise AgentToolError(
                 "Antigravity CLI stable provisioning failed: "
                 f"{update.evidence}; CPU_AES={int(cpu['aes'])}; CPU_PCLMUL={int(cpu['pclmulqdq'])}"
@@ -150,7 +146,7 @@ class AgentToolProvisioner:
                 "release_channel": "official-installer-published-stable-manifest",
                 "managed_update": self.agy.status(),
                 "native_auto_update_disabled": True,
-                "cpu_prerequisites": self._agy_cpu_feature_evidence(),
+                "cpu_prerequisites": cpu,
             },
             "tmux": {"version": state.tmux_version},
             "contains_secrets": False,
