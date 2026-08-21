@@ -125,7 +125,11 @@ class AgentToolProvisioner:
         self.agy_root.mkdir(parents=True, exist_ok=True, mode=0o755)
         update = self.agy.ensure_latest(force=True)
         if update.update_state in {"FAILED", "ROLLED_BACK"} or not self.agy.active_binary.is_file():
-            raise AgentToolError(f"Antigravity CLI stable provisioning failed: {update.evidence}")
+            cpu = self._agy_cpu_feature_evidence()
+            raise AgentToolError(
+                "Antigravity CLI stable provisioning failed: "
+                f"{update.evidence}; CPU_AES={int(cpu['aes'])}; CPU_PCLMUL={int(cpu['pclmulqdq'])}"
+            )
         self._grant_agy_update_ownership()
         state = self.inspect()
         if state.state != "READY":
@@ -146,6 +150,7 @@ class AgentToolProvisioner:
                 "source": AGY_INSTALLER_URL,
                 "managed_update": self.agy.status(),
                 "native_auto_update_disabled": True,
+                "cpu_prerequisites": self._agy_cpu_feature_evidence(),
             },
             "tmux": {"version": state.tmux_version},
             "contains_secrets": False,
@@ -210,6 +215,18 @@ class AgentToolProvisioner:
         self._run(["apt-get", "install", "-y", "curl", "ca-certificates"], timeout=600)
         if not shutil.which("curl") and not shutil.which("wget"):
             raise AgentToolError("Antigravity installer prerequisite install completed without curl or wget")
+
+    @staticmethod
+    def _agy_cpu_feature_evidence() -> dict[str, bool]:
+        flags: set[str] = set()
+        try:
+            for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
+                if line.lower().startswith("flags") and ":" in line:
+                    flags.update(line.split(":", 1)[1].strip().split())
+                    break
+        except OSError:
+            pass
+        return {"aes": "aes" in flags, "pclmulqdq": "pclmulqdq" in flags}
 
     def _run(self, argv: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
         try:
