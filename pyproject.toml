@@ -13,10 +13,10 @@ dependencies = ["jsonschema>=4.10,<5"]
 genos = "genos.cli:main"
 
 [tool.setuptools]
-package-dir = {"" = "src"}
+package-dir = {"" = "src"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
 [tool.setuptools.package-data]
-genos = ["schemas/*.json"]
+genos = ["schemas/*.json", "web/*.html", "web/*.css", "web/*.js"]
