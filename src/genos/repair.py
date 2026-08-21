@@ -99,26 +99,43 @@ class RepairService:
         )
 
     def execute(self, plan: RepairPlan) -> dict[str, Any]:
-        if not plan.mutation_allowed:
-            return {"state": "NO_ACTION", "plan": plan.to_dict()}
         if plan.action != self.ACTION_RESTART_SERVICE or GENOS_SERVICES.get(plan.target) != plan.unit:
             raise RepairError("repair plan is not a current typed registry action")
+        if not plan.mutation_allowed:
+            return {"state": "NO_ACTION", "plan": plan.to_dict()}
+
+        # A plan is only a point-in-time proposal. Re-collect the authoritative
+        # observation immediately before mutation so a recovered/unknown service
+        # cannot be restarted from stale evidence.
+        current_plan = self.plan(action=plan.action, target=plan.target)
+        if current_plan.unit != plan.unit:
+            raise RepairError("repair registry changed after plan creation")
+        if not current_plan.mutation_allowed:
+            return redact(
+                {
+                    "state": "NO_ACTION",
+                    "reason": "PRECONDITION_CHANGED",
+                    "plan": current_plan.to_dict(),
+                    "superseded_plan": plan.to_dict(),
+                }
+            )
+
         if os.geteuid() != 0:
             raise RepairError("typed service repair requires root privileges")
         systemctl = shutil.which("systemctl")
         if not systemctl:
             raise RepairError("systemctl is unavailable")
-        restarted = _run([systemctl, "restart", plan.unit], timeout=30.0)
+        restarted = _run([systemctl, "restart", current_plan.unit], timeout=30.0)
         if restarted.returncode != 0:
             raise RepairError("typed service restart failed")
-        verified = _run([systemctl, "is-active", plan.unit], timeout=10.0)
+        verified = _run([systemctl, "is-active", current_plan.unit], timeout=10.0)
         current = (verified.stdout.strip() or "unknown")[:80]
         state = "SUCCEEDED" if verified.returncode == 0 and current == "active" else "FAILED_VERIFY"
         return redact(
             {
                 "state": state,
-                "plan": plan.to_dict(),
-                "verification": {"unit": plan.unit, "state": current},
+                "plan": current_plan.to_dict(),
+                "verification": {"unit": current_plan.unit, "state": current},
             }
         )
 
