@@ -59,6 +59,7 @@ class DriveConnectionProjection:
     state: str
     instance_id: str
     secret_id: str | None
+    root_name: str | None
     root_folder_id: str | None
     reports_folder_id: str | None
     kanban_folder_id: str | None
@@ -74,6 +75,7 @@ class DriveConnectionProjection:
             "state": self.state,
             "instance_id": self.instance_id,
             "secret_id": self.secret_id,
+            "root_name": self.root_name,
             "root_folder_id": self.root_folder_id,
             "reports_folder_id": self.reports_folder_id,
             "kanban_folder_id": self.kanban_folder_id,
@@ -113,6 +115,7 @@ class DriveConnectionService:
                 state="UNCONFIGURED",
                 instance_id=self.instance_id,
                 secret_id=None,
+                root_name=None,
                 root_folder_id=None,
                 reports_folder_id=None,
                 kanban_folder_id=None,
@@ -135,7 +138,13 @@ class DriveConnectionService:
         if existing_secret and str(existing_secret) != secret_id and current.get("state") == "READY":
             raise DriveNeedsAction("Drive credential change requires explicit rebind")
 
-        checkpoint = self._checkpoint(current, state="NEEDS_AUTH", secret_id=secret_id, last_error_code=None)
+        checkpoint = self._checkpoint(
+            current,
+            state="NEEDS_AUTH",
+            secret_id=secret_id,
+            root_name=root_name,
+            last_error_code=None,
+        )
         try:
             raw_access_token = self.credentials.get_secret_for_consumer(secret_id, consumer=DRIVE_CONSUMER_SCOPE)
             remote = self.remote_factory(raw_access_token)
@@ -228,6 +237,7 @@ class DriveConnectionService:
             "state": str(base.get("state") or "UNCONFIGURED"),
             "instance_id": self.instance_id,
             "secret_id": _optional_text(base.get("secret_id")),
+            "root_name": _optional_text(base.get("root_name")),
             "root_folder_id": _optional_text(base.get("root_folder_id")),
             "reports_folder_id": _optional_text(base.get("reports_folder_id")),
             "kanban_folder_id": _optional_text(base.get("kanban_folder_id")),

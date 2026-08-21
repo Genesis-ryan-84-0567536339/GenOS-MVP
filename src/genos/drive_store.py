@@ -14,6 +14,7 @@ _ALLOWED_KEYS = {
     "state",
     "instance_id",
     "secret_id",
+    "root_name",
     "root_folder_id",
     "reports_folder_id",
     "kanban_folder_id",

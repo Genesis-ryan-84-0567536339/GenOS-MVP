@@ -99,7 +99,20 @@ class DriveSystemServices:
 
     def scheduled_scan(self) -> dict[str, Any]:
         status = self.connection.status()
-        if status.get("state") != "READY":
+        drive_state = str(status.get("state") or "UNKNOWN")
+        if drive_state == "DEGRADED":
+            secret_id = _required_text(status, "secret_id")
+            root_name = _optional_text(status.get("root_name")) or "GenOS"
+            recovered = self.connect(secret_id=secret_id, root_name=root_name)
+            initial_report = recovered.get("initial_report") if isinstance(recovered.get("initial_report"), dict) else {}
+            return {
+                "state": "RECOVERED",
+                "remote_write": bool(initial_report.get("remote_write", False)),
+                "report": initial_report,
+            }
+        if drive_state == "NEEDS_ACTION":
+            return {"state": "NEEDS_ACTION", "remote_write": False}
+        if drive_state != "READY":
             return {"state": "NOT_CONFIGURED", "remote_write": False}
         return self.reports.publish(manual=False)
 
