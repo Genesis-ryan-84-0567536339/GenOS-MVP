@@ -1,17 +1,22 @@
 name: MVP-09 Finalize Gates Once
 
 on:
-  push:
+  pull_request:
     branches:
-      - plan/mvp-09-mission-control-ui
+      - main
     paths:
       - .github/workflows/mvp09-finalize-gates-once.yml
+      - ci/mvp09_browser_e2e.py
+      - ci/fresh-host-e2e.sh
+      - ci/fresh-host-mvp03-e2e.sh
+      - src/genos/install.py
 
 permissions:
   contents: write
 
 jobs:
   patch:
+    if: github.head_ref == 'plan/mvp-09-mission-control-ui'
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -33,7 +38,6 @@ jobs:
                   raise SystemExit(f"{path}: expected {expected} exact matches, found {count}")
               path.write_text(text.replace(old, new), encoding="utf-8")
 
-          # Browser E2E: strict semantic locator; title appears both in board and detail by design.
           replace_exact(
               "ci/mvp09_browser_e2e.py",
               'page.get_by_text("Browser fixture card", exact=True).wait_for()',
@@ -63,7 +67,6 @@ jobs:
           replace_exact("ci/fresh-host-e2e.sh", old_ui_probe, new_ui_probe)
           replace_exact("ci/fresh-host-mvp03-e2e.sh", old_ui_probe, new_ui_probe)
 
-          # The Owner-approved visual gate has passed; manifest/evidence must no longer claim UI is blocked.
           replace_exact(
               "src/genos/install.py",
               '"mission_control_ui": "NOT_IMPLEMENTED_BEFORE_MVP_08_VISUAL_APPROVAL"',
