@@ -1,4 +1,4 @@
-name: PLAN MVP-07 Typed Integration Patch
+name: PLAN MVP-07 Finalize Typed Integration
 
 on:
   pull_request:
@@ -10,321 +10,33 @@ permissions:
   contents: write
 
 jobs:
-  patch:
+  finalize:
     runs-on: ubuntu-24.04
-    timeout-minutes: 8
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.head_ref }}
           fetch-depth: 1
-      - name: Apply typed MVP-07 integration patch
+      - name: Apply typed source integration
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-
-          def replace_once(path: str, old: str, new: str) -> None:
-              p = Path(path)
-              text = p.read_text(encoding='utf-8')
-              if text.count(old) != 1:
-                  raise SystemExit(f'{path}: expected exactly one anchor, found {text.count(old)}')
-              p.write_text(text.replace(old, new), encoding='utf-8')
-
-          # Product API composition and typed Card routes.
-          path = 'src/genos/product_api.py'
-          replace_once(path,
-              'from .drive_system import DriveSystemError, DriveSystemServices, build_drive_system\n',
-              'from .drive_system import DriveSystemError, DriveSystemServices, build_drive_system\n'
-              'from .artifact_store import ArtifactStoreError\n'
-              'from .drive_collab import DriveCollaborationError\n'
-              'from .kanban import InvalidCardTransition, KanbanError, KanbanSystem, build_kanban_system\n'
-              'from .kanban_store import CardConflict, CardNotFound, KanbanStoreError\n')
-          replace_once(path,
-              '_SYSTEM_REPORT = "/api/v1/reports/system"\n',
-              '_SYSTEM_REPORT = "/api/v1/reports/system"\n'
-              '_CARDS_BASE = "/api/v1/cards"\n'
-              '_KANBAN_SYNC = "/api/v1/kanban/sync"\n'
-              '_KANBAN_AGENT_TICK = "/api/v1/kanban/agent-tick"\n'
-              '_CARD_ITEM = re.compile(r"^/api/v1/cards/([0-9a-fA-F-]{36})$")\n'
-              '_CARD_ACTION = re.compile(r"^/api/v1/cards/([0-9a-fA-F-]{36})/(transition|comment)$")\n')
-          replace_once(path,
-              '        drive_system: DriveSystemServices | None = None,\n    ) -> None:\n',
-              '        drive_system: DriveSystemServices | None = None,\n'
-              '        kanban_system: KanbanSystem | None = None,\n'
-              '    ) -> None:\n')
-          replace_once(path,
-              '        self.drive_system = drive_system\n',
-              '        self.drive_system = drive_system\n'
-              '        self.kanban_system = kanban_system\n')
-          replace_once(path,
-              '        drive_system = build_drive_system(product_store=store, credentials=credentials, observability=observability)\n',
-              '        drive_system = build_drive_system(product_store=store, credentials=credentials, observability=observability)\n'
-              '        kanban_system = build_kanban_system(product_store=store, credentials=credentials, agent_root=agent_root)\n')
-          replace_once(path,
-              '            observability,\n            drive_system,\n        )\n',
-              '            observability,\n'
-              '            drive_system,\n'
-              '            kanban_system,\n'
-              '        )\n')
-          replace_once(path,
-              '    def publish_system_report(self, *, manual: bool = True) -> dict[str, Any]:\n        return self._drive().reports.publish(manual=manual)\n\n    def _drive(self) -> DriveSystemServices:\n',
-              '    def publish_system_report(self, *, manual: bool = True) -> dict[str, Any]:\n'
-              '        return self._drive().reports.publish(manual=manual)\n\n'
-              '    def cards_list(self) -> list[dict[str, Any]]:\n'
-              '        return self._kanban().list_cards()\n\n'
-              '    def card_get(self, card_id: str) -> dict[str, Any]:\n'
-              '        return self._kanban().get_card(card_id)\n\n'
-              '    def card_create(self, *, title: str, description: str = "", assignee_agent_id: str | None = "agy-gen") -> dict[str, Any]:\n'
-              '        return self._kanban().create_card(title=title, description=description, assignee_agent_id=assignee_agent_id)\n\n'
-              '    def card_transition(self, card_id: str, *, to_state: str, reason: str = "OWNER_ACTION") -> dict[str, Any]:\n'
-              '        return self._kanban().transition(card_id, to_state=to_state, reason=reason)\n\n'
-              '    def card_comment(self, card_id: str, *, text: str) -> dict[str, Any]:\n'
-              '        return self._kanban().add_comment(card_id, text=text)\n\n'
-              '    def kanban_sync(self) -> dict[str, Any]:\n'
-              '        return self._kanban().sync_drive_inbox()\n\n'
-              '    def kanban_agent_tick(self) -> dict[str, Any]:\n'
-              '        return self._kanban().agent_tick()\n\n'
-              '    def _kanban(self) -> KanbanSystem:\n'
-              '        if self.kanban_system is None:\n'
-              '            raise KanbanError("Kanban system is not configured")\n'
-              '        return self.kanban_system\n\n'
-              '    def _drive(self) -> DriveSystemServices:\n')
-          replace_once(path,
-              '            if self.path == _DRIVE_BASE:\n',
-              '            if self.path == _CARDS_BASE:\n'
-              '                self.app.auth.authenticate(self._bearer_token())\n'
-              '                self._json(200, {"cards": self.app.cards_list()})\n'
-              '                return\n'
-              '            card_item = _CARD_ITEM.match(self.path)\n'
-              '            if card_item:\n'
-              '                self.app.auth.authenticate(self._bearer_token())\n'
-              '                self._json(200, self.app.card_get(card_item.group(1)))\n'
-              '                return\n'
-              '            if self.path == _DRIVE_BASE:\n')
-          replace_once(path,
-              '            if self.path == f"{_DRIVE_BASE}/connect":\n',
-              '            if self.path == _CARDS_BASE:\n'
-              '                self.app.auth.authenticate(self._bearer_token())\n'
-              '                body = self._read_json()\n'
-              '                description = body.get("description", "")\n'
-              '                if not isinstance(description, str):\n'
-              '                    raise AuthError("description must be a string")\n'
-              '                assignee = body.get("assignee_agent_id", "agy-gen")\n'
-              '                if assignee is not None and assignee != "agy-gen":\n'
-              '                    raise AuthError("MVP only supports assignee agy-gen")\n'
-              '                card = self.app.card_create(title=_required_text(body, "title"), description=description, assignee_agent_id=assignee)\n'
-              '                self._json(201, {"card": card})\n'
-              '                return\n'
-              '            if self.path == _KANBAN_SYNC:\n'
-              '                self.app.auth.authenticate(self._bearer_token())\n'
-              '                self._reject_nonempty_body()\n'
-              '                self._json(200, {"sync": self.app.kanban_sync()})\n'
-              '                return\n'
-              '            if self.path == _KANBAN_AGENT_TICK:\n'
-              '                self.app.auth.authenticate(self._bearer_token())\n'
-              '                self._reject_nonempty_body()\n'
-              '                self._json(200, {"agent_tick": self.app.kanban_agent_tick()})\n'
-              '                return\n'
-              '            card_action = _CARD_ACTION.match(self.path)\n'
-              '            if card_action:\n'
-              '                self.app.auth.authenticate(self._bearer_token())\n'
-              '                card_id, operation = card_action.groups()\n'
-              '                body = self._read_json()\n'
-              '                if operation == "transition":\n'
-              '                    reason = body.get("reason", "OWNER_ACTION")\n'
-              '                    if not isinstance(reason, str):\n'
-              '                        raise AuthError("reason must be a string")\n'
-              '                    self._json(200, self.app.card_transition(card_id, to_state=_required_text(body, "to_state"), reason=reason))\n'
-              '                    return\n'
-              '                self._json(200, self.app.card_comment(card_id, text=_required_text(body, "text")))\n'
-              '                return\n'
-              '            if self.path == f"{_DRIVE_BASE}/connect":\n')
-          replace_once(path,
-              '        if isinstance(exc, CredentialNotFound):\n            self._json(404, {"error": "credential_not_found"})\n            return\n',
-              '        if isinstance(exc, CredentialNotFound):\n'
-              '            self._json(404, {"error": "credential_not_found"})\n'
-              '            return\n'
-              '        if isinstance(exc, CardNotFound):\n'
-              '            self._json(404, {"error": "card_not_found"})\n'
-              '            return\n'
-              '        if isinstance(exc, (CardConflict, InvalidCardTransition)):\n'
-              '            self._json(409, {"error": "card_conflict"})\n'
-              '            return\n')
-          replace_once(path,
-              '        if isinstance(exc, (AuthError, CredentialError, AgentAuthError, DriveBridgeError, ValueError)):\n',
-              '        if isinstance(exc, (AuthError, CredentialError, AgentAuthError, DriveBridgeError, KanbanError, ArtifactStoreError, DriveCollaborationError, ValueError)):\n')
-          replace_once(path,
-              '            (ProductStoreError, SecretProviderError, AgentRuntimeError, DriveStoreError, DriveSystemError, ReportBridgeError),\n',
-              '            (ProductStoreError, SecretProviderError, AgentRuntimeError, DriveStoreError, DriveSystemError, ReportBridgeError, KanbanStoreError),\n')
-
-          # CLI typed Kanban commands.
-          path = 'src/genos/cli.py'
-          replace_once(path,
-              'from .install import InstallError, NativeProvisioner, ReleaseArtifact, build_native_install\n',
-              'from .install import InstallError, NativeProvisioner, ReleaseArtifact, build_native_install\n'
-              'from .kanban import InvalidCardTransition, KanbanError, build_kanban_system\n'
-              'from .kanban_store import CARD_STATES, CardConflict, CardNotFound, KanbanStoreError\n')
-          replace_once(path,
-              '    report = sub.add_parser("report", help="Build/publish reports from the shared observability authority")\n',
-              '    kanban = sub.add_parser("kanban", help="Operate the authoritative local Kanban and Drive collaboration bridge")\n'
-              '    kanban_sub = kanban.add_subparsers(dest="kanban_command", required=True)\n'
-              '    kanban_list = kanban_sub.add_parser("list")\n'
-              '    kanban_list.add_argument("--status", choices=CARD_STATES, default=None)\n'
-              '    kanban_list.add_argument("--json", action="store_true", dest="as_json")\n'
-              '    kanban_show = kanban_sub.add_parser("show")\n'
-              '    kanban_show.add_argument("--card-id", required=True)\n'
-              '    kanban_show.add_argument("--json", action="store_true", dest="as_json")\n'
-              '    kanban_create = kanban_sub.add_parser("create")\n'
-              '    kanban_create.add_argument("--title", required=True)\n'
-              '    kanban_create.add_argument("--description", default="")\n'
-              '    kanban_create.add_argument("--json", action="store_true", dest="as_json")\n'
-              '    kanban_transition = kanban_sub.add_parser("transition")\n'
-              '    kanban_transition.add_argument("--card-id", required=True)\n'
-              '    kanban_transition.add_argument("--to", choices=CARD_STATES, required=True, dest="to_state")\n'
-              '    kanban_transition.add_argument("--reason", default="OWNER_ACTION")\n'
-              '    kanban_transition.add_argument("--json", action="store_true", dest="as_json")\n'
-              '    kanban_comment = kanban_sub.add_parser("comment")\n'
-              '    kanban_comment.add_argument("--card-id", required=True)\n'
-              '    kanban_comment.add_argument("--text", required=True)\n'
-              '    kanban_comment.add_argument("--json", action="store_true", dest="as_json")\n'
-              '    for name in ("sync", "agent-tick"):\n'
-              '        item = kanban_sub.add_parser(name)\n'
-              '        item.add_argument("--json", action="store_true", dest="as_json")\n\n'
-              '    report = sub.add_parser("report", help="Build/publish reports from the shared observability authority")\n')
-          replace_once(path,
-              '    if args.command == "report":\n        return _report(args)\n',
-              '    if args.command == "kanban":\n'
-              '        return _kanban(args)\n'
-              '    if args.command == "report":\n'
-              '        return _report(args)\n')
-          replace_once(path,
-              'def _report(args: argparse.Namespace) -> int:\n',
-              'def _kanban(args: argparse.Namespace) -> int:\n'
-              '    try:\n'
-              '        system = build_kanban_system()\n'
-              '        if args.kanban_command == "list":\n'
-              '            payload = {"cards": system.list_cards(status=args.status)}\n'
-              '        elif args.kanban_command == "show":\n'
-              '            payload = system.get_card(args.card_id)\n'
-              '        elif args.kanban_command == "create":\n'
-              '            payload = {"card": system.create_card(title=args.title, description=args.description)}\n'
-              '        elif args.kanban_command == "transition":\n'
-              '            payload = system.transition(args.card_id, to_state=args.to_state, reason=args.reason)\n'
-              '        elif args.kanban_command == "comment":\n'
-              '            payload = system.add_comment(args.card_id, text=args.text)\n'
-              '        elif args.kanban_command == "sync":\n'
-              '            payload = system.sync_drive_inbox()\n'
-              '        elif args.kanban_command == "agent-tick":\n'
-              '            payload = system.agent_tick()\n'
-              '        else:\n'
-              '            raise SystemExit(2)\n'
-              '        _emit_safe(payload, as_json=args.as_json)\n'
-              '        if isinstance(payload, dict) and payload.get("state") in {"NEEDS_ACTION", "PARTIAL", "RETRY"}:\n'
-              '            return 3\n'
-              '        return 0\n'
-              '    except (DriveNeedsAction, AgentNeedsAction):\n'
-              '        _emit_safe({"state": "NEEDS_ACTION"}, as_json=args.as_json)\n'
-              '        return 3\n'
-              '    except (KanbanError, InvalidCardTransition, CardConflict, CardNotFound, KanbanStoreError, ProductStoreError, SecretProviderError, DriveBridgeError, DriveStoreError):\n'
-              '        _emit_safe({"state": "FAILED", "error_type": "KANBAN_OPERATION_FAILED"}, as_json=args.as_json)\n'
-              '        return 4\n\n\n'
-              'def _report(args: argparse.Namespace) -> int:\n')
-
-          # Worker: auto-claim only local BACKLOG, never auto-run inbound Drive Sync.
-          path = 'src/genos/core_service.py'
-          replace_once(path,
-              '    drive_projection: dict[str, object] = {"state": "SCHEDULED", "remote_write": False, "observed_at": _utc_now()}\n',
-              '    drive_projection: dict[str, object] = {"state": "SCHEDULED", "remote_write": False, "observed_at": _utc_now()}\n'
-              '    try:\n'
-              '        from .kanban import build_kanban_system\n'
-              '        kanban_system = build_kanban_system()\n'
-              '        kanban_projection: dict[str, object] = {"state": "IDLE", "reason": "NOT_TICKED", "observed_at": _utc_now()}\n'
-              '    except Exception as exc:\n'
-              '        kanban_system = None\n'
-              '        kanban_projection = {"state": "DEGRADED", "reason": f"KANBAN_INIT_{type(exc).__name__}", "observed_at": _utc_now()}\n')
-          replace_once(path,
-              '        payload = {"status": "ok", "role": "worker", "version": __version__, "instance_id": instance_id, "core_agent": agent, "drive_report": drive_projection, "observed_at": _utc_now()}\n',
-              '        if kanban_system is not None:\n'
-              '            try:\n'
-              '                tick = kanban_system.agent_tick()\n'
-              '                kanban_projection = {**tick, "observed_at": _utc_now()}\n'
-              '            except Exception as exc:\n'
-              '                kanban_projection = {"state": "DEGRADED", "reason": f"KANBAN_TICK_{type(exc).__name__}", "observed_at": _utc_now()}\n'
-              '        payload = {"status": "ok", "role": "worker", "version": __version__, "instance_id": instance_id, "core_agent": agent, "drive_report": drive_projection, "kanban_agent": kanban_projection, "observed_at": _utc_now()}\n')
-
-          # Bound binary Drive reads to the caller's attachment/request limit, not the legacy 4MiB generic adapter cap.
-          path = 'src/genos/drive_collab.py'
-          replace_once(path,
-              'from urllib import parse as urlparse\n',
-              'from urllib import error as urlerror\nfrom urllib import parse as urlparse\nfrom urllib import request as urlrequest\n')
-          replace_once(path,
-              '    def read_bytes(self, file_id: str, *, max_bytes: int) -> bytes:\n        data = self._bytes_request("GET", f"{self.API}/files/{urlparse.quote(file_id)}?alt=media")  # noqa: SLF001\n        if len(data) > max_bytes:\n            return data[: max_bytes + 1]\n        return data\n',
-              '    def read_bytes(self, file_id: str, *, max_bytes: int) -> bytes:\n'
-              '        request = urlrequest.Request(\n'
-              '            f"{self.API}/files/{urlparse.quote(file_id)}?alt=media",\n'
-              '            method="GET",\n'
-              '            headers={"Authorization": f"Bearer {self._token}", "Accept": "application/octet-stream"},  # noqa: SLF001\n'
-              '        )\n'
-              '        try:\n'
-              '            with urlrequest.urlopen(request, timeout=self.timeout) as response:  # noqa: S310 - fixed Google Drive endpoint\n'
-              '                return response.read(max_bytes + 1)\n'
-              '        except urlerror.HTTPError as exc:\n'
-              '            if exc.code in {401, 403}:\n'
-              '                raise DriveNeedsAction("Drive credential rejected") from exc\n'
-              '            raise DriveRemoteError(f"Drive HTTP status {exc.code}") from exc\n'
-              '        except (urlerror.URLError, TimeoutError, OSError) as exc:\n'
-              '            raise DriveRemoteError("Drive network request failed") from exc\n')
-
-          # Fresh host must prove schema v5 and Card API auth boundary.
-          path = 'ci/fresh-host-e2e.sh'
-          replace_once(path,
-              "try:\n    urllib.request.urlopen('http://127.0.0.1:17880/api/v1/drive', timeout=5)\n    raise AssertionError('Drive API unexpectedly allowed unauthenticated access')\nexcept urllib.error.HTTPError as exc:\n    assert exc.code == 401, exc.code\n    error_payload = json.loads(exc.read().decode('utf-8'))\n    assert error_payload['error'] == 'unauthorized', error_payload\n",
-              "for protected in ('/api/v1/drive', '/api/v1/cards'):\n    try:\n        urllib.request.urlopen('http://127.0.0.1:17880' + protected, timeout=5)\n        raise AssertionError(f'{protected} unexpectedly allowed unauthenticated access')\n    except urllib.error.HTTPError as exc:\n        assert exc.code == 401, (protected, exc.code)\n        error_payload = json.loads(exc.read().decode('utf-8'))\n        assert error_payload['error'] == 'unauthorized', error_payload\n")
-          replace_once(path,
-              '  ssh_guest "sudo -u genos psql -d genos -tAc \\"SELECT CASE WHEN EXISTS (SELECT 1 FROM genos_schema_migration WHERE version=4) THEN 1 ELSE 0 END\\" | grep -qx 1"\n',
-              '  ssh_guest "sudo -u genos psql -d genos -tAc \\"SELECT CASE WHEN EXISTS (SELECT 1 FROM genos_schema_migration WHERE version=4) THEN 1 ELSE 0 END\\" | grep -qx 1"\n'
-              '  ssh_guest "sudo -u genos psql -d genos -tAc \\"SELECT CASE WHEN to_regclass(\'public.card\') IS NOT NULL AND to_regclass(\'public.card_event\') IS NOT NULL AND to_regclass(\'public.card_artifact\') IS NOT NULL THEN 1 ELSE 0 END\\" | grep -qx 1"\n'
-              '  ssh_guest "sudo -u genos psql -d genos -tAc \\"SELECT CASE WHEN EXISTS (SELECT 1 FROM genos_schema_migration WHERE version=5) THEN 1 ELSE 0 END\\" | grep -qx 1"\n')
-          replace_once(path,
-              '    "drive_api_owner_auth_boundary": "PASS",\n',
-              '    "drive_api_owner_auth_boundary": "PASS",\n'
-              '    "kanban_schema_v5": "PASS",\n'
-              '    "card_api_owner_auth_boundary": "PASS",\n')
-
-          # Contract guard: behavior, not forbidden-token identifier names used by internal security code.
-          path = '.github/workflows/mvp07-kanban-drive-contract.yml'
-          replace_once(path,
-              '      - name: Authority and secret-boundary guard\n        shell: bash\n        run: |\n          set -euo pipefail\n          ! grep -R "Drive.*authority" -n src/genos/kanban*.py src/genos/drive_collab.py | grep -vi "local\\|replica" || true\n          ! grep -R -E "access_token|refresh_token|client_secret|raw_secret" -n tests/test_mvp07*.py src/genos/kanban*.py src/genos/artifact_store.py || {\n            echo \'MVP-07 Card/artifact surfaces must not contain provider credential fields\'\n            exit 1\n          }\n          echo \'MVP07_AUTHORITY_GUARD_PASS\'\n',
-              '      - name: Authority and secret-boundary guard\n'
-              '        shell: bash\n'
-              '        run: |\n'
-              '          set -euo pipefail\n'
-              '          PYTHONPATH=src python - <<\'PY\'\n'
-              '          from genos.kanban_store import _clean_json, KanbanStoreError\n'
-              '          for key in ("access_token", "refresh_token", "client_secret", "raw_secret", "password"):\n'
-              '              try:\n'
-              '                  _clean_json({key: "fixture-secret"})\n'
-              '              except KanbanStoreError:\n'
-              '                  pass\n'
-              '              else:\n'
-              '                  raise AssertionError(f"forbidden Card event credential field accepted: {key}")\n'
-              '          print("MVP07_SECRET_BOUNDARY_PASS")\n'
-              '          PY\n'
-              '          grep -R "remote_role.*collaboration-replica" -n src/genos/drive_collab.py >/dev/null\n'
-              '          echo \'MVP07_AUTHORITY_GUARD_PASS\'\n')
-          PY
-
-          PYTHONPATH=src python -m compileall -q src/genos tests/test_mvp07.py
-          PYTHONPATH=src python -m unittest discover -s tests -p 'test_mvp07*.py' -v
-          PYTHONPATH=src python - <<'PY'
+          python3 ci/plan_mvp07_finalize.py
+          PYTHONPATH=src python3 -m compileall -q src/genos tests
+          PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_mvp07*.py' -v
+          PYTHONPATH=src python3 - <<'PY'
           from genos.cli import build_parser
           assert build_parser().parse_args(['kanban','sync','--json']).kanban_command == 'sync'
-          assert build_parser().parse_args(['kanban','create','--title','fixture','--json']).kanban_command == 'create'
+          assert build_parser().parse_args(['mcp','principal-create','--name','agent','--scope','genos.*','--json']).mcp_command == 'principal-create'
           PY
-          git config user.name 'PLAN MVP-07 Integration Patch'
+      - name: Commit reviewed generated patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'PLAN MVP-07 Finalizer'
           git config user.email 'genesis.corp.os@gmail.com'
-          git add src/genos/product_api.py src/genos/cli.py src/genos/core_service.py src/genos/drive_collab.py ci/fresh-host-e2e.sh .github/workflows/mvp07-kanban-drive-contract.yml
-          git commit -m 'feat(mvp07): wire typed Kanban API CLI worker lifecycle'
+          git rm ci/plan_mvp07_finalize.py .github/workflows/plan-mvp07-integration-patch.yml
+          git add -A
+          git commit -m 'feat(mvp07): wire Kanban and unified MCP Hub lifecycle'
           git push origin HEAD:${{ github.head_ref }}
