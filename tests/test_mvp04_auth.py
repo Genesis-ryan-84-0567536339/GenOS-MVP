@@ -36,6 +36,16 @@ class AuthProjectionTests(unittest.TestCase):
         projection = parse_auth_terminal("visit https://example.invalid/steal?token=x")
         self.assertIsNone(projection.auth_url)
 
+    def test_trusted_hostname_in_path_is_not_projected(self) -> None:
+        projection = parse_auth_terminal("visit https://evil.example/accounts.google.com/oauth?token=x")
+        self.assertIsNone(projection.auth_url)
+        self.assertEqual(projection.state, "STARTING")
+
+    def test_trusted_hostname_suffix_confusion_is_not_projected(self) -> None:
+        projection = parse_auth_terminal("visit https://accounts.google.com.evil.example/oauth")
+        self.assertIsNone(projection.auth_url)
+        self.assertEqual(projection.state, "STARTING")
+
 
 class AuthCodeHygieneTests(unittest.TestCase):
     def test_code_is_trimmed_but_not_transformed(self) -> None:
