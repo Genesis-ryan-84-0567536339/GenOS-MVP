@@ -106,6 +106,9 @@ class DriveSystemServices:
         }
 
     def oauth_start(self, *, root_name: str = "GenOS") -> dict[str, Any]:
+        current = self.connection.status()
+        if current.get("state") == "READY":
+            raise DriveNeedsAction("Drive is already connected; use explicit reauthorize to change Google account")
         return self._oauth().start(root_name=root_name)
 
     def oauth_status(self) -> dict[str, Any]:
@@ -165,6 +168,8 @@ class DriveSystemServices:
             return {"state": "READY", "drive": current}
         if state == "DEGRADED" and secret_id:
             return self.connect(secret_id=secret_id, root_name=selected_root)
+        if state == "NEEDS_ACTION" and secret_id:
+            return self.reauthorize(root_name=selected_root)
         return self.oauth_start(root_name=selected_root)
 
     def scheduled_scan(self) -> dict[str, Any]:

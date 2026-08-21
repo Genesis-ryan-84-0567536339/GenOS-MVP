@@ -125,6 +125,9 @@ class GoogleDriveDeviceAuthorizationTests(unittest.TestCase):
         self.assertEqual(config.client_id, CLIENT_ID)
         self.assertEqual(config.scope, GOOGLE_DRIVE_FILE_SCOPE)
         self.assertIsNone(GoogleOAuthClientConfig.from_environment({"IGNORED": "1"}))
+        self.assertIsNone(
+            GoogleOAuthClientConfig.from_environment({"GENOS_GOOGLE_DRIVE_OAUTH_CLIENT_ID": CLIENT_ID})
+        )
 
     def test_start_projects_only_user_visible_google_fields(self) -> None:
         credentials = _RecordingCredentials()
@@ -398,6 +401,32 @@ class DriveSystemWiringTests(unittest.TestCase):
         self.assertEqual(credentials.disabled, [SECRET_ID])
         self.assertIsNone(metadata.value["secret_id"])
         self.assertEqual(metadata.value["state"], "DISCONNECTED")
+
+    def test_authorize_requires_explicit_reauthorize_when_drive_is_ready(self) -> None:
+        services = DriveSystemServices(
+            connection=_StubConnection(state="READY", secret_id=SECRET_ID),
+            reports=_StubReports(),
+            metadata=_StubMetadata(),
+            oauth=_StubOAuth(),  # type: ignore[arg-type]
+        )
+        with self.assertRaises(DriveNeedsAction):
+            services.oauth_start()
+
+    def test_reconnect_needs_action_disables_old_secret_and_starts_new_user_authorization(self) -> None:
+        connection = _StubConnection(state="NEEDS_ACTION", secret_id=SECRET_ID)
+        credentials = _RecordingCredentials()
+        oauth = _StubOAuth()
+        services = DriveSystemServices(
+            connection=connection,
+            reports=_StubReports(),
+            metadata=_StubMetadata(),
+            oauth=oauth,  # type: ignore[arg-type]
+            credentials=credentials,  # type: ignore[arg-type]
+        )
+        result = services.reconnect()
+        self.assertEqual(result["state"], "WAITING_USER")
+        self.assertEqual(credentials.disabled, [SECRET_ID])
+        self.assertEqual(oauth.starts, ["GenOS"])
 
     def test_unconfigured_scheduled_scan_does_not_publish(self) -> None:
         connection = _StubConnection(state="UNCONFIGURED")

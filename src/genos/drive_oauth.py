@@ -59,10 +59,11 @@ class GoogleOAuthClientConfig:
         source = env if env is not None else os.environ
         client_id = str(source.get("GENOS_GOOGLE_DRIVE_OAUTH_CLIENT_ID") or "").strip()
         client_secret = str(source.get("GENOS_GOOGLE_DRIVE_OAUTH_CLIENT_SECRET") or "").strip()
-        if not client_id and not client_secret:
-            return None
         if not client_id or not client_secret:
-            raise DriveNeedsAction("Google Drive OAuth application configuration is incomplete")
+            # Distribution configuration is optional until Drive is used. A
+            # partial config must not take down the rest of Product API; the
+            # Drive OAuth surface truthfully projects NOT_CONFIGURED instead.
+            return None
         return cls(_checked_secret(client_id, "OAuth client id"), _checked_secret(client_secret, "OAuth client secret"))
 
 
@@ -190,6 +191,9 @@ class GoogleDriveDeviceAuthService:
 
     def poll(self) -> dict[str, Any]:
         config = self._require_config()
+        # One device code must have exactly one in-flight poll inside this
+        # process. RLock keeps concurrent HTTP/CLI callers from consuming the
+        # same successful grant twice and creating duplicate SecretRefs.
         with self._lock:
             self._expire_if_needed()
             session = self._session
@@ -203,50 +207,54 @@ class GoogleDriveDeviceAuthService:
                 self._last = _replace_projection(session.projection, retry_after_seconds=retry)
                 session.projection = self._last
                 return self._last.to_dict()
-            device_code = session.device_code
+            try:
+                token_payload = self.device_poll(config, session.device_code)
+            except _AuthorizationPending:
+                return self._continue_waiting(slow_down=False)
+            except _SlowDown:
+                return self._continue_waiting(slow_down=True)
+            except _AccessDenied:
+                return self._terminal("DENIED", "USER_DENIED")
+            except _AuthorizationExpired:
+                return self._terminal("EXPIRED", "AUTHORIZATION_EXPIRED")
 
-        try:
-            token_payload = self.device_poll(config, device_code)
-        except _AuthorizationPending:
-            return self._continue_waiting(slow_down=False)
-        except _SlowDown:
-            return self._continue_waiting(slow_down=True)
-        except _AccessDenied:
-            return self._terminal("DENIED", "USER_DENIED")
-        except _AuthorizationExpired:
-            return self._terminal("EXPIRED", "AUTHORIZATION_EXPIRED")
-
-        access_token = _checked_secret(token_payload.get("access_token"), "access token")
-        refresh_token = _checked_secret(token_payload.get("refresh_token"), "refresh token")
-        token_type = _checked_public_text(token_payload.get("token_type", "Bearer"), "token type", max_length=32)
-        if token_type.lower() != "bearer":
-            raise DriveNeedsAction("Google Drive authorization returned an unsupported token type")
-        granted = str(token_payload.get("scope") or "").split()
-        if GOOGLE_DRIVE_FILE_SCOPE not in granted:
-            raise DriveNeedsAction("Google Drive authorization did not grant the required drive.file scope")
-        # Validate the access token but deliberately do not persist or expose it.
-        if not access_token:
-            raise DriveNeedsAction("Google Drive authorization did not return a usable access token")
-        bundle = json.dumps(
-            {
-                "client_id": config.client_id,
-                "client_secret": config.client_secret,
-                "refresh_token": refresh_token,
-            },
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        credential = self.credentials.add(
-            name=f"google-drive-{uuid.uuid4().hex[:12]}",
-            provider_name="google-drive",
-            raw_secret=bundle,
-            consumer_scopes=[DRIVE_CONSUMER_SCOPE],
-            source="google-device-oauth",
-        )
-        secret_id = str(credential["secret_id"])
-        with self._lock:
-            root_name = self._session.projection.root_name if self._session is not None else "GenOS"
+            access_token = _checked_secret(token_payload.get("access_token"), "access token")
+            refresh_token = _checked_secret(token_payload.get("refresh_token"), "refresh token")
+            token_type = _checked_public_text(token_payload.get("token_type", "Bearer"), "token type", max_length=32)
+            if token_type.lower() != "bearer":
+                raise DriveNeedsAction("Google Drive authorization returned an unsupported token type")
+            granted = str(token_payload.get("scope") or "").split()
+            if GOOGLE_DRIVE_FILE_SCOPE not in granted:
+                raise DriveNeedsAction("Google Drive authorization did not grant the required drive.file scope")
+            if not access_token:
+                raise DriveNeedsAction("Google Drive authorization did not return a usable access token")
+            bundle = json.dumps(
+                {
+                    "client_id": config.client_id,
+                    "client_secret": config.client_secret,
+                    "refresh_token": refresh_token,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            try:
+                credential = self.credentials.add(
+                    name=f"google-drive-{uuid.uuid4().hex[:12]}",
+                    provider_name="google-drive",
+                    raw_secret=bundle,
+                    consumer_scopes=[DRIVE_CONSUMER_SCOPE],
+                    source="google-device-oauth",
+                )
+            except Exception:
+                self._session = None
+                self._last = GoogleDeviceAuthorizationProjection(
+                    state="NEEDS_ACTION",
+                    reason="CREDENTIAL_PERSISTENCE_FAILED",
+                )
+                raise
+            secret_id = str(credential["secret_id"])
+            root_name = session.projection.root_name or "GenOS"
             self._session = None
             self._last = GoogleDeviceAuthorizationProjection(
                 state="AUTHORIZED",
@@ -342,7 +350,17 @@ class GoogleDriveRemoteFactory:
 
 def request_google_device_authorization(config: GoogleOAuthClientConfig) -> dict[str, Any]:
     fields = {"client_id": config.client_id, "scope": config.scope}
-    return _post_google_json(GOOGLE_DEVICE_ENDPOINT, fields, max_bytes=MAX_DEVICE_RESPONSE_BYTES, purpose="device authorization")
+    try:
+        return _post_google_json(
+            GOOGLE_DEVICE_ENDPOINT,
+            fields,
+            max_bytes=MAX_DEVICE_RESPONSE_BYTES,
+            purpose="device authorization",
+        )
+    except _GoogleOAuthResponseError as exc:
+        if exc.error in {"admin_policy_enforced", "invalid_client", "org_internal"}:
+            raise DriveNeedsAction("Google Drive OAuth application requires configuration or policy action") from exc
+        raise DriveNeedsAction("Google Drive device authorization was rejected") from exc
 
 
 def poll_google_device_authorization(config: GoogleOAuthClientConfig, device_code: str) -> dict[str, Any]:
