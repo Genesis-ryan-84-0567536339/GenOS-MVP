@@ -18,6 +18,19 @@ class ReportBridgeError(RuntimeError):
     pass
 
 
+_VOLATILE_FINGERPRINT_KEYS = {
+    "generated_at",
+    "observed_at",
+    "updated_at",
+    "age_seconds",
+    "last_verified_at",
+    "last_check_at",
+    "last_success_at",
+    "mcp_grant_checked_at",
+    "last_report_fingerprint",
+}
+
+
 class DriveReportService:
     """Publish sanitized System Reports from the one MVP-05 observability authority."""
 
@@ -119,7 +132,6 @@ class DriveReportService:
                     "report_markdown_file_id": md_id,
                     "report_json_file_id": json_id,
                     "last_report_fingerprint": fingerprint,
-                    "last_verified_at": _utc_now(),
                     "last_error_code": None,
                 }
             )
@@ -165,22 +177,21 @@ class DriveReportService:
 
 
 def _stable_report_projection(snapshot: dict[str, Any]) -> dict[str, Any]:
-    """Remove collection-time noise so unchanged state does not write remotely."""
-    value = deepcopy(redact(snapshot))
-    value.pop("generated_at", None)
-    freshness = value.get("freshness")
-    if isinstance(freshness, dict):
-        freshness.pop("observed_at", None)
-        freshness.pop("age_seconds", None)
-    observations = value.get("observations")
-    if isinstance(observations, list):
-        for item in observations:
-            if isinstance(item, dict):
-                item.pop("observed_at", None)
-                observed = item.get("observed")
-                if isinstance(observed, dict):
-                    observed.pop("observed_at", None)
-                    observed.pop("age_seconds", None)
+    """Remove clock/report bookkeeping so unchanged state never writes remotely."""
+    return _strip_volatile(deepcopy(redact(snapshot)))
+
+
+def _strip_volatile(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _strip_volatile(item)
+            for key, item in value.items()
+            if str(key) not in _VOLATILE_FINGERPRINT_KEYS
+        }
+    if isinstance(value, list):
+        return [_strip_volatile(item) for item in value]
+    if isinstance(value, tuple):
+        return [_strip_volatile(item) for item in value]
     return value
 
 
