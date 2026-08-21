@@ -8,6 +8,7 @@ import shutil
 import subprocess
 from typing import Any, Callable
 
+from .agent_cli_update import AntigravityCliManager
 from .agent_runtime import AgentRuntimeError, AgentRuntimeStore
 from .contracts import Observation, ObservationState, SupportClass, utc_now
 from .recon import collect_all
@@ -21,25 +22,16 @@ GENOS_SERVICES: dict[str, str] = {
     "worker": "genos-worker.service",
     "mission-control": "genos-mission-control.service",
 }
-
-# These surfaces are intentionally explicit even before their later MVP package
-# exists. Missing evidence must render as NOT_INSTALLED/UNKNOWN, never HEALTHY.
 _FUTURE_SURFACES: dict[str, str] = {
     "mcp": "MVP-06_or_later",
     "drive": "MVP-06",
     "tunnel": "MVP-10",
 }
-
 BaselineCollector = Callable[[str | None], tuple[list[Observation], SupportClass, str]]
 
 
 class ObservabilityService:
-    """Single read-only evidence authority for Doctor, Dashboard API and Reports.
-
-    The service consumes the original MVP recon collector instead of replacing
-    it, then appends GenOS-specific projections. No collector in this module
-    mutates host state or executes a shell command string.
-    """
+    """Single read-only evidence authority for Doctor, Dashboard API and Reports."""
 
     def __init__(
         self,
@@ -63,14 +55,14 @@ class ObservabilityService:
                 self._worker_observation(),
                 self._agent_observation(),
                 self._provider_observation(),
+                self._provider_cli_update_observation(),
                 *self._future_surface_observations(),
             ]
         )
-        payloads = [item.to_dict() for item in observations]
         generated_at = utc_now()
         return redact(
             {
-                "schema_version": "1.0",
+                "schema_version": "1.1",
                 "authority": "genos-observability-v1",
                 "read_only": True,
                 "generated_at": generated_at,
@@ -82,12 +74,15 @@ class ObservabilityService:
                 "health": self._health_summary(observations),
                 "support_class": support_class.value,
                 "support_reason": support_reason,
-                "observations": payloads,
+                "sections": self._section_map(observations),
+                "observations": [item.to_dict() for item in observations],
             }
         )
 
     def _installed(self) -> bool:
-        return (self.state_root / "manifest.json").is_file() or (self.state_root / "agents" / "agy-gen" / "identity.json").is_file()
+        return (self.state_root / "manifest.json").is_file() or (
+            self.state_root / "agents" / "agy-gen" / "identity.json"
+        ).is_file()
 
     def _gpu_observation(self) -> Observation:
         device_present = Path("/dev/nvidia0").exists() or Path("/proc/driver/nvidia/gpus").exists()
@@ -97,14 +92,14 @@ class ObservabilityService:
                 "gpu",
                 ObservationState.NOT_FOUND,
                 observed={"available": False, "provider": None},
-                source="/dev/nvidia0+/proc/driver/nvidia/gpus+nvidia-smi presence",
+                source="nvidia device+nvidia-smi presence",
             )
         if not binary:
             return Observation(
                 "gpu",
                 ObservationState.WARN,
-                observed={"available": True, "provider": "nvidia", "details": None},
-                source="NVIDIA device presence; nvidia-smi unavailable",
+                observed={"available": True, "provider": "nvidia", "names": []},
+                source="NVIDIA device presence",
             )
         result = _run_fixed([binary, "--query-gpu=name", "--format=csv,noheader"])
         names = [line.strip()[:160] for line in result.stdout.splitlines() if line.strip()]
@@ -112,33 +107,32 @@ class ObservabilityService:
             "gpu",
             ObservationState.PASS if result.returncode == 0 else ObservationState.UNKNOWN,
             observed={"available": bool(names) or device_present, "provider": "nvidia", "names": names},
-            source="nvidia-smi --query-gpu=name --format=csv,noheader",
+            source="nvidia-smi fixed query",
         )
 
     def _gateway_observation(self) -> Observation:
         path = Path("/proc/net/route")
         if not path.is_file():
-            return Observation("gateway", ObservationState.NOT_FOUND, observed={}, source="/proc/net/route")
+            return Observation("gateway", ObservationState.NOT_FOUND, observed={}, source=str(path))
         try:
-            gateway: str | None = None
-            interface: str | None = None
             for line in path.read_text(encoding="utf-8").splitlines()[1:]:
                 fields = line.split()
-                if len(fields) < 4 or fields[1] != "00000000" or not (int(fields[3], 16) & 0x2):
-                    continue
-                raw = bytes.fromhex(fields[2])
-                gateway = ".".join(str(value) for value in raw[::-1])
-                interface = fields[0]
-                break
-            state = ObservationState.PASS if gateway else ObservationState.NOT_FOUND
+                if len(fields) >= 4 and fields[1] == "00000000" and (int(fields[3], 16) & 0x2):
+                    raw = bytes.fromhex(fields[2])
+                    return Observation(
+                        "gateway",
+                        ObservationState.PASS,
+                        observed={"default_gateway": ".".join(str(value) for value in raw[::-1]), "interface": fields[0]},
+                        source=str(path),
+                    )
             return Observation(
                 "gateway",
-                state,
-                observed={"default_gateway": gateway, "interface": interface},
-                source="/proc/net/route",
+                ObservationState.NOT_FOUND,
+                observed={"default_gateway": None, "interface": None},
+                source=str(path),
             )
         except (OSError, ValueError):
-            return Observation("gateway", ObservationState.UNKNOWN, observed={}, source="/proc/net/route")
+            return Observation("gateway", ObservationState.UNKNOWN, observed={}, source=str(path))
 
     def _services_observation(self) -> Observation:
         if not self._installed():
@@ -146,21 +140,18 @@ class ObservabilityService:
                 "genos_services",
                 ObservationState.NOT_INSTALLED,
                 observed={"units": {key: "not_installed" for key in GENOS_SERVICES}},
-                source="systemctl is-active fixed GenOS units",
+                source="systemctl fixed GenOS units",
             )
         systemctl = shutil.which("systemctl")
         if not systemctl:
             return Observation(
-                "genos_services",
-                ObservationState.NOT_FOUND,
-                observed={"units": {}},
-                source="systemctl is-active fixed GenOS units",
+                "genos_services", ObservationState.NOT_FOUND, observed={"units": {}}, source="systemctl fixed GenOS units"
             )
         states: dict[str, str] = {}
         for key, unit in GENOS_SERVICES.items():
             result = _run_fixed([systemctl, "is-active", unit])
             states[key] = (result.stdout.strip() or "unknown")[:80]
-        if states and all(value == "active" for value in states.values()):
+        if all(value == "active" for value in states.values()):
             state = ObservationState.PASS
         elif any(value in {"failed", "inactive", "deactivating"} for value in states.values()):
             state = ObservationState.FAIL
@@ -172,7 +163,7 @@ class ObservabilityService:
             observed={"units": states},
             expected={"units": {key: "active" for key in GENOS_SERVICES}},
             source="systemctl is-active fixed GenOS units",
-            remediation="Use a typed repair action for a failed GenOS unit; never reinstall blindly.",
+            remediation="Use typed repair; never blind reinstall.",
         )
 
     def _timers_observation(self) -> Observation:
@@ -184,8 +175,7 @@ class ObservabilityService:
             return Observation("timers", ObservationState.UNKNOWN, observed={"units": []}, source="systemctl list-timers")
         units: list[str] = []
         for line in result.stdout.splitlines():
-            fields = line.split()
-            timer = next((field for field in fields if field.endswith(".timer")), None)
+            timer = next((field for field in line.split() if field.endswith(".timer")), None)
             if timer and timer not in units:
                 units.append(timer[:200])
         return Observation("timers", ObservationState.PASS, observed={"units": sorted(units)}, source="systemctl list-timers --all")
@@ -213,44 +203,40 @@ class ObservabilityService:
             observed={"engine": "postgresql", "reachable": result.returncode == 0},
             expected={"reachable": True},
             source="pg_isready -q",
-            remediation="Inspect PostgreSQL/service evidence before any typed repair.",
         )
 
     def _worker_observation(self) -> Observation:
-        heartbeat = self.state_root / "worker" / "heartbeat.json"
-        if not heartbeat.is_file():
-            state = ObservationState.NOT_INSTALLED if not self._installed() else ObservationState.WARN
+        path = self.state_root / "worker" / "heartbeat.json"
+        if not path.is_file():
             return Observation(
                 "worker_daemon",
-                state,
+                ObservationState.NOT_INSTALLED if not self._installed() else ObservationState.WARN,
                 observed={"heartbeat": False, "freshness": "UNKNOWN"},
-                source=str(heartbeat),
+                source=str(path),
             )
         try:
-            payload = json.loads(heartbeat.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8"))
             if not isinstance(payload, dict):
                 raise ValueError("heartbeat must be object")
-            observed_at = str(payload.get("observed_at") or "")
-            age = _age_seconds(observed_at)
+            age = _age_seconds(str(payload.get("observed_at") or ""))
             freshness = "FRESH" if age is not None and age <= 30 else "STALE" if age is not None else "UNKNOWN"
-            state = ObservationState.PASS if freshness == "FRESH" else ObservationState.WARN
             return Observation(
                 "worker_daemon",
-                state,
+                ObservationState.PASS if freshness == "FRESH" else ObservationState.WARN,
                 observed={
                     "heartbeat": True,
                     "freshness": freshness,
                     "age_seconds": round(age, 3) if age is not None else None,
                     "core_agent": redact(payload.get("core_agent")),
                 },
-                source=str(heartbeat),
+                source=str(path),
             )
         except (OSError, ValueError, json.JSONDecodeError):
             return Observation(
                 "worker_daemon",
                 ObservationState.UNKNOWN,
                 observed={"heartbeat": True, "freshness": "UNKNOWN"},
-                source=str(heartbeat),
+                source=str(path),
             )
 
     def _agent_observation(self) -> Observation:
@@ -297,11 +283,10 @@ class ObservabilityService:
     def _provider_observation(self) -> Observation:
         path = self.state_root / "agents" / "agy-gen" / "provider.json"
         if not path.is_file():
-            state = ObservationState.NOT_INSTALLED if not self._installed() else ObservationState.NOT_FOUND
             return Observation(
                 "provider",
-                state,
-                observed={"provider": "gemini-cli", "state": "UNKNOWN", "model": "UNKNOWN"},
+                ObservationState.NOT_INSTALLED if not self._installed() else ObservationState.NOT_FOUND,
+                observed={"provider_cli": "antigravity", "state": "UNKNOWN", "model": "UNKNOWN"},
                 source=str(path),
             )
         try:
@@ -320,10 +305,11 @@ class ObservabilityService:
                 state,
                 observed=redact(
                     {
-                        "provider": "gemini-cli",
+                        "provider_cli": payload.get("provider_cli") or "antigravity",
                         "state": provider_state,
                         "model": payload.get("model") or "UNKNOWN",
                         "thinking_level": payload.get("thinking_level") or "UNKNOWN",
+                        "approval_mode": payload.get("approval_mode") or "UNKNOWN",
                         "evidence": payload.get("evidence"),
                         "observed_at": payload.get("observed_at"),
                     }
@@ -334,9 +320,47 @@ class ObservabilityService:
             return Observation(
                 "provider",
                 ObservationState.UNKNOWN,
-                observed={"provider": "gemini-cli", "state": "UNKNOWN", "model": "UNKNOWN"},
+                observed={"provider_cli": "antigravity", "state": "UNKNOWN", "model": "UNKNOWN"},
                 source=str(path),
             )
+
+    def _provider_cli_update_observation(self) -> Observation:
+        root = self.state_root / "tools" / "antigravity-cli"
+        if not root.is_dir():
+            return Observation(
+                "provider_cli_update",
+                ObservationState.NOT_INSTALLED if not self._installed() else ObservationState.NOT_FOUND,
+                observed={
+                    "provider_cli": "antigravity",
+                    "installed_version": None,
+                    "latest_stable_version": None,
+                    "update_state": "UNKNOWN",
+                    "last_check_at": None,
+                    "last_success_at": None,
+                    "rollback_version": None,
+                },
+                source=str(root / "update-state.json"),
+            )
+        status = AntigravityCliManager(
+            root,
+            agent_state_root=self.state_root / "agents" / "agy-gen",
+        ).status()
+        update_state = str(status.get("update_state") or "UNKNOWN")
+        if update_state in {"CURRENT", "INSTALLED", "UPDATED"}:
+            state = ObservationState.PASS
+        elif update_state in {"UPDATE_DEFERRED_BUSY", "ROLLED_BACK"}:
+            state = ObservationState.WARN
+        elif update_state == "FAILED":
+            state = ObservationState.FAIL
+        else:
+            state = ObservationState.UNKNOWN
+        return Observation(
+            "provider_cli_update",
+            state,
+            observed=status,
+            expected={"provider_cli": "antigravity", "policy": "stable/6h/idle-only/atomic-rollback"},
+            source=str(root / "update-state.json"),
+        )
 
     def _future_surface_observations(self) -> list[Observation]:
         return [
@@ -349,6 +373,19 @@ class ObservabilityService:
             )
             for check_id, package in _FUTURE_SURFACES.items()
         ]
+
+    @staticmethod
+    def _section_map(observations: list[Observation]) -> dict[str, list[str]]:
+        ids = {item.check_id for item in observations}
+        desired = {
+            "host": ["platform", "resources", "gpu", "runtime_basics", "current_genos"],
+            "storage": ["disk", "database"],
+            "network": ["network", "gateway", "ports", "tunnel"],
+            "services": ["systemd", "genos_services", "timers", "worker_daemon"],
+            "agent": ["agent", "provider", "provider_cli_update"],
+            "integrations": ["mcp", "drive"],
+        }
+        return {section: [check_id for check_id in checks if check_id in ids] for section, checks in desired.items()}
 
     @staticmethod
     def _health_summary(observations: list[Observation]) -> dict[str, Any]:
@@ -364,19 +401,14 @@ class ObservabilityService:
             "genos_services",
             "database",
             "agent",
+            "provider",
+            "provider_cli_update",
         )
-        required = [by_id[item] for item in required_ids if item in by_id]
-        states = {item.state for item in required}
+        states = {by_id[item].state for item in required_ids if item in by_id}
         if any(state in {ObservationState.FAIL, ObservationState.NO_PERMISSION, ObservationState.TIMEOUT} for state in states):
             health = "DEGRADED"
         elif any(
-            state
-            in {
-                ObservationState.WARN,
-                ObservationState.UNKNOWN,
-                ObservationState.NOT_FOUND,
-                ObservationState.NOT_INSTALLED,
-            }
+            state in {ObservationState.WARN, ObservationState.UNKNOWN, ObservationState.NOT_FOUND, ObservationState.NOT_INSTALLED}
             for state in states
         ):
             health = "NEEDS_ACTION"
@@ -392,8 +424,10 @@ def _run_fixed(argv: list[str], *, timeout: float = 5.0) -> subprocess.Completed
     env = {
         "PATH": os.environ.get("PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
         "HOME": os.environ.get("HOME", "/"),
+        "SHELL": "/bin/sh",
         "LANG": os.environ.get("LANG", "C.UTF-8"),
         "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
+        "AGY_CLI_DISABLE_AUTO_UPDATE": "true",
     }
     try:
         return subprocess.run(
@@ -406,7 +440,7 @@ def _run_fixed(argv: list[str], *, timeout: float = 5.0) -> subprocess.Completed
             env=env,
         )
     except (OSError, subprocess.TimeoutExpired):
-        return subprocess.CompletedProcess(argv, 127, "", "unavailable")
+        return subprocess.CompletedProcess(argv, 127, "", "")
 
 
 def _age_seconds(value: str) -> float | None:
