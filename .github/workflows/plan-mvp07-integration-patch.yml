@@ -23,6 +23,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 ci/plan_mvp07_finalize.py
+          # Workflow files are managed by the GitHub control plane, not by this runner token.
+          git checkout -- .github/workflows/mvp07-kanban-drive-contract.yml
           PYTHONPATH=src python3 -m compileall -q src/genos tests
           PYTHONPATH=src python3 -m unittest discover -s tests -p 'test_mvp07*.py' -v
           PYTHONPATH=src python3 - <<'PY'
@@ -30,13 +32,13 @@ jobs:
           assert build_parser().parse_args(['kanban','sync','--json']).kanban_command == 'sync'
           assert build_parser().parse_args(['mcp','principal-create','--name','agent','--scope','genos.*','--json']).mcp_command == 'principal-create'
           PY
-      - name: Commit reviewed generated patch
+      - name: Commit product source only
         shell: bash
         run: |
           set -euo pipefail
           git config user.name 'PLAN MVP-07 Finalizer'
           git config user.email 'genesis.corp.os@gmail.com'
-          git rm ci/plan_mvp07_finalize.py .github/workflows/plan-mvp07-integration-patch.yml
+          git rm ci/plan_mvp07_finalize.py
           git add -A
           git commit -m 'feat(mvp07): wire Kanban and unified MCP Hub lifecycle'
           git push origin HEAD:${{ github.head_ref }}
