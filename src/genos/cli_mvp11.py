@@ -10,7 +10,8 @@ from typing import Any
 from . import cli as legacy_cli
 from .install import ReleaseArtifact
 from .lifecycle import LifecycleError, LifecycleNeedsAction
-from .lifecycle_hardened import HardenedLifecycleService, restore_preserved_install_identity
+from .lifecycle_hardened import restore_preserved_install_identity
+from .lifecycle_release import ReleaseCandidateLifecycleService
 from .redaction import redact
 
 
@@ -24,9 +25,6 @@ def main(argv: list[str] | None = None) -> int:
 
     command = args[0]
     if command == "install":
-        # `uninstall` removes generated /etc config but preserves it beneath
-        # durable state. Restore only instance-id/MCP port before a real reinstall
-        # so the same machine does not silently become a new GenOS instance.
         if "--plan-only" not in args and os.geteuid() == 0:
             restore_preserved_install_identity()
         return legacy_cli.main(args)
@@ -35,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
 
     parser = _parser_for(command)
     parsed = parser.parse_args(args[1:])
-    service = HardenedLifecycleService()
+    service = ReleaseCandidateLifecycleService()
     try:
         if command == "backup":
             result = service.backup(
