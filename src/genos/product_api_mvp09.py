@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,8 @@ _AGENT_LIBRARY_DISABLE = f"{_AGENT_LIBRARY}/disable"
 _AGENT_RUNTIME_RESTART = f"{_AGENT_BASE}/runtime/restart"
 _JOBS = "/api/v1/jobs"
 _REPORT_HISTORY = "/api/v1/reports/history"
+_MCP_PRINCIPAL_PREFIX = "/api/v1/mcp/principals/"
+_MCP_ROTATE_SUFFIX = "/rotate"
 
 
 class MVP09ProductAPIHandler(ProductAPIHandler):
@@ -132,9 +135,33 @@ class MVP09ProductAPIHandler(ProductAPIHandler):
                 )
                 self._json(200, {"library": result})
                 return
+            if self.path.startswith(_MCP_PRINCIPAL_PREFIX) and self.path.endswith(_MCP_ROTATE_SUFFIX):
+                self.app.auth.authenticate(self._bearer_token())
+                self._reject_nonempty_body()
+                principal_id = self.path[len(_MCP_PRINCIPAL_PREFIX) : -len(_MCP_ROTATE_SUFFIX)]
+                issued = self.app.mcp_rotate_principal(principal_id)
+                # Keep the established access_token contract while supplying the
+                # approved UI's token alias in the same one-time response. No raw
+                # token is persisted or exposed by any GET endpoint.
+                one_time = dict(issued)
+                one_time["token"] = issued.get("access_token")
+                self._json(200, {"mcp": one_time})
+                return
             super().do_POST()
         except Exception as exc:
             self._handle_mvp09_error(exc)
+
+    def log_message(self, _fmt: str, *_args: object) -> None:
+        # Never log query strings, Authorization, raw request bodies or one-time
+        # credentials. Route paths are sufficient operational evidence.
+        path = self.path.split("?", 1)[0]
+        print(
+            json.dumps(
+                {"event": "product_api_http", "method": self.command, "path": path},
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
 
     def _library(self) -> AgentLibraryService:
         return AgentLibraryService(self.app.agent_store)
