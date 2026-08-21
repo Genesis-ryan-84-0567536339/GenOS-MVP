@@ -3,11 +3,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import BinaryIO
 import json
 import os
 import signal
-import sys
 import threading
 import urllib.error
 import urllib.request
@@ -35,8 +33,8 @@ class MissionControlHandler(BaseHTTPRequestHandler):
     """Static Mission Control shell plus fixed loopback Product API proxy.
 
     The browser never receives a generic proxy destination. Only `/api/v1/*`
-    requests are forwarded to the fixed local Product API, keeping Product API
-    loopback-only while Mission Control remains a same-origin browser surface.
+    requests without query strings are forwarded to the fixed local Product API,
+    keeping Product API loopback-only while Mission Control remains same-origin.
     Authorization/body values are deliberately omitted from HTTP logs.
     """
 
@@ -58,7 +56,10 @@ class MissionControlHandler(BaseHTTPRequestHandler):
             )
             return
         if path.startswith("/api/v1/"):
-            self._proxy("GET")
+            if self.path != path:
+                self._json(400, {"error": "query_not_allowed"})
+                return
+            self._proxy("GET", path)
             return
         if path in _SPA_ROUTES:
             self._serve_static("index.html", "text/html; charset=utf-8")
@@ -72,16 +73,30 @@ class MissionControlHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
         if path.startswith("/api/v1/"):
-            self._proxy("POST")
+            if self.path != path:
+                self._json(400, {"error": "query_not_allowed"})
+                return
+            self._proxy("POST", path)
             return
         self._json(405, {"error": "method_not_allowed"})
 
-    def log_message(self, fmt: str, *args: object) -> None:
-        # Fixed route paths are safe to record; credentials, headers and bodies
-        # are never logged by this service.
-        print(json.dumps({"event": "mission_control_http", "message": fmt % args}, ensure_ascii=False), flush=True)
+    def log_message(self, _fmt: str, *_args: object) -> None:
+        # Never log the raw request-target: a caller could deliberately place
+        # credential-like data in a query string even though queries are rejected.
+        safe_path = self.path.split("?", 1)[0]
+        print(
+            json.dumps(
+                {
+                    "event": "mission_control_http",
+                    "method": self.command,
+                    "path": safe_path,
+                },
+                ensure_ascii=False,
+            ),
+            flush=True,
+        )
 
-    def _proxy(self, method: str) -> None:
+    def _proxy(self, method: str, path: str) -> None:
         raw_length = self.headers.get("Content-Length")
         length = 0
         if raw_length not in {None, ""}:
@@ -101,7 +116,7 @@ class MissionControlHandler(BaseHTTPRequestHandler):
         content_type = self.headers.get("Content-Type")
         if body is not None:
             headers["Content-Type"] = content_type or "application/json"
-        target = PRODUCT_API_ORIGIN + self.path
+        target = PRODUCT_API_ORIGIN + path
         request = urllib.request.Request(target, data=body, headers=headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310 - fixed loopback origin only
@@ -109,13 +124,21 @@ class MissionControlHandler(BaseHTTPRequestHandler):
                 if len(payload) > MAX_PROXY_BODY:
                     self._json(502, {"error": "backend_response_too_large"})
                     return
-                self._raw(response.status, payload, response.headers.get("Content-Type") or "application/json; charset=utf-8")
+                self._raw(
+                    response.status,
+                    payload,
+                    response.headers.get("Content-Type") or "application/json; charset=utf-8",
+                )
         except urllib.error.HTTPError as exc:
             payload = exc.read(MAX_PROXY_BODY + 1)
             if len(payload) > MAX_PROXY_BODY:
                 self._json(502, {"error": "backend_response_too_large"})
                 return
-            self._raw(exc.code, payload, exc.headers.get("Content-Type") or "application/json; charset=utf-8")
+            self._raw(
+                exc.code,
+                payload,
+                exc.headers.get("Content-Type") or "application/json; charset=utf-8",
+            )
         except (urllib.error.URLError, TimeoutError, OSError):
             self._json(502, {"error": "product_api_unavailable"})
 
