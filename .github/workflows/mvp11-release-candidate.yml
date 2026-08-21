@@ -1,0 +1,54 @@
+name: MVP-11 Release Candidate Lifecycle Contract
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact reviewed head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_sha="${{ github.event.pull_request.head.sha || github.sha }}"
+          tested_sha="$(git rev-parse HEAD)"
+          echo "tested_sha=${tested_sha}"
+          test "${tested_sha}" = "${expected_sha}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install exact package
+        run: python -m pip install --disable-pip-version-check -e .
+      - name: Lifecycle contract tests
+        run: python -m unittest -v tests.test_mvp11
+      - name: Compile release-candidate lifecycle
+        run: python -m py_compile src/genos/lifecycle.py src/genos/lifecycle_hardened.py src/genos/cli_mvp11.py src/genos/__main__.py
+      - name: Static destructive and secret boundary guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'genos = "genos.cli_mvp11:main"' pyproject.toml
+          grep -q 'from .cli_mvp11 import main' src/genos/__main__.py
+          grep -q 'restore_preserved_install_identity' src/genos/cli_mvp11.py
+          grep -q 'DROP ROLE IF EXISTS genos' src/genos/lifecycle_hardened.py
+          grep -q 'remote_resources_deleted.*False' src/genos/lifecycle_hardened.py
+          grep -q 'update failed; previous release and checkpoint were restored' src/genos/lifecycle_hardened.py
+          grep -q 'release checksum mismatch' scripts/bootstrap.sh
+          ! grep -R -E 'shell=True|os\.system\(' src/genos/lifecycle.py src/genos/lifecycle_hardened.py src/genos/cli_mvp11.py
+          ! grep -q 'curl |' scripts/bootstrap.sh
+          ! grep -q 'wget |' scripts/bootstrap.sh
+      - name: Bootstrap shell syntax
+        run: bash -n scripts/bootstrap.sh
