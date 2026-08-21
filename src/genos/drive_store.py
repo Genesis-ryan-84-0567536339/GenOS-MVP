@@ -4,7 +4,6 @@ from typing import Any
 import json
 
 from .product_store import PostgresProductStore, ProductStoreError, _jsonb_expr, _text_expr, _uuid_literal
-from .redaction import redact
 
 
 class DriveStoreError(RuntimeError):
@@ -32,14 +31,22 @@ _ALLOWED_KEYS = {
     "last_error_code",
     "updated_at",
 }
+_RAW_SECRET_KEYS = {
+    "access_token",
+    "refresh_token",
+    "client_secret",
+    "authorization_code",
+    "raw_secret",
+    "api_key",
+    "password",
+}
 
 
 class PostgresDriveMetadataStore:
     """Product-authority metadata for the Drive collaboration replica.
 
-    Only identifiers, state, cursor/fingerprint and non-secret account metadata
-    are persisted. Raw OAuth/client material belongs to SecretProvider and is
-    resolved only by a typed consumer at the remote-call boundary.
+    SecretRef identifiers are safe metadata and must remain intact. Raw OAuth
+    or client material is rejected by the strict schema before persistence.
     """
 
     def __init__(self, product_store: PostgresProductStore) -> None:
@@ -81,7 +88,7 @@ COMMIT;
                 "updated_at": row.get("updated_at"),
             }
         )
-        return redact(result)
+        return _clean_payload(result)
 
     def upsert_drive_binding(self, payload: dict[str, Any]) -> dict[str, Any]:
         clean = _clean_payload(payload)
@@ -112,8 +119,7 @@ def _clean_payload(payload: dict[str, Any]) -> dict[str, Any]:
     if unexpected:
         raise DriveStoreError("Drive binding contains unsupported metadata fields")
     for key in payload:
-        lowered = key.lower()
-        if any(fragment in lowered for fragment in ("access_token", "refresh_token", "client_secret", "authorization_code", "raw_secret")):
+        if key.lower() in _RAW_SECRET_KEYS:
             raise DriveStoreError("raw credential material cannot be persisted in Drive binding")
     instance_id = payload.get("instance_id")
     state = payload.get("state")
@@ -125,4 +131,4 @@ def _clean_payload(payload: dict[str, Any]) -> dict[str, Any]:
     serialized = json.dumps(clean, ensure_ascii=False, sort_keys=True)
     if len(serialized.encode("utf-8")) > 64 * 1024:
         raise DriveStoreError("Drive binding metadata is too large")
-    return redact(clean)
+    return clean
