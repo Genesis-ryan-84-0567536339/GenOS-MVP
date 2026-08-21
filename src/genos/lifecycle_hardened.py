@@ -2,14 +2,14 @@ from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
 from typing import Any
-import json
 import os
+import pwd
 import shutil
 import tarfile
 import tempfile
 
 from .install import ReleaseArtifact
-from .lifecycle import CORE_SERVICES, LifecycleError, LifecycleNeedsAction, LifecyclePaths, LifecycleService, sha256_file
+from .lifecycle import CORE_SERVICES, LifecycleError, LifecycleNeedsAction, LifecyclePaths, LifecycleService
 
 
 MAX_RELEASE_MEMBER_BYTES = 1024 * 1024 * 1024
@@ -21,10 +21,11 @@ class HardenedLifecycleService(LifecycleService):
     This layer intentionally overrides only the safety-sensitive operations that
     need stronger release-candidate semantics than the initial lifecycle draft:
     restore preserves existing SecretProvider material when a normal backup did
-    not include secrets; update restores its pre-mutation DB/state checkpoint on
-    failure; purge removes the local Product DB/role; release extraction rejects
-    link/device/oversized members. External Drive/Cloudflare resources are never
-    deleted by these local lifecycle operations.
+    not include secrets; live Product DB dump/restore never depends on postgres
+    traversing a root-only staging tree; update restores its pre-mutation DB/state
+    checkpoint on failure; purge removes the local Product DB/role; and release
+    extraction rejects link/device/oversized members. Remote provider resources
+    are never deleted by these local lifecycle operations.
     """
 
     def _verify_backup_manifest(self, root: Path, manifest: dict[str, Any]) -> None:
@@ -66,6 +67,74 @@ class HardenedLifecycleService(LifecycleService):
             if self.paths.config.exists():
                 shutil.rmtree(self.paths.config)
             shutil.copytree(config_source, self.paths.config, symlinks=False)
+
+    def _pg_dump(self, output: Path) -> None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        if not self._is_live_layout():
+            source = self.paths.state / "fixture-product-db.dump"
+            if source.is_file():
+                shutil.copy2(source, output)
+            else:
+                output.write_bytes(b"GENOS_FIXTURE_DB\n")
+            return
+
+        # Plain SQL on stdout avoids giving the postgres OS user access to the
+        # root-only backup staging tree. BYTEA and non-ASCII values are encoded by
+        # pg_dump as valid SQL text, while --clean makes restore deterministic.
+        result = self.runner.run(
+            [
+                "runuser",
+                "-u",
+                "postgres",
+                "--",
+                "pg_dump",
+                "--format=plain",
+                "--clean",
+                "--if-exists",
+                "--no-owner",
+                "genos",
+            ],
+            timeout=300,
+        )
+        if not result.stdout or "PostgreSQL database dump" not in result.stdout:
+            raise LifecycleError("pg_dump did not return a valid Product DB dump")
+        output.write_text(result.stdout, encoding="utf-8")
+        os.chmod(output, 0o600)
+
+    def _restore_database(self, dump: Path) -> None:
+        if not dump.is_file():
+            raise LifecycleError("database dump is missing")
+        if not self._is_live_layout():
+            shutil.copy2(dump, self.paths.state / "fixture-product-db.dump")
+            return
+
+        postgres = pwd.getpwnam("postgres")
+        staging = Path(tempfile.mkdtemp(prefix="genos-pgrestore-"))
+        try:
+            os.chown(staging, postgres.pw_uid, postgres.pw_gid)
+            os.chmod(staging, 0o700)
+            readable = staging / "product-db.sql"
+            shutil.copy2(dump, readable)
+            os.chown(readable, postgres.pw_uid, postgres.pw_gid)
+            os.chmod(readable, 0o600)
+            self.runner.run(
+                [
+                    "runuser",
+                    "-u",
+                    "postgres",
+                    "--",
+                    "psql",
+                    "-v",
+                    "ON_ERROR_STOP=1",
+                    "-d",
+                    "genos",
+                    "-f",
+                    str(readable),
+                ],
+                timeout=600,
+            )
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
 
     def update(self, *, release: ReleaseArtifact) -> dict[str, Any]:
         self._require_installed()
