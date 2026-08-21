@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>GenOS Mission Control</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Bỏ qua điều hướng</a>
+  <div id="app" class="app-shell">
+    <aside class="sidebar" aria-label="Điều hướng Mission Control">
+      <div class="brand"><strong>GENOS</strong><span>MISSION CONTROL</span></div>
+      <nav id="nav" class="nav-list">
+        <button type="button" data-route="dashboard">Dashboard</button>
+        <button type="button" data-route="kanban">Kanban</button>
+        <button type="button" data-route="agy">Agy-gen</button>
+        <button type="button" data-route="memory">Memory &amp; Skills</button>
+        <button type="button" data-route="connections">Connections</button>
+        <button type="button" data-route="reports">Reports</button>
+      </nav>
+      <section class="instance-card" aria-label="Trạng thái instance">
+        <div class="eyebrow">INSTANCE</div>
+        <div class="status-line"><span class="dot dot-unknown"></span><span id="instance-state">Đang tải…</span></div>
+        <code id="instance-id">UNKNOWN</code>
+        <code id="mcp-mini">MCP: UNKNOWN</code>
+      </section>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <div><span id="route-title">Dashboard</span></div>
+        <div class="top-actions">
+          <span id="global-state" class="badge badge-unknown">UNKNOWN</span>
+          <button id="refresh-btn" class="button" type="button">Làm mới</button>
+          <button id="logout-btn" class="button button-danger" type="button">Đăng xuất</button>
+        </div>
+      </header>
+      <main id="main" class="main" tabindex="-1" aria-live="polite"></main>
+    </div>
+  </div>
+
+  <dialog id="auth-dialog" class="modal">
+    <form id="login-form" method="dialog" class="modal-card">
+      <div class="eyebrow">OWNER AUTH</div>
+      <h1>Đăng nhập GenOS</h1>
+      <p class="muted">Mission Control chỉ dùng session Owner của Product API. Mật khẩu không được lưu trong browser.</p>
+      <label>Tên đăng nhập<input id="login-username" autocomplete="username" required></label>
+      <label>Mật khẩu<input id="login-password" type="password" autocomplete="current-password" required></label>
+      <div id="auth-error" class="error" role="alert"></div>
+      <button class="button button-primary" type="submit">Đăng nhập</button>
+      <button id="show-bootstrap" class="button" type="button">Khởi tạo Owner lần đầu</button>
+    </form>
+    <form id="bootstrap-form" method="dialog" class="modal-card hidden">
+      <div class="eyebrow">FIRST RUN</div>
+      <h1>Tạo Owner duy nhất</h1>
+      <p class="muted">Chỉ dùng khi instance chưa có Owner. Sau khi bootstrap, hãy đăng nhập bằng tài khoản vừa tạo.</p>
+      <label>Tên Owner<input id="bootstrap-username" autocomplete="username" required></label>
+      <label>Mật khẩu mới<input id="bootstrap-password" type="password" autocomplete="new-password" minlength="12" required></label>
+      <div id="bootstrap-error" class="error" role="alert"></div>
+      <button class="button button-primary" type="submit">Tạo Owner</button>
+      <button id="show-login" class="button" type="button">Quay lại đăng nhập</button>
+    </form>
+  </dialog>
+
+  <dialog id="one-time-dialog" class="modal">
+    <section class="modal-card">
+      <div class="eyebrow">ONE-TIME CREDENTIAL</div>
+      <h2>Chỉ hiển thị một lần</h2>
+      <p class="muted">Sau khi đóng cửa sổ này, GenOS không có API đọc lại raw token. Hãy lưu token ở Agent đích ngay bây giờ.</p>
+      <code id="one-time-token" class="secret-once"></code>
+      <div class="row-actions">
+        <button id="copy-token" class="button button-primary" type="button">Copy once</button>
+        <button id="close-token" class="button" type="button">Đóng</button>
+      </div>
+    </section>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>
