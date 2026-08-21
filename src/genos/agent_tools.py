@@ -13,6 +13,7 @@ import tempfile
 import urllib.request
 from typing import Any
 
+from .agent_cli_update import AGY_INSTALLER_URL, AntigravityCliManager
 from .redaction import redact
 
 
@@ -33,66 +34,72 @@ class AgentToolError(RuntimeError):
 class AgentToolState:
     state: str
     node_version: str | None
-    gemini_version: str | None
+    provider_cli: str
+    provider_version: str | None
     tmux_version: str | None
     node_bin: str | None
-    gemini_bin: str | None
-    npm_integrity: str | None
+    provider_bin: str | None
+    update_state: str | None
+    rollback_version: str | None
     evidence: str
+
+    @property
+    def gemini_version(self) -> None:
+        return None
+
+    @property
+    def gemini_bin(self) -> None:
+        return None
+
+    @property
+    def npm_integrity(self) -> None:
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "state": self.state,
             "node_version": self.node_version,
-            "gemini_version": self.gemini_version,
+            "provider_cli": self.provider_cli,
+            "provider_version": self.provider_version,
             "tmux_version": self.tmux_version,
             "node_bin": self.node_bin,
-            "gemini_bin": self.gemini_bin,
-            "npm_integrity": self.npm_integrity,
+            "provider_bin": self.provider_bin,
+            "update_state": self.update_state,
+            "rollback_version": self.rollback_version,
             "evidence": self.evidence,
         }
 
 
 class AgentToolProvisioner:
-    """Typed installer for the agy-gen CLI prerequisites on the verified host.
-
-    Node is downloaded from the official nodejs.org release URL and verified
-    against a pinned SHA256 from the official signed release checksum list.
-    Gemini CLI is installed as the unprivileged `genos` identity from an exact
-    stable npm version. npm verifies registry package integrity; the resolved
-    SRI is recorded as provenance evidence. No `latest` tag is used.
-    """
+    """Typed toolchain provisioner for resident `agy-gen`."""
 
     def __init__(self, root: Path | str = DEFAULT_TOOLS_ROOT) -> None:
         self.root = Path(root)
         self.node_root = self.root / f"node-v{NODE_VERSION}"
-        self.gemini_root = self.root / f"gemini-cli-v{GEMINI_CLI_VERSION}"
         self.node_bin = self.node_root / "bin" / "node"
         self.npm_bin = self.node_root / "bin" / "npm"
-        self.gemini_bin = self.gemini_root / "bin" / "gemini"
+        self.agy_root = self.root / "antigravity-cli"
+        self.agy = AntigravityCliManager(self.agy_root)
         self.state_path = self.root / "agy-gen-toolchain.json"
 
     def inspect(self) -> AgentToolState:
         node_version = self._version([str(self.node_bin), "--version"]) if self.node_bin.is_file() else None
-        gemini_version = self._version([str(self.gemini_bin), "--version"], env=self._tool_env()) if self.gemini_bin.exists() else None
+        agy_status = self.agy.status()
+        agy_version = agy_status.get("installed_version")
         tmux_bin = shutil.which("tmux")
         tmux_version = self._version([tmux_bin, "-V"]) if tmux_bin else None
-        persisted = self._read_state()
-        gemini_meta = persisted.get("gemini_cli") if persisted and isinstance(persisted.get("gemini_cli"), dict) else {}
-        ready = (
-            node_version == f"v{NODE_VERSION}"
-            and gemini_version == GEMINI_CLI_VERSION
-            and bool(tmux_version)
-        )
+        ready = node_version == f"v{NODE_VERSION}" and bool(agy_version) and bool(tmux_version)
         return AgentToolState(
             state="READY" if ready else "NEEDS_ACTION",
             node_version=node_version,
-            gemini_version=gemini_version,
+            provider_cli="antigravity",
+            provider_version=str(agy_version) if agy_version else None,
             tmux_version=tmux_version,
             node_bin=str(self.node_bin) if self.node_bin.is_file() else None,
-            gemini_bin=str(self.gemini_bin) if self.gemini_bin.exists() else None,
-            npm_integrity=str(gemini_meta.get("npm_integrity")) if gemini_meta.get("npm_integrity") else None,
-            evidence="PINNED_TOOLCHAIN_VERIFIED" if ready else "TOOLCHAIN_INCOMPLETE",
+            provider_bin=str(self.agy.active_binary) if self.agy.active_binary.is_file() else None,
+            update_state=str(agy_status.get("update_state")) if agy_status.get("update_state") else None,
+            rollback_version=str(agy_status.get("rollback_version")) if agy_status.get("rollback_version") else None,
+            evidence="MANAGED_ANTIGRAVITY_TOOLCHAIN_VERIFIED" if ready else "TOOLCHAIN_INCOMPLETE",
         )
 
     def provision(self) -> AgentToolState:
@@ -102,15 +109,28 @@ class AgentToolProvisioner:
             raise AgentToolError("supported Linux host evidence unavailable")
         if not _is_verified_ubuntu_x64():
             raise AgentToolError("tool provisioner currently supports only verified Ubuntu 24.04 x86_64 native profile")
+        cpu = self._agy_cpu_feature_evidence()
+        if not cpu["aes"] or not cpu["pclmulqdq"]:
+            raise AgentToolError(
+                "Antigravity CLI CPU prerequisites unavailable: "
+                f"CPU_AES={int(cpu['aes'])}; CPU_PCLMUL={int(cpu['pclmulqdq'])}"
+            )
         self.root.mkdir(parents=True, exist_ok=True, mode=0o755)
         self._ensure_tmux()
         self._ensure_node()
-        integrity = self._ensure_gemini()
+        self.agy_root.mkdir(parents=True, exist_ok=True, mode=0o755)
+        update = self.agy.ensure_latest(force=True)
+        if update.update_state in {"FAILED", "ROLLED_BACK"} or not self.agy.active_binary.is_file():
+            raise AgentToolError(
+                "Antigravity CLI stable provisioning failed: "
+                f"{update.evidence}; CPU_AES={int(cpu['aes'])}; CPU_PCLMUL={int(cpu['pclmulqdq'])}"
+            )
+        self._grant_agy_update_ownership()
         state = self.inspect()
         if state.state != "READY":
             raise AgentToolError(f"agy-gen toolchain verification failed: {state.evidence}")
         payload = {
-            "schema_version": "1.0",
+            "schema_version": "2.0",
             "state": state.state,
             "node": {
                 "version": NODE_VERSION,
@@ -118,17 +138,34 @@ class AgentToolProvisioner:
                 "sha256": NODE_SHA256,
                 "bin": str(self.node_bin),
             },
-            "gemini_cli": {
-                "package": "@google/gemini-cli",
-                "version": GEMINI_CLI_VERSION,
-                "npm_integrity": integrity,
-                "bin": str(self.gemini_bin),
+            "antigravity_cli": {
+                "provider_cli": "antigravity",
+                "version": state.provider_version,
+                "bin": str(self.agy.active_binary),
+                "source": AGY_INSTALLER_URL,
+                "release_channel": "official-installer-published-stable-manifest",
+                "managed_update": self.agy.status(),
+                "native_auto_update_disabled": True,
+                "cpu_prerequisites": cpu,
             },
             "tmux": {"version": state.tmux_version},
             "contains_secrets": False,
         }
         self._atomic_json(self.state_path, payload, 0o644)
         return self.inspect()
+
+    def _grant_agy_update_ownership(self) -> None:
+        try:
+            genos_user = pwd.getpwnam("genos")
+        except KeyError as exc:
+            raise AgentToolError("genos service identity is missing") from exc
+        for root, dirs, files in os.walk(self.agy_root):
+            os.chown(root, genos_user.pw_uid, genos_user.pw_gid)
+            for name in dirs:
+                os.chown(Path(root) / name, genos_user.pw_uid, genos_user.pw_gid)
+            for name in files:
+                os.chown(Path(root) / name, genos_user.pw_uid, genos_user.pw_gid)
+        os.chmod(self.agy_root, 0o755)
 
     def _ensure_tmux(self) -> None:
         if shutil.which("tmux"):
@@ -167,55 +204,17 @@ class AgentToolProvisioner:
         if self._version([str(self.node_bin), "--version"]) != f"v{NODE_VERSION}":
             raise AgentToolError("Node.js exact version verification failed")
 
-    def _ensure_gemini(self) -> str:
-        env = self._tool_env()
-        if self.gemini_bin.exists() and self._version([str(self.gemini_bin), "--version"], env=env) == GEMINI_CLI_VERSION:
-            persisted = self._read_state()
-            gemini_meta = persisted.get("gemini_cli") if persisted and isinstance(persisted.get("gemini_cli"), dict) else {}
-            return str(gemini_meta.get("npm_integrity") or "UNKNOWN")
+    @staticmethod
+    def _agy_cpu_feature_evidence() -> dict[str, bool]:
+        flags: set[str] = set()
         try:
-            genos_user = pwd.getpwnam("genos")
-        except KeyError as exc:
-            raise AgentToolError("genos service identity is missing") from exc
-        self.gemini_root.mkdir(parents=True, exist_ok=True, mode=0o755)
-        os.chown(self.gemini_root, genos_user.pw_uid, genos_user.pw_gid)
-        integrity_result = self._run_as_genos(
-            [str(self.npm_bin), "view", GEMINI_NPM_SPEC, "dist.integrity", "--json"],
-            env=env,
-            timeout=60,
-        )
-        integrity = integrity_result.stdout.strip().strip('"')
-        if not integrity.startswith("sha512-"):
-            raise AgentToolError("npm registry did not return package integrity metadata")
-        self._run_as_genos(
-            [
-                str(self.npm_bin),
-                "install",
-                "--global",
-                "--prefix",
-                str(self.gemini_root),
-                "--no-audit",
-                "--no-fund",
-                GEMINI_NPM_SPEC,
-            ],
-            env=env,
-            timeout=600,
-        )
-        version = self._version([str(self.gemini_bin), "--version"], env=env)
-        if version != GEMINI_CLI_VERSION:
-            raise AgentToolError(f"Gemini CLI exact version verification failed: {version or 'UNKNOWN'}")
-        return integrity
-
-    def _tool_env(self) -> dict[str, str]:
-        env = {
-            "PATH": f"{self.node_root / 'bin'}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-            "HOME": "/var/lib/genos",
-            "LANG": os.environ.get("LANG", "C.UTF-8"),
-            "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
-            "NO_COLOR": "1",
-            "npm_config_update_notifier": "false",
-        }
-        return env
+            for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
+                if line.lower().startswith("flags") and ":" in line:
+                    flags.update(line.split(":", 1)[1].strip().split())
+                    break
+        except OSError:
+            pass
+        return {"aes": "aes" in flags, "pclmulqdq": "pclmulqdq" in flags}
 
     def _run(self, argv: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
         try:
@@ -239,12 +238,6 @@ class AgentToolProvisioner:
             raise AgentToolError(f"typed tool provisioning command failed: {Path(argv[0]).name}")
         return completed
 
-    def _run_as_genos(self, argv: list[str], *, env: dict[str, str], timeout: float) -> subprocess.CompletedProcess[str]:
-        command = ["runuser", "-u", "genos", "--", "env"]
-        command.extend(f"{key}={value}" for key, value in env.items())
-        command.extend(argv)
-        return self._run(command, timeout=timeout)
-
     def _version(self, argv: list[str | None], env: dict[str, str] | None = None) -> str | None:
         if not argv[0]:
             return None
@@ -264,15 +257,6 @@ class AgentToolProvisioner:
             return None
         value = completed.stdout.strip().splitlines()
         return value[0].strip()[:160] if value else None
-
-    def _read_state(self) -> dict[str, Any] | None:
-        if not self.state_path.is_file():
-            return None
-        try:
-            value = json.loads(self.state_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        return value if isinstance(value, dict) else None
 
     @staticmethod
     def _atomic_json(path: Path, payload: dict[str, Any], mode: int) -> None:

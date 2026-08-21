@@ -15,13 +15,14 @@ from .agent_secure_runtime import SecretAwareGeminiAdapter, SecureTmuxController
 from .agent_tool_links import ensure_system_links
 from .agent_tools import AgentToolError, AgentToolProvisioner
 from .install import InstallError, NativeProvisioner, ReleaseArtifact, build_native_install
+from .observability import GENOS_SERVICES, ObservabilityService
 from .recon import collect_all
 from .redaction import redact
+from .repair import RepairError, RepairService
 from .state import JsonStateStore
 
 
 _RESERVED_MUTATION_COMMANDS = {
-    "repair",
     "update",
     "reconfigure",
     "backup",
@@ -41,10 +42,19 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--json", action="store_true", dest="as_json")
     status.add_argument("--state-dir", default=None)
 
-    for name in ("recon", "doctor"):
-        command = sub.add_parser(name, help="Run typed read-only host observations")
-        command.add_argument("--json", action="store_true", dest="as_json")
-        command.add_argument("--cwd", default=None, help="Optional repository path for read-only Git facts")
+    recon = sub.add_parser("recon", help="Run typed read-only host observations")
+    recon.add_argument("--json", action="store_true", dest="as_json")
+    recon.add_argument("--cwd", default=None, help="Optional repository path for read-only Git facts")
+
+    doctor = sub.add_parser("doctor", help="Run the shared read-only GenOS observability model")
+    doctor.add_argument("--json", action="store_true", dest="as_json")
+    doctor.add_argument("--cwd", default=None, help="Optional repository path for read-only Git facts")
+
+    repair = sub.add_parser("repair", help="Run one observation-backed typed repair action")
+    repair.add_argument("--action", required=True, choices=(RepairService.ACTION_RESTART_SERVICE,))
+    repair.add_argument("--target", required=True, choices=tuple(GENOS_SERVICES))
+    repair.add_argument("--plan-only", action="store_true")
+    repair.add_argument("--json", action="store_true", dest="as_json")
 
     install = sub.add_parser("install", help="Plan or execute the approved fresh-install provisioner")
     install.add_argument("--mode", choices=("native", "vm"), default=None)
@@ -94,8 +104,12 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "status":
         return _status(as_json=args.as_json, state_dir=args.state_dir)
-    if args.command in {"recon", "doctor"}:
-        return _recon(mode=args.command, as_json=args.as_json, cwd=args.cwd)
+    if args.command == "recon":
+        return _recon(as_json=args.as_json, cwd=args.cwd)
+    if args.command == "doctor":
+        return _doctor(as_json=args.as_json, cwd=args.cwd)
+    if args.command == "repair":
+        return _repair(args)
     if args.command == "install":
         return _install(args)
     if args.command == "agent":
@@ -129,10 +143,10 @@ def _status_store(state_dir: str | None) -> JsonStateStore:
     return JsonStateStore()
 
 
-def _recon(mode: str, as_json: bool, cwd: str | None) -> int:
+def _recon(as_json: bool, cwd: str | None) -> int:
     observations, support_class, reason = collect_all(cwd=cwd)
     payload = {
-        "mode": mode,
+        "mode": "recon",
         "read_only": True,
         "support_class": support_class.value,
         "support_reason": reason,
@@ -140,6 +154,41 @@ def _recon(mode: str, as_json: bool, cwd: str | None) -> int:
     }
     _emit(payload, as_json=as_json)
     return 0
+
+
+def _doctor(as_json: bool, cwd: str | None) -> int:
+    payload = ObservabilityService().snapshot(cwd=cwd)
+    _emit(payload, as_json=as_json)
+    return 0
+
+
+def _repair(args: argparse.Namespace) -> int:
+    service = RepairService()
+    try:
+        plan = service.plan(action=args.action, target=args.target)
+        payload: dict[str, Any] = {
+            "command": "repair",
+            "plan_only": bool(args.plan_only),
+            "state": "PLANNED" if plan.mutation_allowed else "NO_ACTION",
+            "plan": plan.to_dict(),
+        }
+        if not args.plan_only and plan.mutation_allowed:
+            result = service.execute(plan)
+            payload["result"] = result
+            payload["state"] = str(result.get("state") or "UNKNOWN")
+        _emit(payload, as_json=args.as_json)
+        if not args.plan_only and not plan.mutation_allowed and plan.reason == "INSUFFICIENT_LIVE_EVIDENCE":
+            return 3
+        return 0 if payload["state"] not in {"FAILED", "FAILED_VERIFY"} else 4
+    except RepairError as exc:
+        payload = {
+            "command": "repair",
+            "state": "FAILED_PRECONDITION",
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+        }
+        _emit(redact(payload), as_json=args.as_json)
+        return 4
 
 
 def _install(args: argparse.Namespace) -> int:
@@ -309,6 +358,8 @@ def _emit(payload: dict[str, Any], as_json: bool) -> None:
     if "observations" in payload:
         print(f"support: {payload['support_class']}")
         print(f"reason: {payload['support_reason']}")
+        if payload.get("health"):
+            print(f"health: {payload['health'].get('state', 'UNKNOWN')}")
         for item in payload["observations"]:
             print(f"- {item['check_id']}: {item['state']}")
         return

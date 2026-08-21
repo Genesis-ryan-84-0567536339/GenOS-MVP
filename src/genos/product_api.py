@@ -22,6 +22,7 @@ from .auth_service import (
     CredentialService,
     OwnerAuthService,
 )
+from .observability import ObservabilityService
 from .product_store import PostgresProductStore, ProductStoreError
 from .secret_provider import LocalFileSecretProvider, SecretProviderError
 
@@ -40,12 +41,14 @@ class ProductAPIApp:
         store: PostgresProductStore,
         agent_store: AgentRuntimeStore,
         agent_auth: AgentAuthBridge,
+        observability: ObservabilityService | None = None,
     ) -> None:
         self.auth = auth
         self.credentials = credentials
         self.store = store
         self.agent_store = agent_store
         self.agent_auth = agent_auth
+        self.observability = observability or ObservabilityService()
 
     @classmethod
     def from_system(cls) -> "ProductAPIApp":
@@ -61,7 +64,12 @@ class ProductAPIApp:
             store,
             agent_store,
             AgentAuthBridge(agent_store),
+            ObservabilityService(),
         )
+
+    def read_observability(self) -> dict[str, Any]:
+        """Return the same authoritative read model used by `genos doctor`."""
+        return self.observability.snapshot()
 
 
 class ProductAPIHandler(BaseHTTPRequestHandler):
@@ -87,6 +95,10 @@ class ProductAPIHandler(BaseHTTPRequestHandler):
             if self.path == "/api/v1/auth/me":
                 owner = self.app.auth.authenticate(self._bearer_token())
                 self._json(200, {"owner": owner})
+                return
+            if self.path == "/api/v1/observability":
+                self.app.auth.authenticate(self._bearer_token())
+                self._json(200, {"observability": self.app.read_observability()})
                 return
             if self.path == "/api/v1/credentials":
                 self.app.auth.authenticate(self._bearer_token())

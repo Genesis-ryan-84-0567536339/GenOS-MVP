@@ -15,13 +15,14 @@ import time
 import uuid
 from typing import Any
 
+from .agent_cli_update import AntigravityCliManager
 from .redaction import redact
 
 
 CORE_AGENT_ID = "agy-gen"
 CORE_AGENT_SESSION = "agy-gen"
-TARGET_PROVIDER = "gemini-cli"
-TARGET_MODEL = "gemini-3.7-flash"
+TARGET_PROVIDER = "antigravity"
+TARGET_MODEL = "gemini-3.7-flash-high"
 TARGET_THINKING_LEVEL = "HIGH"
 TARGET_APPROVAL_MODE = "yolo"
 DEFAULT_ROOT = Path("/var/lib/genos/agents/agy-gen")
@@ -78,6 +79,7 @@ class ProviderProbe:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "provider_cli": TARGET_PROVIDER,
             "state": self.state,
             "cli_path": self.cli_path,
             "cli_version": self.cli_version,
@@ -90,11 +92,11 @@ class ProviderProbe:
 
 
 class AgentRuntimeStore:
-    """Durable local runtime projection for the single MVP Core Agent.
+    """Durable local projection for the single MVP Core Agent.
 
-    Identity and revision history are separate from tmux/process state. The store
-    contains no provider credential material. Gemini authentication remains in
-    the provider-owned home/config area and is only observed through probes.
+    Agent identity, memory/skill revisions, work claim and tmux binding are
+    durable authorities independent from the replaceable provider CLI version.
+    Provider credentials remain provider-owned and are never persisted here.
     """
 
     def __init__(self, root: Path | str = DEFAULT_ROOT) -> None:
@@ -102,7 +104,7 @@ class AgentRuntimeStore:
         self.identity_path = self.root / "identity.json"
         self.runtime_path = self.root / "runtime.json"
         self.provider_path = self.root / "provider.json"
-        self.settings_path = self.root / "gemini-settings.json"
+        self.settings_path = self.root / ".gemini" / "antigravity-cli" / "settings.json"
         self.workspace = self.root / "workspace"
         self.queue_dir = self.root / "tasks" / "queued"
         self.result_dir = self.root / "tasks" / "results"
@@ -113,13 +115,7 @@ class AgentRuntimeStore:
     def ensure_seed(self, *, instance_id: str) -> dict[str, Any]:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(self.root, 0o700)
-        for path in (
-            self.workspace,
-            self.queue_dir,
-            self.result_dir,
-            self.memory_dir,
-            self.skills_dir,
-        ):
+        for path in (self.workspace, self.queue_dir, self.result_dir, self.memory_dir, self.skills_dir):
             path.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(path, 0o700)
 
@@ -129,9 +125,22 @@ class AgentRuntimeStore:
                 raise AgentRuntimeError("Core Agent identity path belongs to another agent")
             if existing.get("instance_id") != instance_id:
                 raise AgentRuntimeError("Core Agent identity belongs to another GenOS instance")
+            # Migrate only provider intent metadata. Identity itself remains the
+            # same durable agy-gen record across CLI replacement.
+            target = existing.get("provider_target")
+            if isinstance(target, dict) and target.get("provider") != TARGET_PROVIDER:
+                target.update(
+                    {
+                        "provider": TARGET_PROVIDER,
+                        "model": TARGET_MODEL,
+                        "thinking_level": TARGET_THINKING_LEVEL,
+                        "approval_mode": TARGET_APPROVAL_MODE,
+                    }
+                )
+                _atomic_json(self.identity_path, existing)
         else:
             existing = {
-                "schema_version": "1.0",
+                "schema_version": "1.1",
                 "agent_id": CORE_AGENT_ID,
                 "display_name": CORE_AGENT_ID,
                 "agent_kind": "CORE",
@@ -143,21 +152,14 @@ class AgentRuntimeStore:
                     "thinking_level": TARGET_THINKING_LEVEL,
                     "approval_mode": TARGET_APPROVAL_MODE,
                 },
-                "runtime_binding": {
-                    "type": "tmux",
-                    "session_name": CORE_AGENT_SESSION,
-                },
+                "runtime_binding": {"type": "tmux", "session_name": CORE_AGENT_SESSION},
                 "created_at": utc_now(),
             }
             _atomic_json(self.identity_path, existing)
 
-        self._ensure_gemini_settings()
+        self._ensure_antigravity_settings()
         if _load_json(self.runtime_path) is None:
-            self.write_runtime(
-                state="NEEDS_ACTION",
-                reason="PROVIDER_NOT_VERIFIED",
-                tmux_state="UNKNOWN",
-            )
+            self.write_runtime(state="NEEDS_ACTION", reason="PROVIDER_NOT_VERIFIED", tmux_state="UNKNOWN")
         return existing
 
     def identity(self) -> dict[str, Any]:
@@ -169,8 +171,9 @@ class AgentRuntimeStore:
     def provider(self) -> dict[str, Any] | None:
         return _load_json(self.provider_path)
 
-    def write_provider(self, probe: ProviderProbe) -> None:
-        _atomic_json(self.provider_path, {"schema_version": "1.0", **probe.to_dict()})
+    def write_provider(self, probe: Any) -> None:
+        payload = probe.to_dict() if hasattr(probe, "to_dict") else dict(probe)
+        _atomic_json(self.provider_path, {"schema_version": "1.1", **payload})
 
     def write_runtime(self, *, state: str, reason: str, tmux_state: str, task_id: str | None = None) -> None:
         _atomic_json(
@@ -190,6 +193,7 @@ class AgentRuntimeStore:
         return {
             "identity": self.identity(),
             "provider": self.provider() or {
+                "provider_cli": TARGET_PROVIDER,
                 "state": "NEEDS_ACTION",
                 "evidence": "provider_not_probed",
                 "model": TARGET_MODEL,
@@ -213,8 +217,7 @@ class AgentRuntimeStore:
         root = self.memory_dir if kind == "memory" else self.skills_dir
         target = root / clean_name
         target.mkdir(parents=True, exist_ok=True, mode=0o700)
-        current = sorted(target.glob("*.json"))
-        revision = len(current) + 1
+        revision = len(sorted(target.glob("*.json"))) + 1
         payload = {
             "schema_version": "1.0",
             "kind": kind,
@@ -236,12 +239,7 @@ class AgentRuntimeStore:
 
     def claim_work(self, *, task_id: str) -> dict[str, Any]:
         self.claim_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        payload = {
-            "agent_id": CORE_AGENT_ID,
-            "task_id": task_id,
-            "claimed_at": utc_now(),
-            "concurrency": 1,
-        }
+        payload = {"agent_id": CORE_AGENT_ID, "task_id": task_id, "claimed_at": utc_now(), "concurrency": 1}
         try:
             fd = os.open(self.claim_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         except FileExistsError as exc:
@@ -274,90 +272,54 @@ class AgentRuntimeStore:
         try:
             _atomic_json(
                 self.queue_dir / f"{task_id}.json",
-                {
-                    "task_id": task_id,
-                    "agent_id": CORE_AGENT_ID,
-                    "prompt": prompt,
-                    "state": "QUEUED",
-                    "created_at": utc_now(),
-                },
+                {"task_id": task_id, "agent_id": CORE_AGENT_ID, "prompt": prompt, "state": "QUEUED", "created_at": utc_now()},
             )
         except Exception:
             self.release_work(task_id=task_id)
             raise
         return task_id
 
-    def _ensure_gemini_settings(self) -> None:
-        payload = {
-            "modelConfigs": {
-                "customOverrides": [
-                    {
-                        "match": {"model": TARGET_MODEL},
-                        "modelConfig": {
-                            "generateContentConfig": {
-                                "thinkingConfig": {
-                                    "thinkingLevel": TARGET_THINKING_LEVEL,
-                                    "includeThoughts": False,
-                                }
-                            }
-                        },
-                    }
-                ]
-            },
-            "general": {"enableAutoUpdate": False, "enableAutoUpdateNotification": False},
-        }
+    def _ensure_antigravity_settings(self) -> None:
+        payload: dict[str, Any] = {}
+        if self.settings_path.is_file():
+            try:
+                current = json.loads(self.settings_path.read_text(encoding="utf-8"))
+                if isinstance(current, dict):
+                    payload = current
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+        # Keep permissions explicit in product state; the Owner-selected yolo
+        # behavior is passed only to the dedicated task process.
+        payload.setdefault("permissions", {})
+        self.settings_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         _atomic_json(self.settings_path, payload)
 
 
-class GeminiCliAdapter:
+class AntigravityCliAdapter:
     def __init__(self, store: AgentRuntimeStore, binary: str | None = None) -> None:
         self.store = store
-        self.binary = binary or shutil.which("gemini")
+        managed = Path("/var/lib/genos/tools/antigravity-cli/current/agy")
+        self.binary = binary or (str(managed) if managed.is_file() else shutil.which("agy"))
 
     def probe_installation(self) -> ProviderProbe:
         if not self.binary:
-            return ProviderProbe(
-                state="NEEDS_ACTION",
-                cli_path=None,
-                cli_version=None,
-                model=TARGET_MODEL,
-                thinking_level=TARGET_THINKING_LEVEL,
-                approval_mode=TARGET_APPROVAL_MODE,
-                observed_at=utc_now(),
-                evidence="GEMINI_CLI_NOT_FOUND",
-            )
+            return self._probe("NEEDS_ACTION", None, "AGY_CLI_NOT_FOUND")
         try:
-            completed = subprocess.run(
-                [self.binary, "--version"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-                check=False,
-                shell=False,
-                env=self._env(),
+            version = subprocess.run(
+                [self.binary, "--version"], capture_output=True, text=True, timeout=15, check=False, shell=False, env=self._env()
+            )
+            help_result = subprocess.run(
+                [self.binary, "--help"], capture_output=True, text=True, timeout=20, check=False, shell=False, env=self._env()
             )
         except (OSError, subprocess.TimeoutExpired):
-            return ProviderProbe(
-                state="DEGRADED",
-                cli_path=self.binary,
-                cli_version=None,
-                model=TARGET_MODEL,
-                thinking_level=TARGET_THINKING_LEVEL,
-                approval_mode=TARGET_APPROVAL_MODE,
-                observed_at=utc_now(),
-                evidence="GEMINI_CLI_VERSION_PROBE_FAILED",
-            )
-        version = completed.stdout.strip().splitlines()[0][:160] if completed.returncode == 0 and completed.stdout.strip() else None
-        return ProviderProbe(
-            state="INSTALLED" if completed.returncode == 0 else "DEGRADED",
-            cli_path=self.binary,
-            cli_version=version,
-            model=TARGET_MODEL,
-            thinking_level=TARGET_THINKING_LEVEL,
-            approval_mode=TARGET_APPROVAL_MODE,
-            observed_at=utc_now(),
-            evidence="GEMINI_CLI_VERSION_OK" if completed.returncode == 0 else "GEMINI_CLI_VERSION_NONZERO",
-        )
+            return self._probe("DEGRADED", None, "AGY_CLI_CAPABILITY_PROBE_FAILED")
+        lines = version.stdout.strip().splitlines()
+        cli_version = lines[0].strip()[:160] if version.returncode == 0 and lines else None
+        help_text = f"{help_result.stdout}\n{help_result.stderr}"
+        capabilities = all(flag in help_text for flag in ("--model", "--effort", "--output-format"))
+        if version.returncode != 0 or help_result.returncode != 0 or not capabilities:
+            return self._probe("DEGRADED", cli_version, "AGY_CLI_REQUIRED_FLAGS_MISSING")
+        return self._probe("INSTALLED", cli_version, "AGY_CLI_CAPABILITY_OK")
 
     def activate_with_real_probe(self, *, timeout: float = 90.0) -> ProviderProbe:
         installed = self.probe_installation()
@@ -365,10 +327,9 @@ class GeminiCliAdapter:
             self.store.write_provider(installed)
             return installed
         marker = f"GENOS_AGY_GEN_PROBE_OK_{uuid.uuid4().hex[:12]}"
-        command = self.command_for_prompt(f"Reply with exactly this marker and nothing else: {marker}")
         try:
             completed = subprocess.run(
-                command,
+                self.command_for_prompt(f"Reply with exactly this marker and nothing else: {marker}"),
                 capture_output=True,
                 text=True,
                 timeout=timeout,
@@ -378,64 +339,47 @@ class GeminiCliAdapter:
                 cwd=self.store.workspace,
             )
         except subprocess.TimeoutExpired:
-            probe = ProviderProbe(
-                state="NEEDS_ACTION",
-                cli_path=self.binary,
-                cli_version=installed.cli_version,
-                model=TARGET_MODEL,
-                thinking_level=TARGET_THINKING_LEVEL,
-                approval_mode=TARGET_APPROVAL_MODE,
-                observed_at=utc_now(),
-                evidence="PROVIDER_AUTH_OR_MODEL_PROBE_TIMEOUT",
-            )
+            probe = self._probe("NEEDS_ACTION", installed.cli_version, "PROVIDER_AUTH_OR_MODEL_PROBE_TIMEOUT")
             self.store.write_provider(probe)
             return probe
         except OSError:
-            probe = ProviderProbe(
-                state="DEGRADED",
-                cli_path=self.binary,
-                cli_version=installed.cli_version,
-                model=TARGET_MODEL,
-                thinking_level=TARGET_THINKING_LEVEL,
-                approval_mode=TARGET_APPROVAL_MODE,
-                observed_at=utc_now(),
-                evidence="PROVIDER_EXEC_UNAVAILABLE",
-            )
+            probe = self._probe("DEGRADED", installed.cli_version, "PROVIDER_EXEC_UNAVAILABLE")
             self.store.write_provider(probe)
             return probe
-
         success = completed.returncode == 0 and marker in completed.stdout
-        probe = ProviderProbe(
-            state="ACTIVE" if success else "NEEDS_ACTION",
-            cli_path=self.binary,
-            cli_version=installed.cli_version,
-            model=TARGET_MODEL,
-            thinking_level=TARGET_THINKING_LEVEL,
-            approval_mode=TARGET_APPROVAL_MODE,
-            observed_at=utc_now(),
-            evidence="REAL_MODEL_PROBE_PASS" if success else "AUTH_MODEL_OR_CONFIG_NOT_VERIFIED",
+        if success:
+            try:
+                envelope = json.loads(completed.stdout)
+                success = isinstance(envelope, dict) and envelope.get("status") == "SUCCESS" and marker in str(envelope.get("response", ""))
+            except json.JSONDecodeError:
+                success = marker in completed.stdout
+        probe = self._probe(
+            "ACTIVE" if success else "NEEDS_ACTION",
+            installed.cli_version,
+            "REAL_MODEL_PROBE_PASS" if success else "AUTH_MODEL_OR_CONFIG_NOT_VERIFIED",
         )
         self.store.write_provider(probe)
         return probe
 
     def command_for_prompt(self, prompt: str) -> list[str]:
         if not self.binary:
-            raise AgentNeedsAction("Gemini CLI is not installed")
+            raise AgentNeedsAction("Antigravity CLI is not installed")
         return [
             self.binary,
-            "--model",
-            TARGET_MODEL,
-            "--approval-mode=yolo",
+            "-p",
+            prompt,
             "--output-format",
             "json",
-            "--prompt",
-            prompt,
+            "--model",
+            TARGET_MODEL,
+            "--effort",
+            "high",
+            "--dangerously-skip-permissions",
         ]
 
     def run_task(self, prompt: str, *, timeout: float = 900.0) -> dict[str, Any]:
-        command = self.command_for_prompt(prompt)
         completed = subprocess.run(
-            command,
+            self.command_for_prompt(prompt),
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -447,25 +391,32 @@ class GeminiCliAdapter:
         stdout = completed.stdout[:MAX_RESULT_CHARS]
         digest = hashlib.sha256(completed.stdout.encode("utf-8", errors="replace")).hexdigest()
         if completed.returncode != 0:
-            return {
-                "state": "FAILED",
-                "error": "PROVIDER_COMMAND_FAILED",
-                "output_sha256": digest,
-                "observed_at": utc_now(),
-            }
-        return {
-            "state": "SUCCEEDED",
-            "output": redact(stdout),
-            "output_sha256": digest,
-            "observed_at": utc_now(),
-        }
+            return {"state": "FAILED", "error": "PROVIDER_COMMAND_FAILED", "output_sha256": digest, "observed_at": utc_now()}
+        return {"state": "SUCCEEDED", "output": redact(stdout), "output_sha256": digest, "observed_at": utc_now()}
 
     def _env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["HOME"] = str(self.store.root)
-        env["GEMINI_CLI_SYSTEM_SETTINGS_PATH"] = str(self.store.settings_path)
+        env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "true"
         env.setdefault("NO_COLOR", "1")
         return env
+
+    def _probe(self, state: str, version: str | None, evidence: str) -> ProviderProbe:
+        return ProviderProbe(
+            state=state,
+            cli_path=self.binary,
+            cli_version=version,
+            model=TARGET_MODEL,
+            thinking_level=TARGET_THINKING_LEVEL,
+            approval_mode=TARGET_APPROVAL_MODE,
+            observed_at=utc_now(),
+            evidence=evidence,
+        )
+
+
+# Compatibility import name for MVP-04 callers. It intentionally points to the
+# forward Antigravity adapter; no Gemini binary is invoked through this alias.
+GeminiCliAdapter = AntigravityCliAdapter
 
 
 class TmuxController:
@@ -477,13 +428,8 @@ class TmuxController:
         if not self.binary:
             return False
         completed = subprocess.run(
-            [self.binary, "has-session", "-t", CORE_AGENT_SESSION],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-            shell=False,
-            env=self._env(),
+            [self.binary, "has-session", "-t", CORE_AGENT_SESSION], capture_output=True, text=True, check=False,
+            timeout=5, shell=False, env=self._env(),
         )
         return completed.returncode == 0
 
@@ -493,17 +439,10 @@ class TmuxController:
         if self.has_session():
             return False
         python = shutil.which("python3") or "/usr/bin/python3"
-        command = shlex.join(
-            [python, "-m", "genos.agent_runtime", "worker", "--state-dir", str(self.store.root)]
-        )
+        command = shlex.join([python, "-m", "genos.agent_runtime", "worker", "--state-dir", str(self.store.root)])
         completed = subprocess.run(
             [self.binary, "new-session", "-d", "-s", CORE_AGENT_SESSION, "-c", str(self.store.workspace), command],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-            shell=False,
-            env=self._env(),
+            capture_output=True, text=True, check=False, timeout=10, shell=False, env=self._env(),
         )
         if completed.returncode != 0:
             raise AgentRuntimeError("tmux worker session could not be created")
@@ -513,20 +452,29 @@ class TmuxController:
         if not self.binary:
             raise AgentNeedsAction("tmux is not installed")
         subprocess.run(
-            [self.binary, "kill-session", "-t", CORE_AGENT_SESSION],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=5,
-            shell=False,
-            env=self._env(),
+            [self.binary, "kill-session", "-t", CORE_AGENT_SESSION], capture_output=True, text=True, check=False,
+            timeout=5, shell=False, env=self._env(),
         )
         self.ensure_worker_session()
 
     def _env(self) -> dict[str, str]:
         env = os.environ.copy()
         env["HOME"] = str(self.store.root)
+        env["AGY_CLI_DISABLE_AUTO_UPDATE"] = "true"
         return env
+
+
+def managed_cli_update(store: AgentRuntimeStore, *, force: bool = False) -> dict[str, Any]:
+    manager = AntigravityCliManager(agent_state_root=store.root)
+    was_active = (store.provider() or {}).get("state") == "ACTIVE"
+
+    def post_cutover(binary: str) -> bool:
+        if not was_active:
+            return True
+        return AntigravityCliAdapter(store, binary=binary).activate_with_real_probe(timeout=90).state == "ACTIVE"
+
+    result = manager.ensure_latest(force=force, post_cutover_probe=post_cutover)
+    return result.to_dict()
 
 
 def supervisor_loop(store: AgentRuntimeStore, *, interval: float = 5.0) -> int:
@@ -538,9 +486,12 @@ def supervisor_loop(store: AgentRuntimeStore, *, interval: float = 5.0) -> int:
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-    adapter = GeminiCliAdapter(store)
+    adapter = AntigravityCliAdapter(store)
     tmux = TmuxController(store)
+    first_tick = True
     while not stop:
+        managed_cli_update(store, force=first_tick)
+        first_tick = False
         provider = store.provider()
         if provider is None:
             installed = adapter.probe_installation()
@@ -549,8 +500,7 @@ def supervisor_loop(store: AgentRuntimeStore, *, interval: float = 5.0) -> int:
         claim = _load_json(store.claim_path)
         if provider.get("state") != "ACTIVE":
             store.write_runtime(
-                state="NEEDS_ACTION",
-                reason=str(provider.get("evidence") or "PROVIDER_NOT_ACTIVE"),
+                state="NEEDS_ACTION", reason=str(provider.get("evidence") or "PROVIDER_NOT_ACTIVE"),
                 tmux_state="RUNNING" if tmux.has_session() else "STOPPED",
                 task_id=str(claim.get("task_id")) if claim else None,
             )
@@ -560,14 +510,11 @@ def supervisor_loop(store: AgentRuntimeStore, *, interval: float = 5.0) -> int:
                 store.write_runtime(
                     state="BUSY" if claim else "READY",
                     reason="WORK_CLAIM_ACTIVE" if claim else "PROVIDER_AND_TMUX_ACTIVE",
-                    tmux_state="RUNNING",
-                    task_id=str(claim.get("task_id")) if claim else None,
+                    tmux_state="RUNNING", task_id=str(claim.get("task_id")) if claim else None,
                 )
             except AgentRuntimeError:
                 store.write_runtime(
-                    state="DEGRADED",
-                    reason="TMUX_WORKER_START_FAILED",
-                    tmux_state="STOPPED",
+                    state="DEGRADED", reason="TMUX_WORKER_START_FAILED", tmux_state="STOPPED",
                     task_id=str(claim.get("task_id")) if claim else None,
                 )
         time.sleep(max(0.5, interval))
@@ -583,7 +530,7 @@ def worker_loop(store: AgentRuntimeStore, *, interval: float = 1.0) -> int:
 
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
-    adapter = GeminiCliAdapter(store)
+    adapter = AntigravityCliAdapter(store)
     while not stop:
         queued = sorted(store.queue_dir.glob("*.json"))
         if not queued:
@@ -605,15 +552,8 @@ def worker_loop(store: AgentRuntimeStore, *, interval: float = 1.0) -> int:
         try:
             result = adapter.run_task(prompt)
         except (AgentRuntimeError, subprocess.TimeoutExpired) as exc:
-            result = {
-                "state": "FAILED",
-                "error": type(exc).__name__,
-                "observed_at": utc_now(),
-            }
-        _atomic_json(
-            store.result_dir / f"{task_id}.json",
-            {"task_id": task_id, "agent_id": CORE_AGENT_ID, **result},
-        )
+            result = {"state": "FAILED", "error": type(exc).__name__, "observed_at": utc_now()}
+        _atomic_json(store.result_dir / f"{task_id}.json", {"task_id": task_id, "agent_id": CORE_AGENT_ID, **result})
         task_path.unlink(missing_ok=True)
         store.release_work(task_id=task_id)
     return 0
@@ -622,11 +562,13 @@ def worker_loop(store: AgentRuntimeStore, *, interval: float = 1.0) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="python -m genos.agent_runtime")
     sub = parser.add_subparsers(dest="command", required=True)
-    for name in ("supervisor", "worker", "status", "probe", "activate", "restart"):
+    for name in ("supervisor", "worker", "status", "probe", "activate", "restart", "update-cli"):
         item = sub.add_parser(name)
         item.add_argument("--state-dir", default=str(DEFAULT_ROOT))
         if name in {"supervisor", "worker"}:
             item.add_argument("--interval", type=float, default=5.0 if name == "supervisor" else 1.0)
+        if name == "update-cli":
+            item.add_argument("--force", action="store_true")
     task = sub.add_parser("task")
     task.add_argument("--state-dir", default=str(DEFAULT_ROOT))
     task.add_argument("--prompt", required=True)
@@ -640,34 +582,25 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     store = AgentRuntimeStore(args.state_dir)
     if args.command == "seed":
-        print(json.dumps(store.ensure_seed(instance_id=args.instance_id), sort_keys=True))
-        return 0
+        print(json.dumps(store.ensure_seed(instance_id=args.instance_id), sort_keys=True)); return 0
     if args.command == "supervisor":
-        store.identity()
-        return supervisor_loop(store, interval=args.interval)
+        store.identity(); return supervisor_loop(store, interval=args.interval)
     if args.command == "worker":
-        store.identity()
-        return worker_loop(store, interval=args.interval)
+        store.identity(); return worker_loop(store, interval=args.interval)
     if args.command == "status":
-        print(json.dumps(store.status(), sort_keys=True))
-        return 0
+        print(json.dumps(store.status(), sort_keys=True)); return 0
     if args.command == "probe":
-        probe = GeminiCliAdapter(store).probe_installation()
-        store.write_provider(probe)
-        print(json.dumps(probe.to_dict(), sort_keys=True))
-        return 0 if probe.state == "INSTALLED" else 3
+        probe = AntigravityCliAdapter(store).probe_installation(); store.write_provider(probe)
+        print(json.dumps(probe.to_dict(), sort_keys=True)); return 0 if probe.state == "INSTALLED" else 3
     if args.command == "activate":
-        probe = GeminiCliAdapter(store).activate_with_real_probe()
-        print(json.dumps(probe.to_dict(), sort_keys=True))
-        return 0 if probe.state == "ACTIVE" else 3
+        probe = AntigravityCliAdapter(store).activate_with_real_probe()
+        print(json.dumps(probe.to_dict(), sort_keys=True)); return 0 if probe.state == "ACTIVE" else 3
     if args.command == "restart":
-        TmuxController(store).restart_worker_session()
-        print(json.dumps({"agent_id": CORE_AGENT_ID, "state": "RESTARTED"}, sort_keys=True))
-        return 0
+        TmuxController(store).restart_worker_session(); print(json.dumps({"agent_id": CORE_AGENT_ID, "state": "RESTARTED"}, sort_keys=True)); return 0
+    if args.command == "update-cli":
+        result = managed_cli_update(store, force=bool(args.force)); print(json.dumps(result, sort_keys=True)); return 0 if result.get("update_state") not in {"FAILED"} else 4
     if args.command == "task":
-        task_id = store.queue_task(args.prompt)
-        print(json.dumps({"agent_id": CORE_AGENT_ID, "task_id": task_id, "state": "QUEUED"}, sort_keys=True))
-        return 0
+        task_id = store.queue_task(args.prompt); print(json.dumps({"agent_id": CORE_AGENT_ID, "task_id": task_id, "state": "QUEUED"}, sort_keys=True)); return 0
     raise SystemExit(2)
 
 

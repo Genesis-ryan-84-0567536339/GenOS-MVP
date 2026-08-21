@@ -25,13 +25,22 @@ jobs:
         run: PYTHONPATH=src python -m compileall -q src tests
       - name: Unit and fixture tests
         run: PYTHONPATH=src python -m unittest discover -s tests -v
-      - name: Read-only CLI smoke
+      - name: Read-only lifecycle smoke
         run: |
           PYTHONPATH=src python -m genos status --json
           PYTHONPATH=src python -m genos recon --json > /tmp/genos-recon.json
+          PYTHONPATH=src python -m genos doctor --json > /tmp/genos-doctor.json
+          PYTHONPATH=src python -m genos repair --action restart-service --target worker --plan-only --json > /tmp/genos-repair-plan.json
           python - <<'PY'
           import json
-          payload = json.load(open('/tmp/genos-recon.json', encoding='utf-8'))
-          assert payload['read_only'] is True
-          assert payload['observations']
+          recon = json.load(open('/tmp/genos-recon.json', encoding='utf-8'))
+          doctor = json.load(open('/tmp/genos-doctor.json', encoding='utf-8'))
+          repair = json.load(open('/tmp/genos-repair-plan.json', encoding='utf-8'))
+          assert recon['read_only'] is True
+          assert recon['observations']
+          assert doctor['read_only'] is True
+          assert doctor['authority'] == 'genos-observability-v1'
+          assert doctor['observations']
+          assert repair['plan_only'] is True
+          assert repair['plan']['operation'] == ['systemctl', 'restart', 'genos-worker.service']
           PY

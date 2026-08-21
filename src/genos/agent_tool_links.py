@@ -3,19 +3,19 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from .agent_tools import AgentToolError, GEMINI_CLI_VERSION, NODE_VERSION
+from .agent_tools import AgentToolError, NODE_VERSION
 
 
 LINKS: tuple[tuple[Path, Path], ...] = (
     (Path("/usr/local/bin/node"), Path(f"/var/lib/genos/tools/node-v{NODE_VERSION}/bin/node")),
     (Path("/usr/local/bin/npm"), Path(f"/var/lib/genos/tools/node-v{NODE_VERSION}/bin/npm")),
     (Path("/usr/local/bin/npx"), Path(f"/var/lib/genos/tools/node-v{NODE_VERSION}/bin/npx")),
-    (Path("/usr/local/bin/gemini"), Path(f"/var/lib/genos/tools/gemini-cli-v{GEMINI_CLI_VERSION}/bin/gemini")),
+    (Path("/usr/local/bin/agy"), Path("/var/lib/genos/tools/antigravity-cli/current/agy")),
 )
 
 
 def ensure_system_links() -> list[dict[str, str]]:
-    """Expose only GenOS-pinned tools, refusing to overwrite host binaries."""
+    """Expose only GenOS-managed tools, refusing to overwrite host binaries."""
     if os.geteuid() != 0:
         raise AgentToolError("tool link activation requires root")
     evidence: list[dict[str, str]] = []
