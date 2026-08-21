@@ -1,0 +1,62 @@
+name: MVP-10 Edge Fix Once
+
+on:
+  push:
+    branches: [plan/mvp-10-cloudflare-edge]
+    paths: [.github/workflows/mvp10-edge-fix-once.yml]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: plan/mvp-10-cloudflare-edge
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Patch edge contract
+        shell: python
+        run: |
+          from pathlib import Path
+          p=Path('src/genos/edge.py')
+          s=p.read_text()
+          old='''        normalized = self._public(payload)\n        normalized["schema_version"] = "1.0"\n        normalized["updated_at"] = _utc_now()\n        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)\n        serialized = json.dumps(redact(normalized), ensure_ascii=False, sort_keys=True, indent=2) + "\\n"\n'''
+          new='''        normalized = self._public(payload)\n        for field in ("api_secret_id", "tunnel_secret_id"):\n            value = normalized.get(field)\n            if value not in {None, ""}:\n                try:\n                    normalized[field] = str(uuid.UUID(str(value)))\n                except ValueError as exc:\n                    raise EdgeError(f"invalid {field}") from exc\n        rollback = normalized.get("rollback")\n        if isinstance(rollback, dict):\n            for field in ("api_secret_id", "tunnel_secret_id"):\n                value = rollback.get(field)\n                if value not in {None, ""}:\n                    try:\n                        rollback[field] = str(uuid.UUID(str(value)))\n                    except ValueError as exc:\n                        raise EdgeError(f"invalid rollback {field}") from exc\n        normalized["schema_version"] = "1.0"\n        normalized["updated_at"] = _utc_now()\n        self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)\n        serialized = json.dumps(normalized, ensure_ascii=False, sort_keys=True, indent=2) + "\\n"\n'''
+          assert old in s
+          s=s.replace(old,new)
+          old='''    def _public(self, payload: dict[str, Any]) -> dict[str, Any]:\n        return redact({key: payload.get(key) for key in self._ALLOWED if key in payload})\n'''
+          new='''    def _public(self, payload: dict[str, Any]) -> dict[str, Any]:\n        # Strict field allowlist is the public sanitizer here. SecretRef UUIDs are\n        # intentionally preserved: they are non-secret identifiers required to\n        # resolve material through SecretProvider, not credential material.\n        return {key: payload.get(key) for key in self._ALLOWED if key in payload}\n'''
+          assert old in s
+          s=s.replace(old,new)
+          old='''        except Exception as exc:\n            if previous.get("mode") == "DOMAIN" and previous.get("tunnel_id"):\n                self._rollback_remote(previous, client)\n                restored = dict(previous)\n                restored["last_error_code"] = "RECONFIGURE_ROLLED_BACK"\n                self.store.save(_filter_store(restored))\n            elif created:\n                self.store.save(\n                    {\n                        "schema_version": "1.0",\n                        "state": "NEEDS_ACTION",\n                        "mode": "LOCAL",\n                        "origin": MISSION_CONTROL_ORIGIN,\n                        "last_error_code": "EDGE_CONFIGURE_FAILED_EXTERNAL_TUNNEL_PRESERVED",\n                    }\n                )\n'''
+          new='''        except Exception as exc:\n            if previous.get("mode") == "DOMAIN" and previous.get("tunnel_id"):\n                try:\n                    old_secret_id = str(previous.get("api_secret_id") or "")\n                    old_raw_token = self.credentials.get_secret_for_consumer(old_secret_id, consumer=EDGE_API_SCOPE)\n                    rollback_client = self.client_factory(old_raw_token)\n                    self._rollback_remote(previous, rollback_client)\n                except Exception as rollback_exc:\n                    preserved = dict(previous)\n                    preserved["last_error_code"] = "RECONFIGURE_ROLLBACK_NEEDS_ACTION"\n                    self.store.save(_filter_store(preserved))\n                    raise EdgeRemoteError("Cloudflare rollback could not restore the previous route; local mode remains available") from rollback_exc\n                restored = dict(previous)\n                restored["last_error_code"] = "RECONFIGURE_ROLLED_BACK"\n                self.store.save(_filter_store(restored))\n            elif created:\n                self.store.save(\n                    {\n                        "schema_version": "1.0",\n                        "state": "NEEDS_ACTION",\n                        "mode": "LOCAL",\n                        "account_id": clean_account,\n                        "zone_id": clean_zone,\n                        "api_secret_id": api_secret_id,\n                        "tunnel_id": tunnel_id,\n                        "origin": MISSION_CONTROL_ORIGIN,\n                        "tunnel_state": "REMOTE_RESOURCE_PRESERVED",\n                        "public_state": "NOT_CONFIGURED",\n                        "last_error_code": "EDGE_CONFIGURE_FAILED_EXTERNAL_TUNNEL_PRESERVED",\n                    }\n                )\n'''
+          assert old in s
+          s=s.replace(old,new)
+          p.write_text(s)
+      - name: Extend tests
+        shell: python
+        run: |
+          from pathlib import Path
+          p=Path('tests/test_mvp10.py')
+          s=p.read_text()
+          marker='''    def test_disable_is_unbind_only_and_does_not_delete_remote_resources(self):\n'''
+          addition='''    def test_reconfigure_with_new_api_credential_uses_old_credential_for_rollback(self):\n        with tempfile.TemporaryDirectory() as temp:\n            credentials, cloudflare, service = self.fixture(temp)\n            service.configure(api_secret_id=API_SECRET, account_id=ACCOUNT, zone_id=ZONE, hostname="old.example.test")\n            new_secret = str(uuid.uuid4())\n            credentials.values[new_secret] = "raw-new-api-token-fixture"\n            original_factory = service.client_factory\n            def factory(raw):\n                if raw == "raw-cloudflare-api-token-fixture":\n                    return cloudflare\n                if raw == "raw-new-api-token-fixture":\n                    return cloudflare\n                raise AssertionError("unexpected token")\n            service.client_factory = factory\n            cloudflare.fail_hostname = "new.example.test"\n            with self.assertRaises(EdgeRemoteError):\n                service.configure(api_secret_id=new_secret, account_id=ACCOUNT, zone_id=ZONE, hostname="new.example.test")\n            self.assertEqual(service.status()["hostname"], "old.example.test")\n            self.assertEqual(service.status()["api_secret_id"], API_SECRET)\n\n'''
+          assert marker in s
+          s=s.replace(marker,addition+marker)
+          p.write_text(s)
+      - name: Verify
+        run: |
+          python -m pip install -e .
+          python -m unittest -v tests.test_mvp10
+          python -m py_compile src/genos/edge.py src/genos/edge_runtime.py src/genos/edge_cli.py
+      - name: Commit
+        run: |
+          git config user.name 'Genesis PLAN'
+          git config user.email 'genesis.corp.os@gmail.com'
+          git add src/genos/edge.py tests/test_mvp10.py
+          git commit -m 'fix(mvp10): preserve SecretRefs and harden rollback'
+          git push origin HEAD:plan/mvp-10-cloudflare-edge
