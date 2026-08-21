@@ -64,7 +64,6 @@ jobs:
     timeout-minutes: 20
     env:
       GENOS_MVP06_DRIVE_CREDENTIAL: ${{ secrets.GENOS_MVP06_DRIVE_CREDENTIAL }}
-      GENOS_MVP06_EXTERNAL_EVIDENCE: ${{ runner.temp }}/mvp06-external-drive-evidence.json
       GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
     steps:
       - name: Checkout exact reviewed head
@@ -95,6 +94,8 @@ jobs:
       - name: Record truthful external-auth gate
         if: steps.credential.outputs.configured != 'true'
         shell: bash
+        env:
+          GENOS_MVP06_EXTERNAL_EVIDENCE: ${{ runner.temp }}/mvp06-external-drive-evidence.json
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -130,6 +131,7 @@ jobs:
         shell: bash
         env:
           PYTHONPATH: src
+          GENOS_MVP06_EXTERNAL_EVIDENCE: ${{ runner.temp }}/mvp06-external-drive-evidence.json
         run: |
           set -euo pipefail
           python3 ci/mvp06-external-drive-e2e.py
