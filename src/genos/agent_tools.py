@@ -121,6 +121,7 @@ class AgentToolProvisioner:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o755)
         self._ensure_tmux()
         self._ensure_node()
+        self._ensure_agy_installer_prerequisites()
         self.agy_root.mkdir(parents=True, exist_ok=True, mode=0o755)
         update = self.agy.ensure_latest(force=True)
         if update.update_state in {"FAILED", "ROLLED_BACK"} or not self.agy.active_binary.is_file():
@@ -201,6 +202,14 @@ class AgentToolProvisioner:
             shutil.copytree(source, self.node_root, symlinks=True)
         if self._version([str(self.node_bin), "--version"]) != f"v{NODE_VERSION}":
             raise AgentToolError("Node.js exact version verification failed")
+
+    def _ensure_agy_installer_prerequisites(self) -> None:
+        if shutil.which("curl") or shutil.which("wget"):
+            return
+        self._run(["apt-get", "update"], timeout=300)
+        self._run(["apt-get", "install", "-y", "curl", "ca-certificates"], timeout=600)
+        if not shutil.which("curl") and not shutil.which("wget"):
+            raise AgentToolError("Antigravity installer prerequisite install completed without curl or wget")
 
     def _run(self, argv: list[str], *, timeout: float) -> subprocess.CompletedProcess[str]:
         try:
