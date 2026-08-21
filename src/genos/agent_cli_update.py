@@ -57,14 +57,7 @@ class AgentCliUpdateResult:
 
 
 class AntigravityCliManager:
-    """GenOS-managed stable channel for Google Antigravity CLI (`agy`).
-
-    The upstream installer is downloaded over HTTPS and run as the unprivileged
-    `genos` identity inside a disposable HOME. Its resulting binary is copied to
-    a durable candidate file before the disposable staging tree disappears.
-    Version directories are immutable after creation; `current` and `previous`
-    symlinks are the only mutable activation pointers and are replaced atomically.
-    """
+    """GenOS-owned stable channel with idle-only atomic cutover and rollback."""
 
     def __init__(
         self,
@@ -101,7 +94,7 @@ class AntigravityCliManager:
                 "last_check_at": persisted.get("last_check_at"),
                 "last_success_at": persisted.get("last_success_at"),
                 "rollback_version": self._link_version(self.previous_link),
-                "active_sha256": _sha256_file(self.active_binary) if self.active_binary.is_file() else None,
+                "active_sha256": self._active_sha(),
                 "installer_sha256": persisted.get("installer_sha256"),
                 "evidence": persisted.get("evidence", "AGY_UPDATE_NOT_CHECKED"),
             }
@@ -117,7 +110,7 @@ class AntigravityCliManager:
         now = _utc_now()
         persisted = self._read_state() or {}
         current_version = self._active_version()
-        last_success = str(persisted.get("last_success_at")) if persisted.get("last_success_at") else None
+        last_success = _text(persisted.get("last_success_at"))
 
         if self.claim_path.exists():
             return self._save(
@@ -144,16 +137,15 @@ class AntigravityCliManager:
             candidate_version = candidate["version"]
             installer_sha = candidate["installer_sha256"]
             candidate_sha = candidate["binary_sha256"]
-
-            if current_version and _semver(candidate_version) and _semver(current_version):
-                if _semver(candidate_version) < _semver(current_version):
-                    return self._save(
-                        AgentCliUpdateResult(
-                            AGY_PROVIDER_CLI, current_version, candidate_version, "CURRENT", now, last_success,
-                            self._link_version(self.previous_link), self._active_sha(), installer_sha,
-                            "STABLE_CHANNEL_WOULD_DOWNGRADE_BLOCKED",
-                        )
+            old_semver, new_semver = _semver(current_version), _semver(candidate_version)
+            if old_semver and new_semver and new_semver < old_semver:
+                return self._save(
+                    AgentCliUpdateResult(
+                        AGY_PROVIDER_CLI, current_version, candidate_version, "CURRENT", now, last_success,
+                        self._link_version(self.previous_link), self._active_sha(), installer_sha,
+                        "STABLE_CHANNEL_WOULD_DOWNGRADE_BLOCKED",
                     )
+                )
 
             version_dir = self._store_candidate(candidate_version, staged, candidate_sha)
             if current_version == candidate_version and self.active_binary.is_file():
@@ -200,7 +192,7 @@ class AntigravityCliManager:
                 AgentCliUpdateResult(
                     AGY_PROVIDER_CLI, current_version, _text(persisted.get("latest_stable_version")), "FAILED",
                     now, last_success, self._link_version(self.previous_link), self._active_sha(),
-                    _text(persisted.get("installer_sha256")), f"UPDATE_FAILED_{type(exc).__name__}",
+                    _text(persisted.get("installer_sha256")), _error_evidence(exc),
                 )
             )
         finally:
@@ -209,7 +201,7 @@ class AntigravityCliManager:
 
     def rollback(self) -> AgentCliUpdateResult:
         if not self.previous_link.exists():
-            raise AgentCliUpdateError("no previous Antigravity CLI version is available")
+            raise AgentCliUpdateError("NO_PREVIOUS_VERSION")
         previous_target = self.previous_link.resolve()
         current_target = self.current_link.resolve() if self.current_link.exists() else None
         self._atomic_link(self.current_link, previous_target)
@@ -217,7 +209,7 @@ class AntigravityCliManager:
         if not version or not self._verify_active(version):
             if current_target is not None:
                 self._atomic_link(self.current_link, current_target)
-            raise AgentCliUpdateError("rollback target failed verification")
+            raise AgentCliUpdateError("ROLLBACK_TARGET_VERIFY_FAILED")
         if current_target is not None and current_target != previous_target:
             self._atomic_link(self.previous_link, current_target)
         now = _utc_now()
@@ -235,23 +227,33 @@ class AntigravityCliManager:
         try:
             with tempfile.TemporaryDirectory(prefix="genos-agy-stage-") as temp_name:
                 stage = Path(temp_name)
-                os.chmod(stage, 0o755); os.chown(stage, genos_user.pw_uid, genos_user.pw_gid)
+                os.chmod(stage, 0o755)
+                os.chown(stage, genos_user.pw_uid, genos_user.pw_gid)
                 installer = stage / "install.sh"
                 try:
                     with self.opener(self.installer_url, timeout=60) as response, installer.open("wb") as output:
                         shutil.copyfileobj(response, output)
                 except (OSError, TimeoutError) as exc:
-                    raise AgentCliUpdateError("official Antigravity installer download failed") from exc
-                os.chmod(installer, 0o644); os.chown(installer, genos_user.pw_uid, genos_user.pw_gid)
+                    raise AgentCliUpdateError("INSTALLER_DOWNLOAD_FAILED") from exc
+                os.chmod(installer, 0o644)
+                os.chown(installer, genos_user.pw_uid, genos_user.pw_gid)
                 installer_sha = _sha256_file(installer)
-                home = stage / "home"; home.mkdir(mode=0o700); os.chown(home, genos_user.pw_uid, genos_user.pw_gid)
-                self._run_as_genos(["/bin/bash", str(installer), "--skip-aliases", "--skip-path"], env=self._agy_env(home), timeout=600)
+                home = stage / "home"
+                home.mkdir(mode=0o700)
+                os.chown(home, genos_user.pw_uid, genos_user.pw_gid)
+                # `genos` remains /usr/sbin/nologin at the account level. The
+                # typed installer process alone gets an explicit non-login shell,
+                # matching the tmux auth/runtime hardening invariant.
+                self._run_as_genos(
+                    ["/bin/bash", str(installer), "--skip-aliases", "--skip-path"],
+                    env=self._agy_env(home), timeout=600,
+                )
                 installed = home / ".local" / "bin" / AGY_BINARY_NAME
                 if not installed.is_file():
-                    raise AgentCliUpdateError("official installer completed without an agy binary")
+                    raise AgentCliUpdateError("INSTALLER_BINARY_MISSING")
                 version = self._version(installed, home=home)
                 if not version:
-                    raise AgentCliUpdateError("staged agy --version probe failed")
+                    raise AgentCliUpdateError("STAGED_VERSION_PROBE_FAILED")
                 fd, candidate_name = tempfile.mkstemp(prefix=".agy-candidate-", dir=str(self.root))
                 os.close(fd)
                 persistent_candidate = Path(candidate_name)
@@ -271,12 +273,12 @@ class AntigravityCliManager:
     def _store_candidate(self, version: str, candidate: Path, expected_sha: str) -> Path:
         safe = re.sub(r"[^0-9A-Za-z._+-]", "_", version)[:128]
         if not safe:
-            raise AgentCliUpdateError("candidate version is invalid")
+            raise AgentCliUpdateError("CANDIDATE_VERSION_INVALID")
         target_dir = self.versions_root / safe
         target = target_dir / AGY_BINARY_NAME
         if target.is_file():
             if _sha256_file(target) != expected_sha:
-                raise AgentCliUpdateError("existing version checksum conflicts with candidate")
+                raise AgentCliUpdateError("VERSION_CHECKSUM_CONFLICT")
             return target_dir
         temp_dir = self.versions_root / f".{safe}.{uuid.uuid4().hex}.tmp"
         temp_dir.mkdir(mode=0o755)
@@ -284,7 +286,7 @@ class AntigravityCliManager:
             shutil.copy2(candidate, temp_dir / AGY_BINARY_NAME)
             os.chmod(temp_dir / AGY_BINARY_NAME, 0o755)
             if _sha256_file(temp_dir / AGY_BINARY_NAME) != expected_sha:
-                raise AgentCliUpdateError("candidate checksum changed during staging")
+                raise AgentCliUpdateError("STAGING_CHECKSUM_CHANGED")
             os.replace(temp_dir, target_dir)
         finally:
             if temp_dir.exists():
@@ -314,9 +316,9 @@ class AntigravityCliManager:
         try:
             self.versions_root.mkdir(parents=True, exist_ok=True, mode=0o755)
         except PermissionError as exc:
-            raise AgentCliUpdateError("Antigravity CLI tool root is not writable") from exc
+            raise AgentCliUpdateError("TOOL_ROOT_NOT_WRITABLE") from exc
         if not os.access(self.root, os.W_OK):
-            raise AgentCliUpdateError("Antigravity CLI tool root is not writable")
+            raise AgentCliUpdateError("TOOL_ROOT_NOT_WRITABLE")
 
     def _atomic_link(self, link: Path, target: Path) -> None:
         temp = link.with_name(f".{link.name}.{uuid.uuid4().hex}.tmp")
@@ -329,19 +331,33 @@ class AntigravityCliManager:
     def _run_as_genos(self, argv: list[str], *, env: dict[str, str], timeout: float) -> subprocess.CompletedProcess[str]:
         user = self._genos_user()
         if os.geteuid() == user.pw_uid:
-            command = argv
-            child_env = env
+            command, child_env = argv, env
         elif os.geteuid() == 0:
-            command = ["runuser", "-u", "genos", "--", "env", *[f"{k}={v}" for k, v in env.items()], *argv]
-            child_env = {"PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", "LANG": env.get("LANG", "C.UTF-8"), "LC_ALL": env.get("LC_ALL", "C.UTF-8")}
+            command = ["runuser", "-u", "genos", "--", "env", *[f"{key}={value}" for key, value in env.items()], *argv]
+            child_env = {
+                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "LANG": env.get("LANG", "C.UTF-8"),
+                "LC_ALL": env.get("LC_ALL", "C.UTF-8"),
+            }
         else:
-            raise AgentCliUpdateError("Antigravity update must run as root or genos")
+            raise AgentCliUpdateError("UPDATER_IDENTITY_INVALID")
         try:
             completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=timeout, shell=False, env=child_env)
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise AgentCliUpdateError("Antigravity staging command failed to execute") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise AgentCliUpdateError("INSTALLER_TIMEOUT") from exc
+        except OSError as exc:
+            raise AgentCliUpdateError("INSTALLER_EXEC_FAILED") from exc
         if completed.returncode != 0:
-            raise AgentCliUpdateError("official Antigravity installer returned non-zero")
+            output = f"{completed.stdout}\n{completed.stderr}".lower()
+            if "checksum" in output or "security halt" in output:
+                code = "INSTALLER_INTEGRITY_REJECTED"
+            elif "permission" in output or "denied" in output:
+                code = "INSTALLER_PERMISSION_FAILED"
+            elif "curl" in output or "download" in output or "network" in output:
+                code = "INSTALLER_NETWORK_FAILED"
+            else:
+                code = f"INSTALLER_EXIT_{completed.returncode}"
+            raise AgentCliUpdateError(code)
         return completed
 
     def _version(self, binary: Path, *, home: Path) -> str | None:
@@ -354,11 +370,11 @@ class AntigravityCliManager:
             return None
         if completed.returncode != 0:
             return None
-        line = completed.stdout.strip().splitlines()
-        if not line:
+        lines = completed.stdout.strip().splitlines()
+        if not lines:
             return None
-        match = re.search(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", line[0])
-        return match.group(0) if match else line[0].strip()[:128]
+        match = re.search(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?", lines[0])
+        return match.group(0) if match else lines[0].strip()[:128]
 
     def _active_version(self) -> str | None:
         return self._version(self.active_binary, home=self.agent_state_root) if self.active_binary.is_file() else None
@@ -389,17 +405,19 @@ class AntigravityCliManager:
         return {
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "HOME": str(home),
+            "SHELL": "/bin/sh",
             "LANG": os.environ.get("LANG", "C.UTF-8"),
             "LC_ALL": os.environ.get("LC_ALL", "C.UTF-8"),
             "NO_COLOR": "1",
             "AGY_CLI_DISABLE_AUTO_UPDATE": "true",
         }
 
-    def _genos_user(self) -> pwd.struct_passwd:
+    @staticmethod
+    def _genos_user() -> pwd.struct_passwd:
         try:
             return pwd.getpwnam("genos")
         except KeyError as exc:
-            raise AgentCliUpdateError("genos service identity is missing") from exc
+            raise AgentCliUpdateError("GENOS_IDENTITY_MISSING") from exc
 
     def _read_state(self) -> dict[str, Any] | None:
         if not self.state_path.is_file():
@@ -411,8 +429,10 @@ class AntigravityCliManager:
         return value if isinstance(value, dict) else None
 
     def _save(self, result: AgentCliUpdateResult) -> AgentCliUpdateResult:
-        payload = {"schema_version": "1.0", **result.to_dict(), "source": self.installer_url, "contains_secrets": False}
-        self._atomic_json(self.state_path, payload)
+        self._atomic_json(
+            self.state_path,
+            {"schema_version": "1.0", **result.to_dict(), "source": self.installer_url, "contains_secrets": False},
+        )
         return result
 
     @staticmethod
@@ -420,16 +440,24 @@ class AntigravityCliManager:
         temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
         try:
             temp.write_text(json.dumps(redact(payload), sort_keys=True, indent=2) + "\n", encoding="utf-8")
-            os.chmod(temp, 0o644); os.replace(temp, path)
+            os.chmod(temp, 0o644)
+            os.replace(temp, path)
         finally:
             temp.unlink(missing_ok=True)
+
+
+def _error_evidence(exc: AgentCliUpdateError) -> str:
+    code = re.sub(r"[^A-Z0-9_]+", "_", str(exc).upper()).strip("_")[:96] or "UNKNOWN"
+    return f"UPDATE_FAILED_{code}"
 
 
 def _text(value: Any) -> str | None:
     return str(value) if value not in {None, ""} else None
 
 
-def _semver(value: str) -> tuple[int, int, int] | None:
+def _semver(value: str | None) -> tuple[int, int, int] | None:
+    if not value:
+        return None
     match = re.search(r"(\d+)\.(\d+)\.(\d+)", value)
     return tuple(int(part) for part in match.groups()) if match else None  # type: ignore[return-value]
 
