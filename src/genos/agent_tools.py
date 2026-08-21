@@ -77,9 +77,9 @@ class AgentToolProvisioner:
 
     Node remains a reproducible pinned dependency with official checksum
     verification. Forward provider CLI is Google Antigravity (`agy`), installed
-    from the official stable installer into a GenOS-owned version store. The
-    provider binary is not pinned forever: GenOS manages stable-channel updates,
-    atomic cutover and rollback through :class:`AntigravityCliManager`.
+    from the official stable release manifest into a GenOS-owned version store.
+    The provider binary is not pinned forever: GenOS manages stable-channel
+    updates, atomic cutover and rollback through AntigravityCliManager.
     """
 
     def __init__(self, root: Path | str = DEFAULT_TOOLS_ROOT) -> None:
@@ -121,7 +121,6 @@ class AgentToolProvisioner:
         self.root.mkdir(parents=True, exist_ok=True, mode=0o755)
         self._ensure_tmux()
         self._ensure_node()
-        self._ensure_agy_installer_prerequisites()
         self.agy_root.mkdir(parents=True, exist_ok=True, mode=0o755)
         update = self.agy.ensure_latest(force=True)
         if update.update_state in {"FAILED", "ROLLED_BACK"} or not self.agy.active_binary.is_file():
@@ -148,6 +147,7 @@ class AgentToolProvisioner:
                 "version": state.provider_version,
                 "bin": str(self.agy.active_binary),
                 "source": AGY_INSTALLER_URL,
+                "release_channel": "official-installer-published-stable-manifest",
                 "managed_update": self.agy.status(),
                 "native_auto_update_disabled": True,
                 "cpu_prerequisites": self._agy_cpu_feature_evidence(),
@@ -207,14 +207,6 @@ class AgentToolProvisioner:
             shutil.copytree(source, self.node_root, symlinks=True)
         if self._version([str(self.node_bin), "--version"]) != f"v{NODE_VERSION}":
             raise AgentToolError("Node.js exact version verification failed")
-
-    def _ensure_agy_installer_prerequisites(self) -> None:
-        if shutil.which("curl") or shutil.which("wget"):
-            return
-        self._run(["apt-get", "update"], timeout=300)
-        self._run(["apt-get", "install", "-y", "curl", "ca-certificates"], timeout=600)
-        if not shutil.which("curl") and not shutil.which("wget"):
-            raise AgentToolError("Antigravity installer prerequisite install completed without curl or wget")
 
     @staticmethod
     def _agy_cpu_feature_evidence() -> dict[str, bool]:
