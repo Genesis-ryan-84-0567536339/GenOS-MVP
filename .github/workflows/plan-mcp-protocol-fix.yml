@@ -1,5 +1,6 @@
 name: PLAN MCP Protocol Fix
 
+# trigger after workflow is present on the PR branch
 on:
   pull_request:
     types: [synchronize, reopened]
