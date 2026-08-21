@@ -1,0 +1,53 @@
+name: MVP-07 Kanban Drive Collaboration Contract
+
+on:
+  pull_request:
+    paths:
+      - 'src/genos/kanban*.py'
+      - 'src/genos/artifact_store.py'
+      - 'src/genos/drive_collab.py'
+      - 'src/genos/product_api.py'
+      - 'src/genos/cli.py'
+      - 'src/genos/core_service.py'
+      - 'ci/fresh-host-e2e.sh'
+      - 'tests/test_mvp07*.py'
+      - '.github/workflows/mvp07-kanban-drive-contract.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  kanban-drive-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact reviewed head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+          fi
+      - name: Compile MVP-07 surfaces
+        run: PYTHONPATH=src python -m compileall -q src/genos tests/test_mvp07.py
+      - name: Kanban and Drive collaboration contract tests
+        run: PYTHONPATH=src python -m unittest discover -s tests -p 'test_mvp07*.py' -v
+      - name: Authority and secret-boundary guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          ! grep -R "Drive.*authority" -n src/genos/kanban*.py src/genos/drive_collab.py | grep -vi "local\|replica" || true
+          ! grep -R -E "access_token|refresh_token|client_secret|raw_secret" -n tests/test_mvp07*.py src/genos/kanban*.py src/genos/artifact_store.py || {
+            echo 'MVP-07 Card/artifact surfaces must not contain provider credential fields'
+            exit 1
+          }
+          echo 'MVP07_AUTHORITY_GUARD_PASS'
