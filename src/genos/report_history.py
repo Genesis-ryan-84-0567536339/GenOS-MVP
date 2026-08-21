@@ -73,13 +73,60 @@ class ReportHistoryStore:
     def latest(self) -> dict[str, Any] | None:
         if not self.latest_path.is_file():
             return None
+        return self._read_entry(self.latest_path)
+
+    def list_history(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        bounded = max(1, min(int(limit), 500))
+        if not self.history_dir.is_dir():
+            return []
+        rows: list[dict[str, Any]] = []
+        paths = sorted(
+            self.history_dir.glob("*.json"),
+            key=lambda item: item.stat().st_mtime if item.exists() else 0.0,
+            reverse=True,
+        )
+        for path in paths[:bounded]:
+            try:
+                rows.append(self._read_entry(path))
+            except ReportHistoryError:
+                rows.append(
+                    {
+                        "history_id": path.stem,
+                        "job_id": path.stem,
+                        "state": "UNKNOWN",
+                        "diff": {"state": "UNKNOWN"},
+                    }
+                )
+        return rows
+
+    def _read_entry(self, path: Path) -> dict[str, Any]:
         try:
-            payload = json.loads(self.latest_path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            raise ReportHistoryError("report history latest record is unreadable") from exc
+            raise ReportHistoryError("report history record is unreadable") from exc
         if not isinstance(payload, dict):
-            raise ReportHistoryError("report history latest record is invalid")
-        return payload
+            raise ReportHistoryError("report history record is invalid")
+        # The store contains metadata only, but whitelist the public projection so
+        # future internal fields cannot silently become a browser data surface.
+        files = payload.get("files") if isinstance(payload.get("files"), dict) else {}
+        diff = payload.get("diff") if isinstance(payload.get("diff"), dict) else {}
+        return {
+            "schema_version": payload.get("schema_version"),
+            "history_id": payload.get("history_id"),
+            "job_id": payload.get("job_id"),
+            "fingerprint": payload.get("fingerprint"),
+            "manual": bool(payload.get("manual", False)),
+            "recorded_at": payload.get("recorded_at"),
+            "files": {
+                "markdown": _optional_text(files.get("markdown")),
+                "json": _optional_text(files.get("json")),
+            },
+            "diff": {
+                "state": diff.get("state") or "UNKNOWN",
+                "previous_fingerprint": diff.get("previous_fingerprint"),
+                "current_fingerprint": diff.get("current_fingerprint"),
+            },
+        }
 
     def _atomic_write(self, path: Path, payload: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
