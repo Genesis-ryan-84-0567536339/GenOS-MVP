@@ -36,6 +36,7 @@ _CREDENTIAL_ACTION = re.compile(r"^/api/v1/credentials/([0-9a-fA-F-]{36})/(rotat
 _AGENT_ID = "agy-gen"
 _AGENT_AUTH_BASE = f"/api/v1/agents/{_AGENT_ID}/auth"
 _DRIVE_BASE = "/api/v1/drive"
+_DRIVE_OAUTH = f"{_DRIVE_BASE}/oauth"
 _SYSTEM_REPORT = "/api/v1/reports/system"
 
 
@@ -92,6 +93,24 @@ class ProductAPIApp:
     def drive_verify(self) -> dict[str, Any]:
         return self._drive().connection.verify()
 
+    def drive_oauth_status(self) -> dict[str, Any]:
+        return self._drive().oauth_status()
+
+    def drive_oauth_start(self, *, root_name: str = "GenOS") -> dict[str, Any]:
+        return self._drive().oauth_start(root_name=root_name)
+
+    def drive_oauth_poll(self) -> dict[str, Any]:
+        return self._drive().oauth_poll()
+
+    def drive_disconnect(self) -> dict[str, Any]:
+        return self._drive().disconnect()
+
+    def drive_reauthorize(self, *, root_name: str | None = None) -> dict[str, Any]:
+        return self._drive().reauthorize(root_name=root_name)
+
+    def drive_reconnect(self, *, root_name: str | None = None) -> dict[str, Any]:
+        return self._drive().reconnect(root_name=root_name)
+
     def publish_system_report(self, *, manual: bool = True) -> dict[str, Any]:
         return self._drive().reports.publish(manual=manual)
 
@@ -136,6 +155,10 @@ class ProductAPIHandler(BaseHTTPRequestHandler):
             if self.path == _DRIVE_BASE:
                 self.app.auth.authenticate(self._bearer_token())
                 self._json(200, {"drive": self.app.drive_status()})
+                return
+            if self.path == _DRIVE_OAUTH:
+                self.app.auth.authenticate(self._bearer_token())
+                self._json(200, {"oauth": self.app.drive_oauth_status()})
                 return
             if self.path == _AGENT_AUTH_BASE:
                 self.app.auth.authenticate(self._bearer_token())
@@ -185,16 +208,47 @@ class ProductAPIHandler(BaseHTTPRequestHandler):
             if self.path == f"{_DRIVE_BASE}/connect":
                 self.app.auth.authenticate(self._bearer_token())
                 body = self._read_json()
-                root_name = body.get("root_name", "GenOS")
-                if not isinstance(root_name, str):
-                    raise AuthError("root_name must be a string")
-                result = self.app.drive_connect(secret_id=_required_text(body, "secret_id"), root_name=root_name)
+                result = self.app.drive_connect(
+                    secret_id=_required_text(body, "secret_id"),
+                    root_name=_optional_root_name(body),
+                )
                 self._json(200, {"drive": result})
                 return
             if self.path == f"{_DRIVE_BASE}/verify":
                 self.app.auth.authenticate(self._bearer_token())
                 self._reject_nonempty_body()
                 self._json(200, {"drive": self.app.drive_verify()})
+                return
+            if self.path == f"{_DRIVE_OAUTH}/start":
+                self.app.auth.authenticate(self._bearer_token())
+                body = self._read_optional_json()
+                self._json(200, {"oauth": self.app.drive_oauth_start(root_name=_optional_root_name(body))})
+                return
+            if self.path == f"{_DRIVE_OAUTH}/poll":
+                self.app.auth.authenticate(self._bearer_token())
+                self._reject_nonempty_body()
+                self._json(200, {"oauth": self.app.drive_oauth_poll()})
+                return
+            if self.path == f"{_DRIVE_BASE}/disconnect":
+                self.app.auth.authenticate(self._bearer_token())
+                self._reject_nonempty_body()
+                self._json(200, {"drive": self.app.drive_disconnect()})
+                return
+            if self.path == f"{_DRIVE_BASE}/reauthorize":
+                self.app.auth.authenticate(self._bearer_token())
+                body = self._read_optional_json()
+                root_name = body.get("root_name")
+                if root_name is not None and not isinstance(root_name, str):
+                    raise AuthError("root_name must be a string")
+                self._json(200, {"oauth": self.app.drive_reauthorize(root_name=root_name)})
+                return
+            if self.path == f"{_DRIVE_BASE}/reconnect":
+                self.app.auth.authenticate(self._bearer_token())
+                body = self._read_optional_json()
+                root_name = body.get("root_name")
+                if root_name is not None and not isinstance(root_name, str):
+                    raise AuthError("root_name must be a string")
+                self._json(200, {"drive": self.app.drive_reconnect(root_name=root_name)})
                 return
             if self.path == _SYSTEM_REPORT:
                 self.app.auth.authenticate(self._bearer_token())
@@ -352,6 +406,13 @@ def _required_text(payload: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value:
         raise AuthError(f"{key} is required")
     return value
+
+
+def _optional_root_name(payload: dict[str, Any]) -> str:
+    root_name = payload.get("root_name", "GenOS")
+    if not isinstance(root_name, str):
+        raise AuthError("root_name must be a string")
+    return root_name
 
 
 def attach_product_api(server: ThreadingHTTPServer) -> None:
