@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path, PurePosixPath
 from typing import Any
+import grp
 import os
 import pwd
 import shutil
@@ -21,11 +22,12 @@ class HardenedLifecycleService(LifecycleService):
     This layer intentionally overrides only the safety-sensitive operations that
     need stronger release-candidate semantics than the initial lifecycle draft:
     restore preserves existing SecretProvider material when a normal backup did
-    not include secrets; live Product DB dump/restore never depends on postgres
-    traversing a root-only staging tree; update restores its pre-mutation DB/state
-    checkpoint on failure; purge removes the local Product DB/role; and release
-    extraction rejects link/device/oversized members. Remote provider resources
-    are never deleted by these local lifecycle operations.
+    not include secrets; live Product DB dump/restore uses the GenOS DB role and
+    never depends on traversing a root-only staging tree; restored filesystem
+    ownership is normalized back to the GenOS service identity; update restores
+    its pre-mutation DB/state checkpoint on failure; purge removes the local
+    Product DB/role; and release extraction rejects link/device/oversized members.
+    Remote provider resources are never deleted by local lifecycle operations.
     """
 
     def _verify_backup_manifest(self, root: Path, manifest: dict[str, Any]) -> None:
@@ -67,6 +69,29 @@ class HardenedLifecycleService(LifecycleService):
             if self.paths.config.exists():
                 shutil.rmtree(self.paths.config)
             shutil.copytree(config_source, self.paths.config, symlinks=False)
+        self._normalize_restored_ownership()
+
+    def _normalize_restored_ownership(self) -> None:
+        if not self._is_live_layout():
+            return
+        genos = pwd.getpwnam("genos")
+        gid = grp.getgrnam("genos").gr_gid
+        if self.paths.state.exists():
+            os.chown(self.paths.state, genos.pw_uid, gid)
+            for item in self.paths.state.rglob("*"):
+                if self.paths.backups in item.parents or item == self.paths.backups:
+                    continue
+                if not item.is_symlink():
+                    os.chown(item, genos.pw_uid, gid)
+        if self.paths.config.exists():
+            os.chown(self.paths.config, 0, gid)
+            os.chmod(self.paths.config, 0o750)
+            for item in self.paths.config.rglob("*"):
+                if item.is_symlink():
+                    continue
+                os.chown(item, 0, gid)
+                if item.is_dir():
+                    os.chmod(item, 0o750)
 
     def _pg_dump(self, output: Path) -> None:
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -78,14 +103,13 @@ class HardenedLifecycleService(LifecycleService):
                 output.write_bytes(b"GENOS_FIXTURE_DB\n")
             return
 
-        # Plain SQL on stdout avoids giving the postgres OS user access to the
-        # root-only backup staging tree. BYTEA and non-ASCII values are encoded by
-        # pg_dump as valid SQL text, while --clean makes restore deterministic.
+        # Plain SQL on stdout avoids giving the `genos` OS/DB role access to the
+        # root-only backup staging tree. --clean makes restore deterministic.
         result = self.runner.run(
             [
                 "runuser",
                 "-u",
-                "postgres",
+                "genos",
                 "--",
                 "pg_dump",
                 "--format=plain",
@@ -108,20 +132,20 @@ class HardenedLifecycleService(LifecycleService):
             shutil.copy2(dump, self.paths.state / "fixture-product-db.dump")
             return
 
-        postgres = pwd.getpwnam("postgres")
+        genos = pwd.getpwnam("genos")
         staging = Path(tempfile.mkdtemp(prefix="genos-pgrestore-"))
         try:
-            os.chown(staging, postgres.pw_uid, postgres.pw_gid)
+            os.chown(staging, genos.pw_uid, genos.pw_gid)
             os.chmod(staging, 0o700)
             readable = staging / "product-db.sql"
             shutil.copy2(dump, readable)
-            os.chown(readable, postgres.pw_uid, postgres.pw_gid)
+            os.chown(readable, genos.pw_uid, genos.pw_gid)
             os.chmod(readable, 0o600)
             self.runner.run(
                 [
                     "runuser",
                     "-u",
-                    "postgres",
+                    "genos",
                     "--",
                     "psql",
                     "-v",
