@@ -192,7 +192,23 @@ class DriveConnectionService:
                 raise DriveRemoteError("Drive write/read verification mismatch")
             checkpoint = self._checkpoint(checkpoint, state="READ_VERIFIED")
 
-            decoded = json.loads(protocol_readback)
+            updated_protocol_id = remote.upsert_text_file(
+                name="PROTOCOL.json",
+                parent_id=root_id,
+                content=protocol_text,
+                file_id=protocol_id,
+                mime_type="application/json; charset=utf-8",
+            )
+            updated_protocol_readback = remote.read_text_file(updated_protocol_id)
+            if updated_protocol_id != protocol_id or updated_protocol_readback != protocol_text:
+                raise DriveRemoteError("Drive update/read verification mismatch")
+            checkpoint = self._checkpoint(
+                checkpoint,
+                state="UPDATE_VERIFIED",
+                protocol_file_id=updated_protocol_id,
+            )
+
+            decoded = json.loads(updated_protocol_readback)
             if not isinstance(decoded, dict) or decoded.get("instance_id") != self.instance_id:
                 raise DriveRemoteError("Drive protocol instance binding mismatch")
             checkpoint = self._checkpoint(checkpoint, state="INSTANCE_BOUND")
