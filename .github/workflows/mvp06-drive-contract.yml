@@ -59,6 +59,10 @@ jobs:
           assert auth_poll.drive_command == 'auth-poll'
           disconnect = build_parser().parse_args(['drive','disconnect','--json'])
           assert disconnect.drive_command == 'disconnect'
+          reauthorize = build_parser().parse_args(['drive','reauthorize','--json'])
+          assert reauthorize.drive_command == 'reauthorize'
+          reconnect = build_parser().parse_args(['drive','reconnect','--json'])
+          assert reconnect.drive_command == 'reconnect'
           scheduled = build_parser().parse_args(['report','system','--scheduled','--json'])
           assert scheduled.command == 'report' and scheduled.scheduled is True
           PY
@@ -66,12 +70,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ! grep -R "GENOS_MVP06_DRIVE_CREDENTIAL" -n .github src tests ci || {
+          if git grep -n "GENOS_MVP06_DRIVE_CREDENTIAL" -- ':!.github/workflows/mvp06-drive-contract.yml'; then
             echo 'MVP-06 must not depend on a maintainer personal Drive credential'
             exit 1
-          }
-          ! grep -R "NEEDS_EXTERNAL_GENOS_CREDENTIAL" -n .github src tests ci || {
+          fi
+          if git grep -n "NEEDS_EXTERNAL_GENOS_CREDENTIAL" -- ':!.github/workflows/mvp06-drive-contract.yml'; then
             echo 'obsolete external-owner credential gate remains in required implementation paths'
             exit 1
-          }
+          fi
           echo 'USER_OWNED_GOOGLE_DRIVE_OAUTH_CONTRACT_PASS'
