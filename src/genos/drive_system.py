@@ -7,11 +7,17 @@ from pathlib import Path
 from typing import Any
 import uuid
 
-from .auth_service import CredentialService
+from .auth_service import CredentialError, CredentialService
 from .contracts import utc_now
 from .drive_bridge import DriveConnectionService, DriveNeedsAction, DriveRemote
 from .drive_mcp import DriveMcpGrantProbe, OptionalDriveMcpGrantProbe
-from .drive_oauth import GoogleDriveRemoteFactory
+from .drive_oauth import (
+    DevicePoll,
+    DeviceRequest,
+    GoogleDriveDeviceAuthService,
+    GoogleDriveRemoteFactory,
+    GoogleOAuthClientConfig,
+)
 from .drive_store import PostgresDriveMetadataStore
 from .observability import ObservabilityService
 from .product_store import PostgresProductStore
@@ -53,6 +59,8 @@ class DriveSystemServices:
     connection: DriveConnectionService
     reports: HistoryAwareDriveReports
     metadata: PostgresDriveMetadataStore
+    oauth: GoogleDriveDeviceAuthService | None = None
+    credentials: CredentialService | None = None
     mcp_grant_probe: DriveMcpGrantProbe = field(default_factory=OptionalDriveMcpGrantProbe)
 
     def connect(self, *, secret_id: str, root_name: str = "GenOS") -> dict[str, Any]:
@@ -97,6 +105,68 @@ class DriveSystemServices:
             "initial_report": initial_report,
         }
 
+    def oauth_start(self, *, root_name: str = "GenOS") -> dict[str, Any]:
+        return self._oauth().start(root_name=root_name)
+
+    def oauth_status(self) -> dict[str, Any]:
+        return self._oauth().status()
+
+    def oauth_poll(self) -> dict[str, Any]:
+        auth = self._oauth().poll()
+        if auth.get("state") != "AUTHORIZED":
+            return {"state": str(auth.get("state") or "UNKNOWN"), "auth": auth}
+        secret_id = _required_text(auth, "secret_id")
+        root_name = _optional_text(auth.get("root_name")) or "GenOS"
+        current = self.connection.status()
+        if current.get("state") == "READY" and current.get("secret_id") == secret_id:
+            return {"state": "READY", "auth": auth, "connection": {"state": "READY", "drive": current}}
+        connection = self.connect(secret_id=secret_id, root_name=root_name)
+        return {"state": "READY", "auth": auth, "connection": connection}
+
+    def disconnect(self) -> dict[str, Any]:
+        current = self.connection.status()
+        secret_id = _optional_text(current.get("secret_id"))
+        if secret_id and self.credentials is not None:
+            try:
+                self.credentials.disable(secret_id)
+            except CredentialError as exc:
+                raise DriveNeedsAction("Drive credential could not be disabled") from exc
+        instance_id = _required_text(current, "instance_id")
+        root_name = _optional_text(current.get("root_name")) or "GenOS"
+        disconnected = self.metadata.upsert_drive_binding(
+            {
+                "state": "DISCONNECTED",
+                "instance_id": instance_id,
+                "secret_id": None,
+                "root_name": root_name,
+                "last_error_code": None,
+            }
+        )
+        if self.oauth is not None:
+            self.oauth.clear(state="DISCONNECTED")
+        return {
+            "state": "DISCONNECTED",
+            "remote_content_deleted": False,
+            "drive": disconnected,
+        }
+
+    def reauthorize(self, *, root_name: str | None = None) -> dict[str, Any]:
+        current = self.connection.status()
+        selected_root = root_name or _optional_text(current.get("root_name")) or "GenOS"
+        self.disconnect()
+        return self.oauth_start(root_name=selected_root)
+
+    def reconnect(self, *, root_name: str | None = None) -> dict[str, Any]:
+        current = self.connection.status()
+        state = str(current.get("state") or "UNCONFIGURED")
+        selected_root = root_name or _optional_text(current.get("root_name")) or "GenOS"
+        secret_id = _optional_text(current.get("secret_id"))
+        if state == "READY":
+            return {"state": "READY", "drive": current}
+        if state == "DEGRADED" and secret_id:
+            return self.connect(secret_id=secret_id, root_name=selected_root)
+        return self.oauth_start(root_name=selected_root)
+
     def scheduled_scan(self) -> dict[str, Any]:
         status = self.connection.status()
         drive_state = str(status.get("state") or "UNKNOWN")
@@ -116,6 +186,11 @@ class DriveSystemServices:
             return {"state": "NOT_CONFIGURED", "remote_write": False}
         return self.reports.publish(manual=False)
 
+    def _oauth(self) -> GoogleDriveDeviceAuthService:
+        if self.oauth is None:
+            raise DriveNeedsAction("Google Drive OAuth service is not configured")
+        return self.oauth
+
 
 def build_drive_system(
     *,
@@ -124,6 +199,9 @@ def build_drive_system(
     observability: ObservabilityService | None = None,
     remote_factory: Callable[[str], DriveRemote] | None = None,
     mcp_grant_probe: DriveMcpGrantProbe | None = None,
+    oauth_client_config: GoogleOAuthClientConfig | None = None,
+    oauth_device_request: DeviceRequest | None = None,
+    oauth_device_poll: DevicePoll | None = None,
 ) -> DriveSystemServices:
     store = product_store or PostgresProductStore()
     store.ensure_schema()
@@ -148,10 +226,21 @@ def build_drive_system(
         jobs=JsonStateStore(state_root),
     )
     reports = HistoryAwareDriveReports(report_service, ReportHistoryStore(state_root))
+    resolved_client_config = oauth_client_config
+    if resolved_client_config is None:
+        resolved_client_config = GoogleOAuthClientConfig.from_environment()
+    oauth = GoogleDriveDeviceAuthService(
+        credentials=credentials,
+        client_config=resolved_client_config,
+        device_request=oauth_device_request,
+        device_poll=oauth_device_poll,
+    )
     return DriveSystemServices(
         connection=connection,
         reports=reports,
         metadata=metadata,
+        oauth=oauth,
+        credentials=credentials,
         mcp_grant_probe=mcp_grant_probe or OptionalDriveMcpGrantProbe(),
     )
 
