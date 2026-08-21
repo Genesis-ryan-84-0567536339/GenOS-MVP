@@ -10,9 +10,9 @@ from typing import Any
 from . import cli as legacy_cli
 from .install import ReleaseArtifact
 from .lifecycle import LifecycleError, LifecycleNeedsAction
-from .lifecycle_hardened import restore_preserved_install_identity
 from .lifecycle_release import ReleaseCandidateLifecycleService
 from .redaction import redact
+from .reinstall import prepare_reinstall_from_preserved_state
 
 
 _LIFECYCLE = {"update", "backup", "restore", "support-bundle", "uninstall", "purge"}
@@ -26,7 +26,7 @@ def main(argv: list[str] | None = None) -> int:
     command = args[0]
     if command == "install":
         if "--plan-only" not in args and os.geteuid() == 0:
-            restore_preserved_install_identity()
+            prepare_reinstall_from_preserved_state()
         return legacy_cli.main(args)
     if command not in _LIFECYCLE:
         return legacy_cli.main(args)
