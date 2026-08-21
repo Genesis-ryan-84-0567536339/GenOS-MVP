@@ -133,10 +133,21 @@ class DriveConnectionTests(unittest.TestCase):
         result = service.connect(secret_id=SECRET_ID)
         self.assertEqual(result["state"], "READY")
         states = [item["state"] for item in store.history]
-        for expected in ("NEEDS_AUTH", "AUTHENTICATED", "FOLDER_BOUND", "WRITE_VERIFIED", "READ_VERIFIED", "INSTANCE_BOUND", "READY"):
+        for expected in (
+            "NEEDS_AUTH",
+            "AUTHENTICATED",
+            "FOLDER_BOUND",
+            "WRITE_VERIFIED",
+            "READ_VERIFIED",
+            "UPDATE_VERIFIED",
+            "INSTANCE_BOUND",
+            "READY",
+        ):
             self.assertIn(expected, states)
+        self.assertLess(states.index("READ_VERIFIED"), states.index("UPDATE_VERIFIED"))
+        self.assertLess(states.index("UPDATE_VERIFIED"), states.index("INSTANCE_BOUND"))
         self.assertEqual(credentials.calls, [(SECRET_ID, DRIVE_CONSUMER_SCOPE)])
-        self.assertEqual(remote.write_count, 2)
+        self.assertEqual(remote.write_count, 3)
         self.assertEqual(len(remote.folders), 3)
         serialized = json.dumps(result, sort_keys=True)
         self.assertNotIn(RAW_TOKEN, serialized)
@@ -145,7 +156,7 @@ class DriveConnectionTests(unittest.TestCase):
         second = service.connect(secret_id=SECRET_ID)
         self.assertEqual(second["state"], "READY")
         self.assertEqual(len(remote.folders), 3)
-        self.assertEqual(remote.write_count, 4)
+        self.assertEqual(remote.write_count, 6)
         self.assertEqual(second["protocol_file_id"], result["protocol_file_id"])
         self.assertEqual(second["index_file_id"], result["index_file_id"])
 
