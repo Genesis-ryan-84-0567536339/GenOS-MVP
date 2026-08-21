@@ -5,13 +5,14 @@ from datetime import datetime, timezone
 import hashlib
 import json
 import os
-from pathlib import Path
-import pwd
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import subprocess
+import tarfile
 import tempfile
 import urllib.request
+from urllib.parse import urlparse
 import uuid
 from typing import Any, Callable
 
@@ -22,6 +23,10 @@ AGY_INSTALLER_URL = "https://antigravity.google/cli/install.sh"
 AGY_UPDATE_INTERVAL_SECONDS = 6 * 60 * 60
 AGY_PROVIDER_CLI = "antigravity"
 AGY_BINARY_NAME = "agy"
+AGY_MANIFEST_PLATFORM = "linux_amd64"
+AGY_TRUSTED_MANIFEST_HOST = "antigravity-cli-auto-updater-974169037036.us-central1.run.app"
+AGY_TRUSTED_BINARY_HOST = "storage.googleapis.com"
+AGY_TRUSTED_BINARY_PREFIX = "/antigravity-public/antigravity-cli/"
 
 
 class AgentCliUpdateError(RuntimeError):
@@ -57,7 +62,16 @@ class AgentCliUpdateResult:
 
 
 class AntigravityCliManager:
-    """GenOS-owned stable channel with idle-only atomic cutover and rollback."""
+    """GenOS-owned stable channel with idle-only atomic cutover and rollback.
+
+    GenOS does not execute the upstream shell installer. It downloads the
+    official installer only as the current discovery authority, extracts its
+    Google-hosted stable-manifest base URL, then downloads the release archive
+    named by that manifest. The archive SHA-512 is verified before a single
+    regular-file binary is extracted and probed. This preserves Google's
+    release provenance while avoiding shell-profile mutation and the upstream
+    `agy install` post-configuration handoff, which is outside GenOS authority.
+    """
 
     def __init__(
         self,
@@ -115,19 +129,31 @@ class AntigravityCliManager:
         if self.claim_path.exists():
             return self._save(
                 AgentCliUpdateResult(
-                    AGY_PROVIDER_CLI, current_version, _text(persisted.get("latest_stable_version")),
-                    "UPDATE_DEFERRED_BUSY", now, last_success, self._link_version(self.previous_link),
-                    self._active_sha(), _text(persisted.get("installer_sha256")),
+                    AGY_PROVIDER_CLI,
+                    current_version,
+                    _text(persisted.get("latest_stable_version")),
+                    "UPDATE_DEFERRED_BUSY",
+                    now,
+                    last_success,
+                    self._link_version(self.previous_link),
+                    self._active_sha(),
+                    _text(persisted.get("installer_sha256")),
                     "ACTIVE_WORK_CLAIM_BLOCKS_CLI_CUTOVER",
                 )
             )
 
         if not force and self._check_is_fresh(persisted.get("last_check_at")):
             return AgentCliUpdateResult(
-                AGY_PROVIDER_CLI, current_version, _text(persisted.get("latest_stable_version")),
-                str(persisted.get("update_state") or "CURRENT"), str(persisted.get("last_check_at") or now),
-                last_success, self._link_version(self.previous_link), self._active_sha(),
-                _text(persisted.get("installer_sha256")), "UPDATE_CHECK_THROTTLED_6H",
+                AGY_PROVIDER_CLI,
+                current_version,
+                _text(persisted.get("latest_stable_version")),
+                str(persisted.get("update_state") or "CURRENT"),
+                str(persisted.get("last_check_at") or now),
+                last_success,
+                self._link_version(self.previous_link),
+                self._active_sha(),
+                _text(persisted.get("installer_sha256")),
+                "UPDATE_CHECK_THROTTLED_6H",
             )
 
         staged: Path | None = None
@@ -141,8 +167,15 @@ class AntigravityCliManager:
             if old_semver and new_semver and new_semver < old_semver:
                 return self._save(
                     AgentCliUpdateResult(
-                        AGY_PROVIDER_CLI, current_version, candidate_version, "CURRENT", now, last_success,
-                        self._link_version(self.previous_link), self._active_sha(), installer_sha,
+                        AGY_PROVIDER_CLI,
+                        current_version,
+                        candidate_version,
+                        "CURRENT",
+                        now,
+                        last_success,
+                        self._link_version(self.previous_link),
+                        self._active_sha(),
+                        installer_sha,
                         "STABLE_CHANNEL_WOULD_DOWNGRADE_BLOCKED",
                     )
                 )
@@ -151,8 +184,15 @@ class AntigravityCliManager:
             if current_version == candidate_version and self.active_binary.is_file():
                 return self._save(
                     AgentCliUpdateResult(
-                        AGY_PROVIDER_CLI, current_version, candidate_version, "CURRENT", now, now,
-                        self._link_version(self.previous_link), self._active_sha(), installer_sha,
+                        AGY_PROVIDER_CLI,
+                        current_version,
+                        candidate_version,
+                        "CURRENT",
+                        now,
+                        now,
+                        self._link_version(self.previous_link),
+                        self._active_sha(),
+                        installer_sha,
                         "LATEST_STABLE_ALREADY_ACTIVE",
                     )
                 )
@@ -164,8 +204,15 @@ class AntigravityCliManager:
                 self._restore_current(previous_target)
                 return self._save(
                     AgentCliUpdateResult(
-                        AGY_PROVIDER_CLI, self._active_version(), candidate_version, "ROLLED_BACK", now, last_success,
-                        previous_version, self._active_sha(), installer_sha,
+                        AGY_PROVIDER_CLI,
+                        self._active_version(),
+                        candidate_version,
+                        "ROLLED_BACK",
+                        now,
+                        last_success,
+                        previous_version,
+                        self._active_sha(),
+                        installer_sha,
                         "CANDIDATE_CAPABILITY_VERIFY_FAILED_ROLLED_BACK",
                     )
                 )
@@ -173,8 +220,15 @@ class AntigravityCliManager:
                 self._restore_current(previous_target)
                 return self._save(
                     AgentCliUpdateResult(
-                        AGY_PROVIDER_CLI, self._active_version(), candidate_version, "ROLLED_BACK", now, last_success,
-                        previous_version, self._active_sha(), installer_sha,
+                        AGY_PROVIDER_CLI,
+                        self._active_version(),
+                        candidate_version,
+                        "ROLLED_BACK",
+                        now,
+                        last_success,
+                        previous_version,
+                        self._active_sha(),
+                        installer_sha,
                         "POST_CUTOVER_PROVIDER_PROBE_FAILED_ROLLED_BACK",
                     )
                 )
@@ -182,17 +236,31 @@ class AntigravityCliManager:
                 self._atomic_link(self.previous_link, previous_target)
             return self._save(
                 AgentCliUpdateResult(
-                    AGY_PROVIDER_CLI, candidate_version, candidate_version,
-                    "UPDATED" if previous_version else "INSTALLED", now, now, previous_version,
-                    candidate_sha, installer_sha, "ANTIGRAVITY_STABLE_VERIFIED_AND_ACTIVATED",
+                    AGY_PROVIDER_CLI,
+                    candidate_version,
+                    candidate_version,
+                    "UPDATED" if previous_version else "INSTALLED",
+                    now,
+                    now,
+                    previous_version,
+                    candidate_sha,
+                    installer_sha,
+                    "ANTIGRAVITY_STABLE_VERIFIED_AND_ACTIVATED",
                 )
             )
         except AgentCliUpdateError as exc:
             return self._save(
                 AgentCliUpdateResult(
-                    AGY_PROVIDER_CLI, current_version, _text(persisted.get("latest_stable_version")), "FAILED",
-                    now, last_success, self._link_version(self.previous_link), self._active_sha(),
-                    _text(persisted.get("installer_sha256")), _error_evidence(exc),
+                    AGY_PROVIDER_CLI,
+                    current_version,
+                    _text(persisted.get("latest_stable_version")),
+                    "FAILED",
+                    now,
+                    last_success,
+                    self._link_version(self.previous_link),
+                    self._active_sha(),
+                    _text(persisted.get("installer_sha256")),
+                    _error_evidence(exc),
                 )
             )
         finally:
@@ -215,49 +283,51 @@ class AntigravityCliManager:
         now = _utc_now()
         return self._save(
             AgentCliUpdateResult(
-                AGY_PROVIDER_CLI, version, None, "ROLLED_BACK", now, now,
-                self._link_version(self.previous_link), self._active_sha(), None,
+                AGY_PROVIDER_CLI,
+                version,
+                None,
+                "ROLLED_BACK",
+                now,
+                now,
+                self._link_version(self.previous_link),
+                self._active_sha(),
+                None,
                 "EXPLICIT_ROLLBACK_VERIFIED",
             )
         )
 
     def _stage_latest(self) -> dict[str, str]:
-        genos_user = self._genos_user()
         persistent_candidate: Path | None = None
         try:
-            with tempfile.TemporaryDirectory(prefix="genos-agy-stage-") as temp_name:
+            with tempfile.TemporaryDirectory(prefix=".genos-agy-stage-", dir=str(self.root)) as temp_name:
                 stage = Path(temp_name)
-                os.chmod(stage, 0o755)
-                os.chown(stage, genos_user.pw_uid, genos_user.pw_gid)
                 installer = stage / "install.sh"
-                try:
-                    with self.opener(self.installer_url, timeout=60) as response, installer.open("wb") as output:
-                        shutil.copyfileobj(response, output)
-                except (OSError, TimeoutError) as exc:
-                    raise AgentCliUpdateError("INSTALLER_DOWNLOAD_FAILED") from exc
-                os.chmod(installer, 0o644)
-                os.chown(installer, genos_user.pw_uid, genos_user.pw_gid)
+                self._download_url(self.installer_url, installer, timeout=60)
                 installer_sha = _sha256_file(installer)
+                manifest_base = self._manifest_base_from_installer(installer)
+                manifest_url = f"{manifest_base}/manifests/{AGY_MANIFEST_PLATFORM}.json"
+                manifest = self._download_json(manifest_url, timeout=60)
+                version, archive_url, expected_sha512 = self._validate_manifest(manifest)
+
+                archive = stage / "agy-release.tar.gz"
+                self._download_url(archive_url, archive, timeout=180)
+                if _sha512_file(archive) != expected_sha512:
+                    raise AgentCliUpdateError("RELEASE_SHA512_MISMATCH")
+
+                staged_binary = stage / AGY_BINARY_NAME
+                self._extract_release_binary(archive, staged_binary)
                 home = stage / "home"
                 home.mkdir(mode=0o700)
-                os.chown(home, genos_user.pw_uid, genos_user.pw_gid)
-                # `genos` remains /usr/sbin/nologin at the account level. The
-                # typed installer process alone gets an explicit non-login shell,
-                # matching the tmux auth/runtime hardening invariant.
-                self._run_as_genos(
-                    ["/bin/bash", str(installer), "--skip-aliases", "--skip-path"],
-                    env=self._agy_env(home), timeout=600,
-                )
-                installed = home / ".local" / "bin" / AGY_BINARY_NAME
-                if not installed.is_file():
-                    raise AgentCliUpdateError("INSTALLER_BINARY_MISSING")
-                version = self._version(installed, home=home)
-                if not version:
+                actual_version = self._version(staged_binary, home=home)
+                if not actual_version:
                     raise AgentCliUpdateError("STAGED_VERSION_PROBE_FAILED")
+                if actual_version != version:
+                    raise AgentCliUpdateError("MANIFEST_BINARY_VERSION_MISMATCH")
+
                 fd, candidate_name = tempfile.mkstemp(prefix=".agy-candidate-", dir=str(self.root))
                 os.close(fd)
                 persistent_candidate = Path(candidate_name)
-                shutil.copy2(installed, persistent_candidate)
+                shutil.copy2(staged_binary, persistent_candidate)
                 os.chmod(persistent_candidate, 0o755)
                 return {
                     "version": version,
@@ -265,10 +335,92 @@ class AntigravityCliManager:
                     "installer_sha256": installer_sha,
                     "binary_sha256": _sha256_file(persistent_candidate),
                 }
-        except Exception:
+        except AgentCliUpdateError:
             if persistent_candidate is not None:
                 persistent_candidate.unlink(missing_ok=True)
             raise
+        except (OSError, tarfile.TarError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+            if persistent_candidate is not None:
+                persistent_candidate.unlink(missing_ok=True)
+            raise AgentCliUpdateError("STABLE_RELEASE_STAGING_FAILED") from exc
+
+    def _manifest_base_from_installer(self, installer: Path) -> str:
+        text = installer.read_text(encoding="utf-8")
+        match = re.search(r'^\s*DOWNLOAD_BASE_URL=["\']([^"\']+)["\']\s*$', text, re.MULTILINE)
+        if not match:
+            raise AgentCliUpdateError("INSTALLER_RELEASE_BASE_MISSING")
+        base = match.group(1).rstrip("/")
+        parsed = urlparse(base)
+        if parsed.scheme != "https" or parsed.hostname != AGY_TRUSTED_MANIFEST_HOST or parsed.username or parsed.password:
+            raise AgentCliUpdateError("INSTALLER_RELEASE_BASE_UNTRUSTED")
+        return base
+
+    def _download_json(self, url: str, *, timeout: float) -> dict[str, Any]:
+        try:
+            with self.opener(url, timeout=timeout) as response:
+                raw = response.read()
+        except (OSError, TimeoutError) as exc:
+            raise AgentCliUpdateError("MANIFEST_DOWNLOAD_FAILED") from exc
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise AgentCliUpdateError("MANIFEST_INVALID_JSON") from exc
+        if not isinstance(payload, dict):
+            raise AgentCliUpdateError("MANIFEST_INVALID_SHAPE")
+        return payload
+
+    def _validate_manifest(self, manifest: dict[str, Any]) -> tuple[str, str, str]:
+        version = _text(manifest.get("version"))
+        archive_url = _text(manifest.get("url"))
+        sha512 = _text(manifest.get("sha512"))
+        if not version or not _semver(version):
+            raise AgentCliUpdateError("MANIFEST_VERSION_INVALID")
+        if not archive_url:
+            raise AgentCliUpdateError("MANIFEST_RELEASE_URL_MISSING")
+        parsed = urlparse(archive_url)
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname != AGY_TRUSTED_BINARY_HOST
+            or not parsed.path.startswith(AGY_TRUSTED_BINARY_PREFIX)
+            or not parsed.path.endswith(".tar.gz")
+            or parsed.username
+            or parsed.password
+        ):
+            raise AgentCliUpdateError("MANIFEST_RELEASE_URL_UNTRUSTED")
+        if not sha512 or re.fullmatch(r"[0-9A-Fa-f]{128}", sha512) is None:
+            raise AgentCliUpdateError("MANIFEST_SHA512_INVALID")
+        return version, archive_url, sha512.lower()
+
+    def _download_url(self, url: str, destination: Path, *, timeout: float) -> None:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.username or parsed.password:
+            raise AgentCliUpdateError("DOWNLOAD_URL_INVALID")
+        try:
+            with self.opener(url, timeout=timeout) as response, destination.open("wb") as output:
+                shutil.copyfileobj(response, output)
+        except (OSError, TimeoutError) as exc:
+            raise AgentCliUpdateError("DOWNLOAD_FAILED") from exc
+
+    @staticmethod
+    def _extract_release_binary(archive: Path, destination: Path) -> None:
+        with tarfile.open(archive, "r:*") as handle:
+            candidates: list[tarfile.TarInfo] = []
+            for member in handle.getmembers():
+                relative = PurePosixPath(member.name)
+                if relative.is_absolute() or ".." in relative.parts:
+                    raise AgentCliUpdateError("RELEASE_ARCHIVE_PATH_ESCAPE")
+                if not (member.isdir() or member.isfile()):
+                    raise AgentCliUpdateError("RELEASE_ARCHIVE_UNSUPPORTED_ENTRY")
+                if member.isfile() and relative.name in {"antigravity", "agy"}:
+                    candidates.append(member)
+            if len(candidates) != 1:
+                raise AgentCliUpdateError("RELEASE_BINARY_ENTRY_AMBIGUOUS")
+            source = handle.extractfile(candidates[0])
+            if source is None:
+                raise AgentCliUpdateError("RELEASE_BINARY_UNREADABLE")
+            with source, destination.open("wb") as output:
+                shutil.copyfileobj(source, output)
+        os.chmod(destination, 0o755)
 
     def _store_candidate(self, version: str, candidate: Path, expected_sha: str) -> Path:
         safe = re.sub(r"[^0-9A-Za-z._+-]", "_", version)[:128]
@@ -298,8 +450,13 @@ class AntigravityCliManager:
             return False
         try:
             completed = subprocess.run(
-                [str(self.active_binary), "--help"], capture_output=True, text=True, timeout=20,
-                check=False, shell=False, env=self._agy_env(self.agent_state_root),
+                [str(self.active_binary), "--help"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+                shell=False,
+                env=self._agy_env(self.agent_state_root),
             )
         except (OSError, subprocess.TimeoutExpired):
             return False
@@ -328,43 +485,16 @@ class AntigravityCliManager:
         finally:
             temp.unlink(missing_ok=True)
 
-    def _run_as_genos(self, argv: list[str], *, env: dict[str, str], timeout: float) -> subprocess.CompletedProcess[str]:
-        user = self._genos_user()
-        if os.geteuid() == user.pw_uid:
-            command, child_env = argv, env
-        elif os.geteuid() == 0:
-            command = ["runuser", "-u", "genos", "--", "env", *[f"{key}={value}" for key, value in env.items()], *argv]
-            child_env = {
-                "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-                "LANG": env.get("LANG", "C.UTF-8"),
-                "LC_ALL": env.get("LC_ALL", "C.UTF-8"),
-            }
-        else:
-            raise AgentCliUpdateError("UPDATER_IDENTITY_INVALID")
-        try:
-            completed = subprocess.run(command, capture_output=True, text=True, check=False, timeout=timeout, shell=False, env=child_env)
-        except subprocess.TimeoutExpired as exc:
-            raise AgentCliUpdateError("INSTALLER_TIMEOUT") from exc
-        except OSError as exc:
-            raise AgentCliUpdateError("INSTALLER_EXEC_FAILED") from exc
-        if completed.returncode != 0:
-            output = f"{completed.stdout}\n{completed.stderr}".lower()
-            if "checksum" in output or "security halt" in output:
-                code = "INSTALLER_INTEGRITY_REJECTED"
-            elif "permission" in output or "denied" in output:
-                code = "INSTALLER_PERMISSION_FAILED"
-            elif "curl" in output or "download" in output or "network" in output:
-                code = "INSTALLER_NETWORK_FAILED"
-            else:
-                code = f"INSTALLER_EXIT_{completed.returncode}"
-            raise AgentCliUpdateError(code)
-        return completed
-
     def _version(self, binary: Path, *, home: Path) -> str | None:
         try:
             completed = subprocess.run(
-                [str(binary), "--version"], capture_output=True, text=True, check=False, timeout=20,
-                shell=False, env=self._agy_env(home),
+                [str(binary), "--version"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=20,
+                shell=False,
+                env=self._agy_env(home),
             )
         except (OSError, subprocess.TimeoutExpired):
             return None
@@ -401,7 +531,8 @@ class AntigravityCliManager:
         age = (datetime.now(timezone.utc) - observed).total_seconds()
         return 0 <= age < self.update_interval_seconds
 
-    def _agy_env(self, home: Path) -> dict[str, str]:
+    @staticmethod
+    def _agy_env(home: Path) -> dict[str, str]:
         return {
             "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
             "HOME": str(home),
@@ -411,13 +542,6 @@ class AntigravityCliManager:
             "NO_COLOR": "1",
             "AGY_CLI_DISABLE_AUTO_UPDATE": "true",
         }
-
-    @staticmethod
-    def _genos_user() -> pwd.struct_passwd:
-        try:
-            return pwd.getpwnam("genos")
-        except KeyError as exc:
-            raise AgentCliUpdateError("GENOS_IDENTITY_MISSING") from exc
 
     def _read_state(self) -> dict[str, Any] | None:
         if not self.state_path.is_file():
@@ -431,7 +555,13 @@ class AntigravityCliManager:
     def _save(self, result: AgentCliUpdateResult) -> AgentCliUpdateResult:
         self._atomic_json(
             self.state_path,
-            {"schema_version": "1.0", **result.to_dict(), "source": self.installer_url, "contains_secrets": False},
+            {
+                "schema_version": "1.1",
+                **result.to_dict(),
+                "source": self.installer_url,
+                "release_channel": "official-installer-published-stable-manifest",
+                "contains_secrets": False,
+            },
         )
         return result
 
@@ -464,6 +594,14 @@ def _semver(value: str | None) -> tuple[int, int, int] | None:
 
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha512_file(path: Path) -> str:
+    digest = hashlib.sha512()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
