@@ -36,6 +36,39 @@ class JsonStateStore:
         with path.open("r", encoding="utf-8") as handle:
             return JobRun.from_dict(redact(json.load(handle)))
 
+    def list_jobs(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Return recent sanitized JobRun projections without creating new state.
+
+        Job files are already redacted at write time. Read failures are projected
+        as UNKNOWN records rather than causing the Mission Control history surface
+        to fabricate success or lose the remaining durable jobs.
+        """
+        bounded = max(1, min(int(limit), 500))
+        if not self.jobs_dir.is_dir():
+            return []
+        rows: list[dict[str, Any]] = []
+        paths = sorted(
+            self.jobs_dir.glob("*.json"),
+            key=lambda item: item.stat().st_mtime if item.exists() else 0.0,
+            reverse=True,
+        )
+        for path in paths[:bounded]:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    rows.append(redact(payload))
+                    continue
+            except (OSError, json.JSONDecodeError):
+                pass
+            rows.append(
+                {
+                    "job_id": path.stem,
+                    "state": "UNKNOWN",
+                    "current_step": "job_record_unreadable",
+                }
+            )
+        return rows
+
     def save_manifest(self, payload: dict[str, Any]) -> None:
         self._atomic_write(self.manifest_path, redact(payload))
 
