@@ -1,0 +1,53 @@
+name: MVP-09 Mission Control Browser Contract
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  browser-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact reviewed head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_sha="${{ github.event.pull_request.head.sha || github.sha }}"
+          tested_sha="$(git rev-parse HEAD)"
+          echo "tested_sha=${tested_sha}"
+          test "${tested_sha}" = "${expected_sha}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install product package and browser test dependency
+        run: |
+          python -m pip install --disable-pip-version-check -e .
+          python -m pip install --disable-pip-version-check "playwright>=1.50,<2"
+          python -m playwright install --with-deps chromium
+      - name: Static security and packaging contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s src/genos/web/index.html
+          test -s src/genos/web/app.css
+          test -s src/genos/web/app.js
+          grep -q "web/\\*.js" pyproject.toml
+          ! grep -R "localStorage" src/genos/web src/genos/mission_control.py
+          ! grep -R -E "(/shell|shell=|subprocess|os\.system)" src/genos/web
+          grep -q "frame-ancestors 'none'" src/genos/mission_control.py
+          grep -q "PRODUCT_API_ORIGIN = \"http://127.0.0.1:17880\"" src/genos/mission_control.py
+      - name: Chromium core journey E2E
+        env:
+          PYTHONPATH: src
+        run: python ci/mvp09_browser_e2e.py
