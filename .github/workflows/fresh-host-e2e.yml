@@ -24,15 +24,16 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
+          persist-credentials: false
 
       - name: Verify exact checkout
         shell: bash
         run: |
           set -euo pipefail
-          echo "tested_sha=$(git rev-parse HEAD)"
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
-          fi
+          expected_sha="${{ github.event.pull_request.head.sha || github.sha }}"
+          tested_sha="$(git rev-parse HEAD)"
+          echo "tested_sha=${tested_sha}"
+          test "${tested_sha}" = "${expected_sha}"
 
       - name: Install isolated VM tooling
         shell: bash
@@ -51,21 +52,14 @@ jobs:
         shell: bash
         run: bash ci/fresh-host-e2e.sh
 
-      - name: Collect failure diagnostics
+      - name: Report failure without emitting unverified guest artifacts
         if: failure()
         shell: bash
         run: |
-          set +e
-          WORK_DIR="${RUNNER_TEMP}/genos-fresh-host"
-          echo "--- qemu serial tail ---"
-          tail -n 300 "$WORK_DIR/qemu-serial.log" 2>/dev/null || true
-          echo "--- install output ---"
-          cat "$WORK_DIR/install.json" 2>/dev/null || true
-          echo "--- rerun output ---"
-          cat "$WORK_DIR/rerun.json" 2>/dev/null || true
+          echo "Fresh-host gate failed. Guest logs/evidence are intentionally not emitted because the in-run secret sanitation gate did not complete."
 
       - name: Upload sanitized fresh-host evidence
-        if: always()
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: mvp02-fresh-host-${{ github.event.pull_request.head.sha || github.sha }}

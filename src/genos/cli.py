@@ -19,8 +19,11 @@ from .drive_bridge import DriveBridgeError, DriveNeedsAction, DriveRemoteError
 from .drive_store import DriveStoreError
 from .drive_system import DriveSystemError, build_drive_system
 from .install import InstallError, NativeProvisioner, ReleaseArtifact, build_native_install
+from .kanban import InvalidCardTransition, KanbanError, build_kanban_system
+from .kanban_store import CARD_STATES, CardConflict, CardNotFound, KanbanStoreError
+from .mcp_store import McpConflict, McpNotFound, McpStoreError, PostgresMcpStore
 from .observability import GENOS_SERVICES, ObservabilityService
-from .product_store import ProductStoreError
+from .product_store import PostgresProductStore, ProductStoreError
 from .recon import collect_all
 from .redaction import redact
 from .repair import RepairError, RepairService
@@ -98,6 +101,27 @@ def build_parser() -> argparse.ArgumentParser:
     drive_reconnect.add_argument("--root-name", default=None)
     drive_reconnect.add_argument("--json", action="store_true", dest="as_json")
 
+    kanban = sub.add_parser("kanban", help="Operate the authoritative local Kanban and Drive collaboration bridge")
+    kanban_sub = kanban.add_subparsers(dest="kanban_command", required=True)
+    item = kanban_sub.add_parser("list"); item.add_argument("--status", choices=CARD_STATES, default=None); item.add_argument("--json", action="store_true", dest="as_json")
+    item = kanban_sub.add_parser("show"); item.add_argument("--card-id", required=True); item.add_argument("--json", action="store_true", dest="as_json")
+    item = kanban_sub.add_parser("create"); item.add_argument("--title", required=True); item.add_argument("--description", default=""); item.add_argument("--json", action="store_true", dest="as_json")
+    item = kanban_sub.add_parser("transition"); item.add_argument("--card-id", required=True); item.add_argument("--to", choices=CARD_STATES, required=True, dest="to_state"); item.add_argument("--reason", default="OWNER_ACTION"); item.add_argument("--json", action="store_true", dest="as_json")
+    item = kanban_sub.add_parser("comment"); item.add_argument("--card-id", required=True); item.add_argument("--text", required=True); item.add_argument("--json", action="store_true", dest="as_json")
+    for name in ("sync", "agent-tick"):
+        item = kanban_sub.add_parser(name); item.add_argument("--json", action="store_true", dest="as_json")
+
+    mcp = sub.add_parser("mcp", help="Manage the unified GenOS MCP Hub")
+    mcp_sub = mcp.add_subparsers(dest="mcp_command", required=True)
+    for name in ("status", "principal-list", "upstream-list", "audit"):
+        item = mcp_sub.add_parser(name); item.add_argument("--json", action="store_true", dest="as_json")
+    item = mcp_sub.add_parser("principal-create"); item.add_argument("--name", required=True); item.add_argument("--scope", action="append", default=[]); item.add_argument("--json", action="store_true", dest="as_json")
+    for name in ("principal-rotate", "principal-revoke"):
+        item = mcp_sub.add_parser(name); item.add_argument("--principal-id", required=True); item.add_argument("--json", action="store_true", dest="as_json")
+    item = mcp_sub.add_parser("principal-scopes"); item.add_argument("--principal-id", required=True); item.add_argument("--scope", action="append", default=[]); item.add_argument("--json", action="store_true", dest="as_json")
+    item = mcp_sub.add_parser("upstream-add"); item.add_argument("--namespace", required=True); item.add_argument("--name", required=True); item.add_argument("--endpoint", required=True); item.add_argument("--secret-id", default=None); item.add_argument("--json", action="store_true", dest="as_json")
+    item = mcp_sub.add_parser("upstream-disable"); item.add_argument("--upstream-id", required=True); item.add_argument("--json", action="store_true", dest="as_json")
+
     report = sub.add_parser("report", help="Build/publish reports from the shared observability authority")
     report_sub = report.add_subparsers(dest="report_command", required=True)
     system_report = report_sub.add_parser("system", help="Publish the sanitized System Report to the bound Drive replica")
@@ -153,6 +177,10 @@ def main(argv: list[str] | None = None) -> int:
         return _install(args)
     if args.command == "drive":
         return _drive(args)
+    if args.command == "kanban":
+        return _kanban(args)
+    if args.command == "mcp":
+        return _mcp(args)
     if args.command == "report":
         return _report(args)
     if args.command == "agent":
@@ -319,6 +347,50 @@ def _drive(args: argparse.Namespace) -> int:
         _emit_safe({"state": "FAILED", "error_type": "DRIVE_BACKEND_UNAVAILABLE"}, as_json=args.as_json)
         return 4
     raise SystemExit(2)
+
+
+def _kanban(args: argparse.Namespace) -> int:
+    try:
+        system = build_kanban_system()
+        if args.kanban_command == "list": payload = {"cards": system.list_cards(status=args.status)}
+        elif args.kanban_command == "show": payload = system.get_card(args.card_id)
+        elif args.kanban_command == "create": payload = {"card": system.create_card(title=args.title, description=args.description)}
+        elif args.kanban_command == "transition": payload = system.transition(args.card_id, to_state=args.to_state, reason=args.reason)
+        elif args.kanban_command == "comment": payload = system.add_comment(args.card_id, text=args.text)
+        elif args.kanban_command == "sync": payload = system.sync_drive_inbox()
+        elif args.kanban_command == "agent-tick": payload = system.agent_tick()
+        else: raise SystemExit(2)
+        _emit_safe(payload, as_json=args.as_json)
+        return 3 if isinstance(payload, dict) and payload.get("state") in {"NEEDS_ACTION", "PARTIAL", "RETRY"} else 0
+    except (DriveNeedsAction, AgentNeedsAction):
+        _emit_safe({"state": "NEEDS_ACTION"}, as_json=args.as_json); return 3
+    except (KanbanError, InvalidCardTransition, CardConflict, CardNotFound, KanbanStoreError, ProductStoreError, SecretProviderError, DriveBridgeError, DriveStoreError):
+        _emit_safe({"state": "FAILED", "error_type": "KANBAN_OPERATION_FAILED"}, as_json=args.as_json); return 4
+
+
+def _mcp(args: argparse.Namespace) -> int:
+    try:
+        product = PostgresProductStore(); product.ensure_schema(); store = PostgresMcpStore(product); store.ensure_schema()
+        if args.mcp_command == "status":
+            port_path = Path("/etc/genos/mcp-port"); port = port_path.read_text(encoding="utf-8").strip() if port_path.is_file() else None
+            payload = {"protocol_version": "2026-07-28", "endpoint": f"http://127.0.0.1:{port}/mcp" if port else None, "principals": len(store.list_principals()), "upstreams": store.list_upstreams()}
+        elif args.mcp_command == "principal-list": payload = {"principals": store.list_principals()}
+        elif args.mcp_command == "principal-create": payload = store.create_principal(name=args.name, scopes=args.scope).one_way_response()
+        elif args.mcp_command == "principal-rotate": payload = store.rotate_principal(args.principal_id).one_way_response()
+        elif args.mcp_command == "principal-revoke": payload = {"principal": store.revoke_principal(args.principal_id)}
+        elif args.mcp_command == "principal-scopes": payload = {"principal": store.replace_scopes(args.principal_id, args.scope)}
+        elif args.mcp_command == "upstream-list": payload = {"upstreams": store.list_upstreams()}
+        elif args.mcp_command == "upstream-add":
+            if args.secret_id:
+                record = product.get_credential(args.secret_id)
+                if record is None or record.status != "ACTIVE" or "mcp-hub" not in record.consumer_scopes: raise McpStoreError("SecretRef must be ACTIVE and granted to mcp-hub")
+            payload = {"upstream": store.register_upstream(namespace=args.namespace, name=args.name, endpoint=args.endpoint, secret_id=args.secret_id)}
+        elif args.mcp_command == "upstream-disable": payload = {"upstream": store.disable_upstream(args.upstream_id)}
+        elif args.mcp_command == "audit": payload = {"audit": store.recent_audit(limit=100)}
+        else: raise SystemExit(2)
+        _emit_safe(payload, as_json=args.as_json); return 0
+    except (McpStoreError, McpConflict, McpNotFound, ProductStoreError):
+        _emit_safe({"state": "FAILED", "error_type": "MCP_OPERATION_FAILED"}, as_json=args.as_json); return 4
 
 
 def _report(args: argparse.Namespace) -> int:

@@ -9,6 +9,7 @@ import json
 import os
 import pwd
 import shutil
+import socket
 import subprocess
 import tarfile
 import tempfile
@@ -26,6 +27,8 @@ from .state import JsonStateStore
 PRODUCT_API_PORT = 17880
 RUNTIME_PORT = 17881
 MISSION_CONTROL_PORT = 17882
+MCP_PORT_MIN = 17883
+MCP_PORT_MAX = 17932
 CORE_USER = "genos"
 CORE_GROUP = "genos"
 CORE_DB = "genos"
@@ -231,11 +234,12 @@ class NativeProvisioner:
         profile = get_profile(self.planned.plan.profile)
         if profile.package_manager != "apt":
             raise InstallError(f"package manager not implemented: {profile.package_manager}")
-        if _dpkg_packages_present(self.runner, ["postgresql", "postgresql-client"]):
+        packages = ["postgresql", "postgresql-client", "ca-certificates", "python3-jsonschema"]
+        if _dpkg_packages_present(self.runner, packages):
             return
         self.runner.run(["apt-get", "update"], timeout=300)
         self.runner.run(
-            ["apt-get", "install", "-y", "postgresql", "postgresql-client", "ca-certificates"],
+            ["apt-get", "install", "-y", *packages],
             timeout=600,
         )
 
@@ -312,15 +316,19 @@ class NativeProvisioner:
             instance_id = str(uuid.uuid4())
             _atomic_text(instance_path, instance_id + "\n", mode=0o640)
         self._instance_id = instance_id
+        mcp_port = _resolve_mcp_port(Path("/etc/genos/mcp-port"))
         env = (
             f"GENOS_INSTANCE_ID={instance_id}\n"
             "GENOS_STATE_DIR=/var/lib/genos\n"
             f"GENOS_RELEASE_SHA={self.planned.release.git_sha}\n"
+            f"GENOS_MCP_PORT={mcp_port}\n"
         )
         _atomic_text(Path("/etc/genos/genos.env"), env, mode=0o640)
         gid = grp.getgrnam(CORE_GROUP).gr_gid
         os.chown(instance_path, 0, gid)
         os.chown("/etc/genos/genos.env", 0, gid)
+        os.chown("/etc/genos/mcp-port", 0, gid)
+        os.chmod("/etc/genos/mcp-port", 0o640)
 
     def _install_systemd_units(self) -> None:
         for name, content in _systemd_units().items():
@@ -353,14 +361,17 @@ class NativeProvisioner:
             "genos-product-api.service",
             "genos-runtime.service",
             "genos-worker.service",
+            "genos-mcp.service",
             "genos-mission-control.service",
         ):
             self.runner.run(["systemctl", "enable", "--now", service])
 
     def _verify_local_core(self) -> None:
+        mcp_port = int(Path("/etc/genos/mcp-port").read_text(encoding="utf-8").strip())
         for role, service, port in (
             ("product-api", "genos-product-api.service", PRODUCT_API_PORT),
             ("runtime", "genos-runtime.service", RUNTIME_PORT),
+            ("mcp-hub", "genos-mcp.service", mcp_port),
             ("mission-control", "genos-mission-control.service", MISSION_CONTROL_PORT),
         ):
             try:
@@ -407,6 +418,8 @@ class NativeProvisioner:
                 "mission_control_health": f"http://127.0.0.1:{MISSION_CONTROL_PORT}/health",
                 "mission_control_ui": "NOT_IMPLEMENTED_BEFORE_MVP_08_VISUAL_APPROVAL",
                 "worker": "/var/lib/genos/worker/heartbeat.json",
+                "mcp_hub": f"http://127.0.0.1:{int(Path('/etc/genos/mcp-port').read_text(encoding='utf-8').strip())}/mcp",
+                "mcp_protocol_version": "2026-07-28",
                 "postgresql_database": CORE_DB,
             },
             "updated_at": utc_now(),
@@ -503,6 +516,26 @@ def _safe_extract_tar(archive: Path, destination: Path) -> None:
             os.chmod(target, 0o644)
 
 
+def _resolve_mcp_port(path: Path) -> int:
+    if path.is_file():
+        try: port = int(path.read_text(encoding="utf-8").strip())
+        except (OSError, ValueError) as exc: raise InstallError("existing MCP port configuration is invalid") from exc
+        if not (MCP_PORT_MIN <= port <= MCP_PORT_MAX): raise InstallError("existing MCP port is outside the managed range")
+        return port
+    for port in range(MCP_PORT_MIN, MCP_PORT_MAX + 1):
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+            sock.bind(("127.0.0.1", port))
+        except OSError:
+            continue
+        finally:
+            sock.close()
+        _atomic_text(path, f"{port}\n", mode=0o640)
+        return port
+    raise InstallError("no conflict-free MCP port is available in the managed range")
+
+
 def _replace_symlink(link: Path, target: Path) -> None:
     temp = link.with_name(f".{link.name}.{uuid.uuid4().hex}.tmp")
     try:
@@ -559,6 +592,9 @@ def _systemd_units() -> dict[str, str]:
         + install,
         "genos-worker.service": common
         + "ExecStart=/usr/bin/python3 -m genos.core_service worker --state-dir /var/lib/genos\n"
+        + install,
+        "genos-mcp.service": common
+        + "ExecStart=/usr/bin/python3 -m genos.core_service mcp\n"
         + install,
         "genos-mission-control.service": common
         + f"ExecStart=/usr/bin/python3 -m genos.core_service mission-control --port {MISSION_CONTROL_PORT}\n"
