@@ -23,41 +23,19 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         role = getattr(self.server, "genos_role", "unknown")
         if self.path == "/health":
-            self._json(
-                200,
-                {
-                    "status": "ok",
-                    "role": role,
-                    "version": __version__,
-                    "instance_id": os.environ.get("GENOS_INSTANCE_ID") or "UNKNOWN",
-                    "ui_state": "NOT_IMPLEMENTED" if role == "mission-control" else None,
-                    "observed_at": _utc_now(),
-                },
-            )
+            self._json(200, {"status": "ok", "role": role, "version": __version__, "instance_id": os.environ.get("GENOS_INSTANCE_ID") or "UNKNOWN", "ui_state": "NOT_IMPLEMENTED" if role == "mission-control" else None, "observed_at": _utc_now()})
             return
         if role == "mission-control" and self.path == "/":
-            self._json(
-                503,
-                {
-                    "status": "not_ready",
-                    "role": role,
-                    "reason": "MISSION_CONTROL_UI_NOT_IMPLEMENTED_BEFORE_MVP_08_VISUAL_APPROVAL",
-                },
-            )
+            self._json(503, {"status": "not_ready", "role": role, "reason": "MISSION_CONTROL_UI_NOT_IMPLEMENTED_BEFORE_MVP_08_VISUAL_APPROVAL"})
             return
         self._json(404, {"status": "not_found"})
 
     def log_message(self, fmt: str, *args: object) -> None:
-        sys.stdout.write(json.dumps({"event": "http", "message": fmt % args}, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+        sys.stdout.write(json.dumps({"event": "http", "message": fmt % args}, ensure_ascii=False) + "\n"); sys.stdout.flush()
 
     def _json(self, status: int, payload: dict[str, object]) -> None:
         body = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
 
 
 def serve_http(role: str, port: int) -> int:
@@ -65,59 +43,52 @@ def serve_http(role: str, port: int) -> int:
     product_app = None
     if role == "product-api":
         from .product_api import ProductAPIApp, ProductAPIHandler
-
-        product_app = ProductAPIApp.from_system()
-        handler = ProductAPIHandler
-
+        product_app = ProductAPIApp.from_system(); handler = ProductAPIHandler
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
-    server.daemon_threads = True
-    server.genos_role = role  # type: ignore[attr-defined]
+    server.daemon_threads = True; server.genos_role = role  # type: ignore[attr-defined]
     if product_app is not None:
         server.genos_app = product_app  # type: ignore[attr-defined]
     stop_event = threading.Event()
-
-    def _stop(_signum: int, _frame: object) -> None:
-        stop_event.set()
-
-    signal.signal(signal.SIGTERM, _stop)
-    signal.signal(signal.SIGINT, _stop)
+    def _stop(_signum: int, _frame: object) -> None: stop_event.set()
+    signal.signal(signal.SIGTERM, _stop); signal.signal(signal.SIGINT, _stop)
     print(json.dumps({"event": "service_start", "role": role, "port": port, "observed_at": _utc_now()}), flush=True)
-
-    server_thread = threading.Thread(
-        target=server.serve_forever,
-        kwargs={"poll_interval": 0.25},
-        name=f"genos-{role}-http",
-        daemon=True,
-    )
+    server_thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.25}, name=f"genos-{role}-http", daemon=True)
     server_thread.start()
-    try:
-        stop_event.wait()
+    try: stop_event.wait()
     finally:
-        server.shutdown()
-        server.server_close()
-        server_thread.join(timeout=5)
+        server.shutdown(); server.server_close(); server_thread.join(timeout=5)
     return 0
 
 
-def _reconcile_core_agent(state_dir: Path, instance_id: str) -> dict[str, object]:
-    """One watchdog reconciliation tick for the single MVP Core Agent.
+def _reconcile_core_agent(state_dir: Path, instance_id: str, *, force_cli_update: bool = False) -> dict[str, object]:
+    """One watchdog tick for resident `agy-gen` with live provider truth.
 
-    Once Gemini CLI is installed, the worker keeps the persistent `agy-gen:auth`
-    tmux window available under the unprivileged service identity. The Owner can
-    copy the projected OAuth URL outside the execution boundary and submit a
-    one-time code through the typed bridge. When Gemini reports authentication
-    success, the worker performs the direct target-model probe automatically.
-    Only a verified provider may start/restore the separate `runtime` window.
+    Antigravity CLI (`agy`) is a replaceable tool binding, not Agent identity.
+    When the managed toolchain exists, the worker checks the stable channel on
+    boot and then through the updater's six-hour throttle. A busy work claim
+    defers cutover. Provider installation is re-probed whenever it is not ACTIVE
+    so a stale pre-provision `CLI_NOT_FOUND` projection cannot survive after the
+    CLI becomes available.
     """
     from .agent_auth import AgentAuthBridge
-    from .agent_runtime import AgentRuntimeError, AgentRuntimeStore, GeminiCliAdapter
-    from .agent_secure_runtime import SecretAwareGeminiAdapter, SecureTmuxController
+    from .agent_runtime import AgentRuntimeError, AgentRuntimeStore, AntigravityCliAdapter, managed_cli_update
+    from .agent_secure_runtime import SecretAwareAntigravityAdapter, SecureTmuxController
 
     store = AgentRuntimeStore(state_dir / "agents" / "agy-gen")
     store.ensure_seed(instance_id=instance_id)
+
+    managed_root = state_dir / "tools" / "antigravity-cli"
+    if managed_root.is_dir():
+        try:
+            managed_cli_update(store, force=force_cli_update)
+        except (AgentRuntimeError, OSError):
+            # Update failure is separately projected by the toolchain state and
+            # must not erase the last-known-good provider/runtime projection.
+            pass
+
     provider = store.provider()
-    if provider is None:
-        installed = GeminiCliAdapter(store).probe_installation()
+    if provider is None or provider.get("state") != "ACTIVE":
+        installed = AntigravityCliAdapter(store).probe_installation()
         store.write_provider(installed)
         provider = installed.to_dict()
 
@@ -134,7 +105,7 @@ def _reconcile_core_agent(state_dir: Path, instance_id: str) -> dict[str, object
             auth_state = str(projection.get("state") or "UNKNOWN")
             auth_reason = f"AUTH_{auth_state}"
             if auth_state == "AUTHENTICATED":
-                verified = SecretAwareGeminiAdapter(store).activate_with_real_probe()
+                verified = SecretAwareAntigravityAdapter(store).activate_with_real_probe()
                 provider = verified.to_dict()
                 auth_reason = str(provider.get("evidence") or "AUTH_MODEL_VERIFY_REQUIRED")
         except AgentRuntimeError:
@@ -158,53 +129,27 @@ def _reconcile_core_agent(state_dir: Path, instance_id: str) -> dict[str, object
             )
         except AgentRuntimeError:
             store.write_runtime(
-                state="DEGRADED",
-                reason="TMUX_WORKER_START_FAILED",
-                tmux_state="STOPPED",
+                state="DEGRADED", reason="TMUX_WORKER_START_FAILED", tmux_state="STOPPED",
                 task_id=str(claim.get("task_id")) if isinstance(claim, dict) and claim.get("task_id") else None,
             )
-    status = store.status()
-    runtime = status.get("runtime") if isinstance(status.get("runtime"), dict) else {}
-    return {
-        "agent_id": "agy-gen",
-        "state": runtime.get("state", "UNKNOWN"),
-        "reason": runtime.get("reason", "UNKNOWN"),
-        "tmux_state": runtime.get("tmux_state", "UNKNOWN"),
-    }
+    status = store.status(); runtime = status.get("runtime") if isinstance(status.get("runtime"), dict) else {}
+    return {"agent_id": "agy-gen", "state": runtime.get("state", "UNKNOWN"), "reason": runtime.get("reason", "UNKNOWN"), "tmux_state": runtime.get("tmux_state", "UNKNOWN")}
 
 
 def run_worker(state_dir: Path, interval_seconds: float) -> int:
-    heartbeat = state_dir / "worker" / "heartbeat.json"
-    heartbeat.parent.mkdir(parents=True, exist_ok=True)
-    stop_event = threading.Event()
-
-    def _stop(_signum: int, _frame: object) -> None:
-        stop_event.set()
-
-    signal.signal(signal.SIGTERM, _stop)
-    signal.signal(signal.SIGINT, _stop)
+    heartbeat = state_dir / "worker" / "heartbeat.json"; heartbeat.parent.mkdir(parents=True, exist_ok=True)
+    stop_event = threading.Event(); first_tick = True
+    def _stop(_signum: int, _frame: object) -> None: stop_event.set()
+    signal.signal(signal.SIGTERM, _stop); signal.signal(signal.SIGINT, _stop)
     while not stop_event.is_set():
         instance_id = os.environ.get("GENOS_INSTANCE_ID") or "UNKNOWN"
         try:
-            agent = _reconcile_core_agent(state_dir, instance_id)
+            agent = _reconcile_core_agent(state_dir, instance_id, force_cli_update=first_tick)
         except Exception as exc:
-            agent = {
-                "agent_id": "agy-gen",
-                "state": "DEGRADED",
-                "reason": f"RECONCILE_{type(exc).__name__}",
-                "tmux_state": "UNKNOWN",
-            }
-        payload = {
-            "status": "ok",
-            "role": "worker",
-            "version": __version__,
-            "instance_id": instance_id,
-            "core_agent": agent,
-            "observed_at": _utc_now(),
-        }
-        temp = heartbeat.with_suffix(".tmp")
-        temp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
-        os.replace(temp, heartbeat)
+            agent = {"agent_id": "agy-gen", "state": "DEGRADED", "reason": f"RECONCILE_{type(exc).__name__}", "tmux_state": "UNKNOWN"}
+        first_tick = False
+        payload = {"status": "ok", "role": "worker", "version": __version__, "instance_id": instance_id, "core_agent": agent, "observed_at": _utc_now()}
+        temp = heartbeat.with_suffix(".tmp"); temp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"); os.replace(temp, heartbeat)
         stop_event.wait(interval_seconds)
     return 0
 
@@ -220,10 +165,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.role == "worker":
-        return run_worker(Path(args.state_dir), args.worker_interval)
-    if args.port is None:
-        raise SystemExit("--port is required for HTTP roles")
+    if args.role == "worker": return run_worker(Path(args.state_dir), args.worker_interval)
+    if args.port is None: raise SystemExit("--port is required for HTTP roles")
     return serve_http(args.role, args.port)
 
 
