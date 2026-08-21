@@ -1,4 +1,4 @@
-name: MVP-06 Drive Report Contract
+name: MVP-06 Drive OAuth and Report Contract
 
 on:
   pull_request:
@@ -13,7 +13,6 @@ on:
       - 'src/genos/product_store.py'
       - 'src/genos/secret_provider.py'
       - 'ci/fresh-host-e2e.sh'
-      - 'ci/mvp06-external-drive-e2e.py'
       - 'tests/test_mvp06*.py'
       - '.github/workflows/mvp06-drive-contract.yml'
   workflow_dispatch:
@@ -42,104 +41,37 @@ jobs:
             test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
           fi
       - name: Compile MVP-06 surfaces
-        run: PYTHONPATH=src python -m compileall -q src/genos tests/test_mvp06.py tests/test_mvp06_oauth.py ci/mvp06-external-drive-e2e.py
-      - name: Drive and report contract tests
+        run: PYTHONPATH=src python -m compileall -q src/genos tests/test_mvp06.py tests/test_mvp06_oauth.py
+      - name: User-owned OAuth, Drive and report contract tests
         run: PYTHONPATH=src python -m unittest discover -s tests -p 'test_mvp06*.py' -v
-      - name: Typed CLI parse smoke
+      - name: Typed Setup-facing CLI parse smoke
         run: |
           PYTHONPATH=src python - <<'PY'
           from genos.cli import build_parser
           secret_id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
           connect = build_parser().parse_args(['drive','connect','--secret-id',secret_id,'--json'])
           assert connect.command == 'drive' and connect.drive_command == 'connect'
+          auth_start = build_parser().parse_args(['drive','authorize','--root-name','GenOS','--json'])
+          assert auth_start.drive_command == 'authorize' and auth_start.root_name == 'GenOS'
+          auth_status = build_parser().parse_args(['drive','auth-status','--json'])
+          assert auth_status.drive_command == 'auth-status'
+          auth_poll = build_parser().parse_args(['drive','auth-poll','--json'])
+          assert auth_poll.drive_command == 'auth-poll'
+          disconnect = build_parser().parse_args(['drive','disconnect','--json'])
+          assert disconnect.drive_command == 'disconnect'
           scheduled = build_parser().parse_args(['report','system','--scheduled','--json'])
           assert scheduled.command == 'report' and scheduled.scheduled is True
           PY
-
-  external-drive-e2e:
-    name: external-drive-e2e
-    needs: drive-contract
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    env:
-      GENOS_MVP06_DRIVE_CREDENTIAL: ${{ secrets.GENOS_MVP06_DRIVE_CREDENTIAL }}
-      GITHUB_HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
-    steps:
-      - name: Checkout exact reviewed head
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-          fetch-depth: 1
-
-      - name: Verify exact checkout
+      - name: Guard against maintainer-personal Drive acceptance coupling
         shell: bash
         run: |
           set -euo pipefail
-          test "$(git rev-parse HEAD)" = "$GITHUB_HEAD_SHA"
-
-      - name: Detect external GenOS credential
-        id: credential
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -n "${GENOS_MVP06_DRIVE_CREDENTIAL:-}" ]]; then
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-            echo "GenOS external Drive credential: CONFIGURED"
-          else
-            echo "configured=false" >> "$GITHUB_OUTPUT"
-            echo "GenOS external Drive credential: NEEDS_EXTERNAL_GENOS_CREDENTIAL"
-          fi
-
-      - name: Record truthful external-auth gate
-        if: steps.credential.outputs.configured != 'true'
-        shell: bash
-        env:
-          GENOS_MVP06_EXTERNAL_EVIDENCE: ${{ runner.temp }}/mvp06-external-drive-evidence.json
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json, os
-          from pathlib import Path
-          payload = {
-              "schema_version": "1.0",
-              "state": "NEEDS_EXTERNAL_GENOS_CREDENTIAL",
-              "tested_git_sha": os.environ["GITHUB_HEAD_SHA"],
-              "remote_mutation": False,
+          ! grep -R "GENOS_MVP06_DRIVE_CREDENTIAL" -n .github src tests ci || {
+            echo 'MVP-06 must not depend on a maintainer personal Drive credential'
+            exit 1
           }
-          Path(os.environ["GENOS_MVP06_EXTERNAL_EVIDENCE"]).write_text(
-              json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
-          )
-          print("GENOS_MVP06_EXTERNAL_DRIVE_E2E_NEEDS_EXTERNAL_GENOS_CREDENTIAL")
-          PY
-
-      - name: Prepare PostgreSQL SecretRef authority
-        if: steps.credential.outputs.configured == 'true'
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo systemctl start postgresql
-          if ! sudo -u postgres psql -Atqc "SELECT 1 FROM pg_roles WHERE rolname='${USER}'" | grep -qx 1; then
-            sudo -u postgres createuser --superuser "${USER}"
-          fi
-          sudo -u postgres dropdb --if-exists genos
-          sudo -u postgres createdb -O "${USER}" genos
-          psql -d genos -Atqc 'SELECT 1' | grep -qx 1
-
-      - name: Run GenOS SecretRef to real Google Drive acceptance
-        if: steps.credential.outputs.configured == 'true'
-        shell: bash
-        env:
-          PYTHONPATH: src
-          GENOS_MVP06_EXTERNAL_EVIDENCE: ${{ runner.temp }}/mvp06-external-drive-evidence.json
-        run: |
-          set -euo pipefail
-          python3 ci/mvp06-external-drive-e2e.py
-
-      - name: Upload sanitized external evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mvp06-external-drive-${{ github.event.pull_request.head.sha || github.sha }}
-          path: ${{ runner.temp }}/mvp06-external-drive-evidence.json
-          if-no-files-found: error
-          retention-days: 14
+          ! grep -R "NEEDS_EXTERNAL_GENOS_CREDENTIAL" -n .github src tests ci || {
+            echo 'obsolete external-owner credential gate remains in required implementation paths'
+            exit 1
+          }
+          echo 'USER_OWNED_GOOGLE_DRIVE_OAUTH_CONTRACT_PASS'
