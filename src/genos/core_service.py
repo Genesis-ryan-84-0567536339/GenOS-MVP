@@ -9,8 +9,12 @@ from pathlib import Path
 import signal
 import sys
 import threading
+import time
 
 from . import __version__
+
+
+DRIVE_SCAN_INTERVAL_SECONDS = 30 * 60
 
 
 def _utc_now() -> str:
@@ -136,9 +140,30 @@ def _reconcile_core_agent(state_dir: Path, instance_id: str, *, force_cli_update
     return {"agent_id": "agy-gen", "state": runtime.get("state", "UNKNOWN"), "reason": runtime.get("reason", "UNKNOWN"), "tmux_state": runtime.get("tmux_state", "UNKNOWN")}
 
 
+def _scheduled_drive_scan() -> dict[str, object]:
+    """One isolated 30-minute scan; never throws into Agent/worker health."""
+    try:
+        from .drive_system import build_drive_system
+        result = build_drive_system().scheduled_scan()
+        return {
+            "state": str(result.get("state") or "UNKNOWN"),
+            "remote_write": bool(result.get("remote_write", False)),
+            "observed_at": _utc_now(),
+        }
+    except Exception as exc:
+        return {
+            "state": "DEGRADED",
+            "reason": f"DRIVE_SCAN_{type(exc).__name__}",
+            "remote_write": False,
+            "observed_at": _utc_now(),
+        }
+
+
 def run_worker(state_dir: Path, interval_seconds: float) -> int:
     heartbeat = state_dir / "worker" / "heartbeat.json"; heartbeat.parent.mkdir(parents=True, exist_ok=True)
     stop_event = threading.Event(); first_tick = True
+    next_drive_scan = time.monotonic() + DRIVE_SCAN_INTERVAL_SECONDS
+    drive_projection: dict[str, object] = {"state": "SCHEDULED", "remote_write": False, "observed_at": _utc_now()}
     def _stop(_signum: int, _frame: object) -> None: stop_event.set()
     signal.signal(signal.SIGTERM, _stop); signal.signal(signal.SIGINT, _stop)
     while not stop_event.is_set():
@@ -148,7 +173,11 @@ def run_worker(state_dir: Path, interval_seconds: float) -> int:
         except Exception as exc:
             agent = {"agent_id": "agy-gen", "state": "DEGRADED", "reason": f"RECONCILE_{type(exc).__name__}", "tmux_state": "UNKNOWN"}
         first_tick = False
-        payload = {"status": "ok", "role": "worker", "version": __version__, "instance_id": instance_id, "core_agent": agent, "observed_at": _utc_now()}
+        now = time.monotonic()
+        if now >= next_drive_scan:
+            drive_projection = _scheduled_drive_scan()
+            next_drive_scan = now + DRIVE_SCAN_INTERVAL_SECONDS
+        payload = {"status": "ok", "role": "worker", "version": __version__, "instance_id": instance_id, "core_agent": agent, "drive_report": drive_projection, "observed_at": _utc_now()}
         temp = heartbeat.with_suffix(".tmp"); temp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"); os.replace(temp, heartbeat)
         stop_event.wait(interval_seconds)
     return 0
