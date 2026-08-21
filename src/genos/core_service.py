@@ -27,40 +27,67 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:  # noqa: N802
         role = getattr(self.server, "genos_role", "unknown")
         if self.path == "/health":
-            self._json(200, {"status": "ok", "role": role, "version": __version__, "instance_id": os.environ.get("GENOS_INSTANCE_ID") or "UNKNOWN", "ui_state": "NOT_IMPLEMENTED" if role == "mission-control" else None, "observed_at": _utc_now()})
-            return
-        if role == "mission-control" and self.path == "/":
-            self._json(503, {"status": "not_ready", "role": role, "reason": "MISSION_CONTROL_UI_NOT_IMPLEMENTED_BEFORE_MVP_08_VISUAL_APPROVAL"})
+            self._json(
+                200,
+                {
+                    "status": "ok",
+                    "role": role,
+                    "version": __version__,
+                    "instance_id": os.environ.get("GENOS_INSTANCE_ID") or "UNKNOWN",
+                    "observed_at": _utc_now(),
+                },
+            )
             return
         self._json(404, {"status": "not_found"})
 
     def log_message(self, fmt: str, *args: object) -> None:
-        sys.stdout.write(json.dumps({"event": "http", "message": fmt % args}, ensure_ascii=False) + "\n"); sys.stdout.flush()
+        sys.stdout.write(json.dumps({"event": "http", "message": fmt % args}, ensure_ascii=False) + "\n")
+        sys.stdout.flush()
 
     def _json(self, status: int, payload: dict[str, object]) -> None:
         body = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
-        self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(body))); self.end_headers(); self.wfile.write(body)
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 def serve_http(role: str, port: int) -> int:
     handler: type[BaseHTTPRequestHandler] = HealthHandler
     product_app = None
     if role == "product-api":
-        from .product_api import ProductAPIApp, ProductAPIHandler
-        product_app = ProductAPIApp.from_system(); handler = ProductAPIHandler
+        from .product_api import ProductAPIApp
+        from .product_api_mvp09 import MVP09ProductAPIHandler
+
+        product_app = ProductAPIApp.from_system()
+        handler = MVP09ProductAPIHandler
     server = ThreadingHTTPServer(("127.0.0.1", port), handler)
-    server.daemon_threads = True; server.genos_role = role  # type: ignore[attr-defined]
+    server.daemon_threads = True
+    server.genos_role = role  # type: ignore[attr-defined]
     if product_app is not None:
         server.genos_app = product_app  # type: ignore[attr-defined]
     stop_event = threading.Event()
-    def _stop(_signum: int, _frame: object) -> None: stop_event.set()
-    signal.signal(signal.SIGTERM, _stop); signal.signal(signal.SIGINT, _stop)
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
     print(json.dumps({"event": "service_start", "role": role, "port": port, "observed_at": _utc_now()}), flush=True)
-    server_thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.25}, name=f"genos-{role}-http", daemon=True)
+    server_thread = threading.Thread(
+        target=server.serve_forever,
+        kwargs={"poll_interval": 0.25},
+        name=f"genos-{role}-http",
+        daemon=True,
+    )
     server_thread.start()
-    try: stop_event.wait()
+    try:
+        stop_event.wait()
     finally:
-        server.shutdown(); server.server_close(); server_thread.join(timeout=5)
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=5)
     return 0
 
 
@@ -133,17 +160,26 @@ def _reconcile_core_agent(state_dir: Path, instance_id: str, *, force_cli_update
             )
         except AgentRuntimeError:
             store.write_runtime(
-                state="DEGRADED", reason="TMUX_WORKER_START_FAILED", tmux_state="STOPPED",
+                state="DEGRADED",
+                reason="TMUX_WORKER_START_FAILED",
+                tmux_state="STOPPED",
                 task_id=str(claim.get("task_id")) if isinstance(claim, dict) and claim.get("task_id") else None,
             )
-    status = store.status(); runtime = status.get("runtime") if isinstance(status.get("runtime"), dict) else {}
-    return {"agent_id": "agy-gen", "state": runtime.get("state", "UNKNOWN"), "reason": runtime.get("reason", "UNKNOWN"), "tmux_state": runtime.get("tmux_state", "UNKNOWN")}
+    status = store.status()
+    runtime = status.get("runtime") if isinstance(status.get("runtime"), dict) else {}
+    return {
+        "agent_id": "agy-gen",
+        "state": runtime.get("state", "UNKNOWN"),
+        "reason": runtime.get("reason", "UNKNOWN"),
+        "tmux_state": runtime.get("tmux_state", "UNKNOWN"),
+    }
 
 
 def _scheduled_drive_scan() -> dict[str, object]:
     """One isolated 30-minute scan; failure is queued for the next cadence."""
     try:
         from .drive_system import build_drive_system
+
         result = build_drive_system().scheduled_scan()
         return {
             "state": str(result.get("state") or "UNKNOWN"),
@@ -161,25 +197,49 @@ def _scheduled_drive_scan() -> dict[str, object]:
 
 
 def run_worker(state_dir: Path, interval_seconds: float) -> int:
-    heartbeat = state_dir / "worker" / "heartbeat.json"; heartbeat.parent.mkdir(parents=True, exist_ok=True)
-    stop_event = threading.Event(); first_tick = True
+    heartbeat = state_dir / "worker" / "heartbeat.json"
+    heartbeat.parent.mkdir(parents=True, exist_ok=True)
+    stop_event = threading.Event()
+    first_tick = True
     next_drive_scan = time.monotonic() + DRIVE_SCAN_INTERVAL_SECONDS
-    drive_projection: dict[str, object] = {"state": "SCHEDULED", "remote_write": False, "observed_at": _utc_now()}
+    drive_projection: dict[str, object] = {
+        "state": "SCHEDULED",
+        "remote_write": False,
+        "observed_at": _utc_now(),
+    }
     try:
         from .kanban import build_kanban_system
+
         kanban_system = build_kanban_system()
-        kanban_projection: dict[str, object] = {"state": "IDLE", "reason": "NOT_TICKED", "observed_at": _utc_now()}
+        kanban_projection: dict[str, object] = {
+            "state": "IDLE",
+            "reason": "NOT_TICKED",
+            "observed_at": _utc_now(),
+        }
     except Exception as exc:
         kanban_system = None
-        kanban_projection = {"state": "DEGRADED", "reason": f"KANBAN_INIT_{type(exc).__name__}", "observed_at": _utc_now()}
-    def _stop(_signum: int, _frame: object) -> None: stop_event.set()
-    signal.signal(signal.SIGTERM, _stop); signal.signal(signal.SIGINT, _stop)
+        kanban_projection = {
+            "state": "DEGRADED",
+            "reason": f"KANBAN_INIT_{type(exc).__name__}",
+            "observed_at": _utc_now(),
+        }
+
+    def _stop(_signum: int, _frame: object) -> None:
+        stop_event.set()
+
+    signal.signal(signal.SIGTERM, _stop)
+    signal.signal(signal.SIGINT, _stop)
     while not stop_event.is_set():
         instance_id = os.environ.get("GENOS_INSTANCE_ID") or "UNKNOWN"
         try:
             agent = _reconcile_core_agent(state_dir, instance_id, force_cli_update=first_tick)
         except Exception as exc:
-            agent = {"agent_id": "agy-gen", "state": "DEGRADED", "reason": f"RECONCILE_{type(exc).__name__}", "tmux_state": "UNKNOWN"}
+            agent = {
+                "agent_id": "agy-gen",
+                "state": "DEGRADED",
+                "reason": f"RECONCILE_{type(exc).__name__}",
+                "tmux_state": "UNKNOWN",
+            }
         first_tick = False
         now = time.monotonic()
         if now >= next_drive_scan:
@@ -190,9 +250,24 @@ def run_worker(state_dir: Path, interval_seconds: float) -> int:
                 tick = kanban_system.agent_tick()
                 kanban_projection = {**tick, "observed_at": _utc_now()}
             except Exception as exc:
-                kanban_projection = {"state": "DEGRADED", "reason": f"KANBAN_TICK_{type(exc).__name__}", "observed_at": _utc_now()}
-        payload = {"status": "ok", "role": "worker", "version": __version__, "instance_id": instance_id, "core_agent": agent, "drive_report": drive_projection, "kanban_agent": kanban_projection, "observed_at": _utc_now()}
-        temp = heartbeat.with_suffix(".tmp"); temp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8"); os.replace(temp, heartbeat)
+                kanban_projection = {
+                    "state": "DEGRADED",
+                    "reason": f"KANBAN_TICK_{type(exc).__name__}",
+                    "observed_at": _utc_now(),
+                }
+        payload = {
+            "status": "ok",
+            "role": "worker",
+            "version": __version__,
+            "instance_id": instance_id,
+            "core_agent": agent,
+            "drive_report": drive_projection,
+            "kanban_agent": kanban_projection,
+            "observed_at": _utc_now(),
+        }
+        temp = heartbeat.with_suffix(".tmp")
+        temp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(temp, heartbeat)
         stop_event.wait(interval_seconds)
     return 0
 
@@ -208,13 +283,23 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    if args.role == "worker": return run_worker(Path(args.state_dir), args.worker_interval)
+    if args.role == "worker":
+        return run_worker(Path(args.state_dir), args.worker_interval)
     if args.role == "mcp":
         from .mcp_transport import serve_mcp
+
         port = args.port or int(os.environ.get("GENOS_MCP_PORT", "0") or "0")
-        if not port: raise SystemExit("GENOS_MCP_PORT or --port is required for MCP role")
+        if not port:
+            raise SystemExit("GENOS_MCP_PORT or --port is required for MCP role")
         return serve_mcp(port=port)
-    if args.port is None: raise SystemExit("--port is required for HTTP roles")
+    if args.role == "mission-control":
+        from .mission_control import serve_mission_control
+
+        if args.port is None:
+            raise SystemExit("--port is required for mission-control role")
+        return serve_mission_control(port=args.port)
+    if args.port is None:
+        raise SystemExit("--port is required for HTTP roles")
     return serve_http(args.role, args.port)
 
 

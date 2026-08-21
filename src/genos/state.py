@@ -36,6 +36,59 @@ class JsonStateStore:
         with path.open("r", encoding="utf-8") as handle:
             return JobRun.from_dict(redact(json.load(handle)))
 
+    def list_jobs(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        """Return bounded recent JobRun activity summaries without new state.
+
+        Full evidence remains in the durable JobRun file and can be consumed by
+        typed support/report paths. Mission Control needs only progress/activity
+        metadata, which keeps refresh responses small and secret-safe.
+        """
+        bounded = max(1, min(int(limit), 200))
+        if not self.jobs_dir.is_dir():
+            return []
+        rows: list[dict[str, Any]] = []
+        try:
+            paths = sorted(
+                self.jobs_dir.glob("*.json"),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+        except OSError:
+            return []
+        for path in paths[:bounded]:
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    safe = redact(payload)
+                    evidence = safe.get("evidence") if isinstance(safe.get("evidence"), list) else []
+                    last_evidence = evidence[-1] if evidence and isinstance(evidence[-1], dict) else None
+                    rows.append(
+                        {
+                            "job_id": safe.get("job_id") or path.stem,
+                            "kind": safe.get("kind") or "generic",
+                            "state": safe.get("state") or "UNKNOWN",
+                            "progress_percent": safe.get("progress_percent", 0),
+                            "current_step": safe.get("current_step"),
+                            "created_at": safe.get("created_at"),
+                            "updated_at": safe.get("updated_at"),
+                            "last_evidence": last_evidence,
+                        }
+                    )
+                    continue
+            except (OSError, json.JSONDecodeError):
+                pass
+            rows.append(
+                {
+                    "job_id": path.stem,
+                    "kind": "UNKNOWN",
+                    "state": "UNKNOWN",
+                    "progress_percent": 0,
+                    "current_step": "job_record_unreadable",
+                    "last_evidence": None,
+                }
+            )
+        return rows
+
     def save_manifest(self, payload: dict[str, Any]) -> None:
         self._atomic_write(self.manifest_path, redact(payload))
 
