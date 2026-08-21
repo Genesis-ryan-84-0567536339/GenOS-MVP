@@ -48,7 +48,7 @@ class FixtureProductAPI(BaseHTTPRequestHandler):
             )
         if self.path == "/api/v1/cards":
             return self._protected({"cards": list(self.cards)})
-        if self.path.startswith("/api/v1/cards/") and self.path.count("/") == 5:
+        if self.path.startswith("/api/v1/cards/") and self.path.count("/") == 4:
             card_id = self.path.rsplit("/", 1)[-1]
             card = next((item for item in self.cards if item["card_id"] == card_id), self.cards[0])
             return self._protected(
@@ -196,37 +196,37 @@ def main() -> int:
             page.locator("#login-username").fill("ryan")
             page.locator("#login-password").fill("fixture-password")
             page.locator("#login-form button[type=submit]").click()
-            page.get_by_role("heading", name="Dashboard").wait_for()
+            page.get_by_role("heading", name="Dashboard", exact=True).wait_for()
             assert "PASS" in page.locator("#global-state").inner_text()
 
-            page.get_by_role("button", name="Kanban").click()
-            page.get_by_role("heading", name="Kanban").wait_for()
+            page.locator('#nav [data-route="kanban"]').click()
+            page.get_by_role("heading", name="Kanban", exact=True).wait_for()
             page.locator("#new-card-title").fill("Browser fixture card")
             page.locator("#new-card-description").fill("Created through typed Product API fixture")
             page.locator("#new-card-form button[type=submit]").click()
-            page.get_by_text("Browser fixture card").wait_for()
+            page.get_by_text("Browser fixture card", exact=True).wait_for()
 
-            page.get_by_role("button", name="Agy-gen").click()
-            page.get_by_role("heading", name="Agy-gen Chat / Runtime").wait_for()
+            page.locator('#nav [data-route="agy"]').click()
+            page.get_by_role("heading", name="Agy-gen Chat / Runtime", exact=True).wait_for()
             page.locator("#agent-task-prompt").fill("Browser fixture task")
             page.locator("#agent-task-form button[type=submit]").click()
-            page.get_by_text("Browser fixture task").wait_for()
+            page.get_by_text("Browser fixture task", exact=True).wait_for()
 
-            page.get_by_role("button", name="Memory & Skills").click()
-            page.get_by_role("heading", name="Memory & Skills").wait_for()
-            page.get_by_text("owner-context").first.wait_for()
+            page.locator('#nav [data-route="memory"]').click()
+            page.get_by_role("heading", name="Memory & Skills", exact=True).wait_for()
+            page.get_by_text("owner-context", exact=True).first.wait_for()
 
-            page.get_by_role("button", name="Connections").click()
-            page.get_by_role("heading", name="Connections & Credentials").wait_for()
-            page.get_by_text("http://127.0.0.1:17883/mcp").first.wait_for()
+            page.locator('#nav [data-route="connections"]').click()
+            page.get_by_role("heading", name="Connections & Credentials", exact=True).wait_for()
+            page.get_by_text("http://127.0.0.1:17883/mcp", exact=True).first.wait_for()
 
-            page.get_by_role("button", name="Reports").click()
-            page.get_by_role("heading", name="Reports & Job progress").wait_for()
-            page.get_by_text("LATEST SYSTEM REPORT").wait_for()
+            page.locator('#nav [data-route="reports"]').click()
+            page.get_by_role("heading", name="Reports & Job progress", exact=True).wait_for()
+            page.get_by_text("LATEST SYSTEM REPORT", exact=True).wait_for()
 
             page.set_viewport_size({"width": 390, "height": 844})
-            page.get_by_role("button", name="Dashboard").click()
-            page.get_by_role("heading", name="Dashboard").wait_for()
+            page.locator('#nav [data-route="dashboard"]').click()
+            page.get_by_role("heading", name="Dashboard", exact=True).wait_for()
             assert page.locator("#nav").is_visible()
             browser.close()
         if errors:
@@ -234,8 +234,12 @@ def main() -> int:
         print("MVP-09 browser E2E PASS: Owner login + six surfaces + typed Card/Agent task + responsive navigation")
         return 0
     finally:
-        web.shutdown(); web.server_close(); web_thread.join(timeout=2)
-        product.shutdown(); product.server_close(); product_thread.join(timeout=2)
+        web.shutdown()
+        web.server_close()
+        web_thread.join(timeout=2)
+        product.shutdown()
+        product.server_close()
+        product_thread.join(timeout=2)
 
 
 if __name__ == "__main__":
