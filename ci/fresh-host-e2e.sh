@@ -172,7 +172,7 @@ for protected in ('/api/v1/drive', '/api/v1/cards', '/api/v1/mcp'):
         assert exc.code == 401, (protected, exc.code)
         error_payload = json.loads(exc.read().decode('utf-8'))
         assert error_payload['error'] == 'unauthorized', error_payload
-mcp_body=json.dumps({'jsonrpc':'2.0','id':1,'method':'tools/list','params':{}}).encode()
+mcp_body=json.dumps({'jsonrpc':'2.0','id':1,'method':'tools/list','params':{'_meta':{'io.modelcontextprotocol/protocolVersion':'2026-07-28'}}}).encode()
 mcp_req=urllib.request.Request(f'http://127.0.0.1:{mcp_port}/mcp', data=mcp_body, method='POST', headers={'Content-Type':'application/json','MCP-Protocol-Version':'2026-07-28','Mcp-Method':'tools/list'})
 try:
     urllib.request.urlopen(mcp_req, timeout=5)

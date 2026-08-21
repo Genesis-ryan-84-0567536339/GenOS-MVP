@@ -20,6 +20,16 @@ from .mcp_hub import (
 
 
 MAX_MCP_BODY = 1024 * 1024
+PROTOCOL_VERSION_META_KEY = "io.modelcontextprotocol/protocolVersion"
+SERVER_INFO_META_KEY = "io.modelcontextprotocol/serverInfo"
+
+
+class McpHeaderMismatch(McpHubError):
+    pass
+
+
+class McpUnsupportedProtocol(McpHubError):
+    pass
 
 
 class McpHttpHandler(BaseHTTPRequestHandler):
@@ -60,12 +70,15 @@ class McpHttpHandler(BaseHTTPRequestHandler):
             header_version = self.headers.get("MCP-Protocol-Version", "")
             header_method = self.headers.get("Mcp-Method", "")
             if header_version != MCP_PROTOCOL_VERSION:
-                raise McpHubError("unsupported MCP protocol version")
+                raise McpUnsupportedProtocol("unsupported MCP protocol version")
             if header_method != method:
-                raise McpHubError("Mcp-Method header/body mismatch")
+                raise McpHeaderMismatch("Mcp-Method header/body mismatch")
             params = payload.get("params") or {}
             if not isinstance(params, dict):
                 raise McpHubError("MCP params must be an object")
+            meta = params.get("_meta")
+            if not isinstance(meta, dict) or meta.get(PROTOCOL_VERSION_META_KEY) != MCP_PROTOCOL_VERSION:
+                raise McpUnsupportedProtocol("MCP params._meta protocol version missing or unsupported")
             principal = self.hub.authenticate(self._bearer_token())
             correlation_id = self.headers.get("traceparent") or self.headers.get("X-Request-ID") or str(uuid.uuid4())
 
@@ -77,7 +90,7 @@ class McpHttpHandler(BaseHTTPRequestHandler):
                 body_name = params.get("name")
                 header_name = self.headers.get("Mcp-Name", "")
                 if not isinstance(body_name, str) or not body_name or header_name != body_name:
-                    raise McpHubError("Mcp-Name header/body mismatch")
+                    raise McpHeaderMismatch("Mcp-Name header/body mismatch")
                 arguments = params.get("arguments") or {}
                 if not isinstance(arguments, dict):
                     raise McpHubError("tool arguments must be an object")
@@ -90,7 +103,11 @@ class McpHttpHandler(BaseHTTPRequestHandler):
             else:
                 self._rpc_error(request_id, -32601, "method_not_found", status=404)
                 return
-            self._json(200, {"jsonrpc": "2.0", "id": request_id, "result": result})
+            self._json(200, {"jsonrpc": "2.0", "id": request_id, "result": _with_server_meta(result)})
+        except McpUnsupportedProtocol:
+            self._rpc_error(request_id, -32022, "unsupported_protocol_version", status=400)
+        except McpHeaderMismatch:
+            self._rpc_error(request_id, -32020, "header_mismatch", status=400)
         except McpUnauthorized:
             self._rpc_error(request_id, -32001, "unauthorized", status=401)
         except McpForbidden:
@@ -150,6 +167,15 @@ class McpHttpHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+
+def _with_server_meta(result: Any) -> Any:
+    if not isinstance(result, dict):
+        return result
+    existing = result.get("_meta")
+    meta = dict(existing) if isinstance(existing, dict) else {}
+    meta[SERVER_INFO_META_KEY] = {"name": "genos-mcp-hub", "version": "0.1"}
+    return {**result, "_meta": meta}
 
 
 def serve_mcp(*, host: str = "127.0.0.1", port: int) -> int:

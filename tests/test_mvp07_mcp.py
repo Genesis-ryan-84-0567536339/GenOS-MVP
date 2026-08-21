@@ -118,7 +118,12 @@ class McpHubContractTests(unittest.TestCase):
         thread.start()
         endpoint = f"http://127.0.0.1:{server.server_port}/mcp"
         try:
-            payload = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
+            payload = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/list",
+                "params": {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}},
+            }
             req = urllib.request.Request(
                 endpoint,
                 data=json.dumps(payload).encode(),

@@ -106,12 +106,22 @@ class UpstreamMcpClient:
         params: dict[str, Any],
     ) -> dict[str, Any]:
         request_id = str(uuid.uuid4())
+        request_params = dict(params)
+        current_meta = request_params.get("_meta")
+        meta = dict(current_meta) if isinstance(current_meta, dict) else {}
+        meta.update(
+            {
+                "io.modelcontextprotocol/protocolVersion": MCP_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientInfo": {"name": "genos-mcp-hub", "version": "0.1"},
+                "io.modelcontextprotocol/clientCapabilities": {},
+            }
+        )
+        request_params["_meta"] = meta
         body = {
             "jsonrpc": "2.0",
             "id": request_id,
             "method": method,
-            "params": params,
-            "_meta": {"io.modelcontextprotocol/clientInfo": {"name": "genos-mcp-hub", "version": "0.1"}},
+            "params": request_params,
         }
         headers = {
             "Content-Type": "application/json",
@@ -179,10 +189,9 @@ class GenOSMcpHub:
 
     def discover(self, principal: dict[str, Any]) -> dict[str, Any]:
         return {
-            "protocolVersion": MCP_PROTOCOL_VERSION,
-            "serverInfo": {"name": "genos-mcp-hub", "version": "0.1"},
+            "supportedVersions": [MCP_PROTOCOL_VERSION],
             "capabilities": {"tools": {"listChanged": False}},
-            "authorization": {"principal_id": principal["principal_id"], "grant_mode": "deny-by-default"},
+            "instructions": "GenOS unified MCP Hub. Tool discovery and invocation are filtered by the authenticated principal grant.",
         }
 
     def list_tools(self, principal: dict[str, Any]) -> dict[str, Any]:
