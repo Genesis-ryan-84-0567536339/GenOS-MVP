@@ -5,13 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from genos.agent_auth import (
-    AUTH_SELECTED_TYPE,
-    AgentAuthBridge,
-    AgentAuthError,
-    normalize_auth_code,
-    parse_auth_terminal,
-)
+from genos.agent_auth import AgentAuthBridge, AgentAuthError, normalize_auth_code, parse_auth_terminal
 from genos.agent_runtime import AgentRuntimeStore
 from genos.agent_secure_runtime import SecureTmuxController
 
@@ -20,26 +14,27 @@ class AuthProjectionTests(unittest.TestCase):
     def test_manual_oauth_url_and_code_prompt_are_projected(self) -> None:
         url = (
             "https://accounts.google.com/o/oauth2/v2/auth?client_id=fixture"
-            "&redirect_uri=https%3A%2F%2Fcodeassist.google.com%2Fauthcode&state=ephemeral"
+            "&redirect_uri=https%3A%2F%2Fantigravity.google%2Fauthcode&state=ephemeral"
         )
-        projection = parse_auth_terminal(
-            "Please visit the following URL to authorize the application:\n\n"
-            + url
-            + "\n\nEnter the authorization code: "
-        )
+        projection = parse_auth_terminal("Open this URL in your browser:\n" + url + "\nPaste the authorization code: ")
         self.assertEqual(projection.state, "WAITING_CODE")
         self.assertEqual(projection.auth_url, url)
         self.assertEqual(projection.tmux_session, "agy-gen")
         self.assertEqual(projection.tmux_window, "auth")
 
     def test_auth_success_is_truthful(self) -> None:
-        projection = parse_auth_terminal("Authentication succeeded\n")
+        projection = parse_auth_terminal("Authentication successful\n")
         self.assertEqual(projection.state, "AUTHENTICATED")
-        self.assertEqual(projection.evidence, "GEMINI_OAUTH_USER_CODE_ACCEPTED")
+        self.assertEqual(projection.evidence, "AGY_OAUTH_USER_CODE_ACCEPTED")
 
     def test_auth_failure_is_truthful(self) -> None:
         projection = parse_auth_terminal("Failed to authenticate with authorization code: denied\n")
         self.assertEqual(projection.state, "FAILED")
+        self.assertEqual(projection.evidence, "AGY_OAUTH_USER_CODE_REJECTED")
+
+    def test_untrusted_url_is_not_projected(self) -> None:
+        projection = parse_auth_terminal("visit https://example.invalid/steal?token=x")
+        self.assertIsNone(projection.auth_url)
 
 
 class AuthCodeHygieneTests(unittest.TestCase):
@@ -56,16 +51,15 @@ class AuthCodeHygieneTests(unittest.TestCase):
 
 
 class AuthSettingsTests(unittest.TestCase):
-    def test_bridge_selects_google_oauth_without_storing_auth_material(self) -> None:
+    def test_bridge_settings_contain_no_auth_material(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             store = AgentRuntimeStore(Path(temp) / "agy-gen")
             store.ensure_seed(instance_id="instance-a")
-            bridge = AgentAuthBridge(store, tmux_binary="/bin/false", gemini_binary="/bin/false")
-            bridge._ensure_user_auth_settings()  # settings-only unit contract
-            path = store.root / ".gemini" / "settings.json"
-            payload = json.loads(path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["security"]["auth"]["selectedType"], AUTH_SELECTED_TYPE)
-            text = path.read_text(encoding="utf-8").lower()
+            bridge = AgentAuthBridge(store, tmux_binary="/bin/false", agy_binary="/bin/false")
+            bridge._ensure_user_settings()
+            payload = json.loads(store.settings_path.read_text(encoding="utf-8"))
+            self.assertIn("permissions", payload)
+            text = store.settings_path.read_text(encoding="utf-8").lower()
             for forbidden in ("access_token", "refresh_token", "api_key", "authorization_code"):
                 self.assertNotIn(forbidden, text)
 
@@ -73,18 +67,20 @@ class AuthSettingsTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             store = AgentRuntimeStore(Path(temp) / "agy-gen")
             store.ensure_seed(instance_id="instance-a")
-            auth = AgentAuthBridge(store, tmux_binary="/bin/false", gemini_binary="/bin/false")
+            auth = AgentAuthBridge(store, tmux_binary="/bin/false", agy_binary="/bin/false")
             runtime = SecureTmuxController(store, tmux_binary="/bin/false")
             self.assertEqual(auth._env()["TMUX_TMPDIR"], str(store.root))
             self.assertEqual(runtime._env()["TMUX_TMPDIR"], str(store.root))
             self.assertEqual(auth._env()["HOME"], str(store.root))
             self.assertEqual(runtime._env()["HOME"], str(store.root))
+            self.assertEqual(auth._env()["AGY_CLI_DISABLE_AUTO_UPDATE"], "true")
+            self.assertEqual(runtime._env()["AGY_CLI_DISABLE_AUTO_UPDATE"], "true")
 
     def test_tmux_uses_explicit_shell_without_enabling_service_login(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             store = AgentRuntimeStore(Path(temp) / "agy-gen")
             store.ensure_seed(instance_id="instance-a")
-            auth = AgentAuthBridge(store, tmux_binary="/bin/false", gemini_binary="/bin/false")
+            auth = AgentAuthBridge(store, tmux_binary="/bin/false", agy_binary="/bin/false")
             runtime = SecureTmuxController(store, tmux_binary="/bin/false")
             self.assertEqual(auth._env()["SHELL"], "/bin/sh")
             self.assertEqual(runtime._env()["SHELL"], "/bin/sh")
