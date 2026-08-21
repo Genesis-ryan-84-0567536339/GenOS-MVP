@@ -209,7 +209,10 @@ def worker_loop(store: AgentRuntimeStore, *, interval: float = 1.0) -> int:
             result = adapter.run_task(prompt)
         except (AgentRuntimeError, subprocess.TimeoutExpired) as exc:
             result = {"state": "FAILED", "error": type(exc).__name__, "observed_at": utc_now()}
-        _atomic_json(store.result_dir / f"{task_id}.json", {"task_id": task_id, "agent_id": CORE_AGENT_ID, **result})
+        _atomic_json(
+            store.result_dir / f"{task_id}.json",
+            {"task_id": task_id, "agent_id": CORE_AGENT_ID, "prompt": prompt, **result},
+        )
         task_path.unlink(missing_ok=True)
         store.release_work(task_id=task_id)
     return 0
