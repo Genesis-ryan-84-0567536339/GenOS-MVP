@@ -404,6 +404,7 @@ bootstrapForm.addEventListener("submit", async (event) => {
 });
 document.getElementById("copy-token").addEventListener("click", async () => { const value=document.getElementById("one-time-token").textContent; try { await navigator.clipboard.writeText(value); toastMsg("Đã copy one-time token"); } catch (_err) { toastMsg("Browser không cho clipboard; hãy chọn và copy thủ công", true); } });
 document.getElementById("close-token").addEventListener("click", () => { document.getElementById("one-time-token").textContent=""; document.getElementById("one-time-dialog").close(); });
+document.getElementById("one-time-dialog").addEventListener("close", () => { document.getElementById("one-time-token").textContent=""; });
 
 (async function boot() {
   document.getElementById("route-title").textContent = ROUTES[app.route];

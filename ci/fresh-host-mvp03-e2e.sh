@@ -183,11 +183,20 @@ for role, port in [('product-api',17880),('runtime',17881),('mission-control',17
     assert response.status == 200, (role, response.status)
     assert payload['status'] == 'ok', payload
     assert payload['role'] == role, payload
-try:
-    urllib.request.urlopen('http://127.0.0.1:17882/', timeout=5)
-    raise AssertionError('Mission Control root unexpectedly returned success before MVP-08')
-except urllib.error.HTTPError as exc:
-    assert exc.code == 503, exc.code
+with urllib.request.urlopen('http://127.0.0.1:17882/', timeout=5) as response:
+    mission_html=response.read().decode('utf-8')
+    mission_status=response.status
+    mission_csp=response.headers.get('Content-Security-Policy', '')
+    mission_nosniff=response.headers.get('X-Content-Type-Options', '')
+assert mission_status == 200, mission_status
+assert 'GenOS Mission Control' in mission_html, mission_html[:200]
+assert "frame-ancestors 'none'" in mission_csp, mission_csp
+assert mission_nosniff == 'nosniff', mission_nosniff
+with urllib.request.urlopen('http://127.0.0.1:17882/assets/app.js', timeout=5) as response:
+    mission_asset=response.read()
+    mission_asset_status=response.status
+assert mission_asset_status == 200, mission_asset_status
+assert mission_asset, 'Mission Control app.js is empty'
 manifest=json.load(open('/var/lib/genos/manifest.json', encoding='utf-8'))
 assert manifest['state'] == 'READY_LOCAL_CORE', manifest
 assert manifest['release']['git_sha'] == '$TESTED_SHA', manifest
@@ -258,7 +267,7 @@ payload = {
     "product_db_raw_secret_negative_scan": "PASS",
     "no_public_secret_get": "PASS",
     "reboot_persistence": "PASS",
-    "mission_control_ui": "NOT_IMPLEMENTED_BEFORE_MVP_08_VISUAL_APPROVAL"
+    "mission_control_ui": "READY"
 }
 with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(payload, handle, indent=2, sort_keys=True)

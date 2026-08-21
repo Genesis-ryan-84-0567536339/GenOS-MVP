@@ -416,7 +416,7 @@ class NativeProvisioner:
                 "product_api": f"http://127.0.0.1:{PRODUCT_API_PORT}/health",
                 "runtime": f"http://127.0.0.1:{RUNTIME_PORT}/health",
                 "mission_control_health": f"http://127.0.0.1:{MISSION_CONTROL_PORT}/health",
-                "mission_control_ui": "NOT_IMPLEMENTED_BEFORE_MVP_08_VISUAL_APPROVAL",
+                "mission_control_ui": "READY",
                 "worker": "/var/lib/genos/worker/heartbeat.json",
                 "mcp_hub": f"http://127.0.0.1:{int(Path('/etc/genos/mcp-port').read_text(encoding='utf-8').strip())}/mcp",
                 "mcp_protocol_version": "2026-07-28",

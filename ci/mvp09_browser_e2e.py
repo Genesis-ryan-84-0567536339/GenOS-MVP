@@ -204,7 +204,7 @@ def main() -> int:
             page.locator("#new-card-title").fill("Browser fixture card")
             page.locator("#new-card-description").fill("Created through typed Product API fixture")
             page.locator("#new-card-form button[type=submit]").click()
-            page.get_by_text("Browser fixture card", exact=True).wait_for()
+            page.get_by_role("heading", name="Browser fixture card", exact=True).wait_for()
 
             page.locator('#nav [data-route="agy"]').click()
             page.get_by_role("heading", name="Agy-gen Chat / Runtime", exact=True).wait_for()
