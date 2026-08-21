@@ -1,165 +1,4 @@
-name: MVP-10 Final Review Patch Gate
-
-on:
-  pull_request:
-
-permissions:
-  contents: write
-
-jobs:
-  final-review-patch:
-    runs-on: ubuntu-latest
-    timeout-minutes: 12
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: plan/mvp-10-cloudflare-edge
-          fetch-depth: 0
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - name: Apply DNS ownership and package-source fixes
-        shell: python
-        run: |
-          from pathlib import Path
-
-          p = Path('src/genos/edge_cli.py')
-          s = p.read_text(encoding='utf-8')
-          assert 'https://pkg.cloudflare.com/cloudflared noble main' in s
-          p.write_text(s.replace('https://pkg.cloudflare.com/cloudflared noble main', 'https://pkg.cloudflare.com/cloudflared any main'), encoding='utf-8')
-
-          p = Path('src/genos/edge.py')
-          s = p.read_text(encoding='utf-8')
-          old = '''    def upsert_dns_cname(self, *, zone_id: str, hostname: str, tunnel_id: str) -> dict[str, Any]:
-'''
-          new = '''    def upsert_dns_cname(
-        self,
-        *,
-        zone_id: str,
-        hostname: str,
-        tunnel_id: str,
-        expected_record_id: str | None = None,
-    ) -> dict[str, Any]:
-'''
-          assert old in s
-          s = s.replace(old, new)
-          old = '''        if rows:
-            record_id = str(rows[0].get("id") or "") if isinstance(rows[0], dict) else ""
-            if not record_id:
-                raise EdgeRemoteError("Cloudflare DNS record response is invalid")
-            payload = self._request("PUT", f"/zones/{zone_id}/dns_records/{record_id}", body)
-        else:
-            payload = self._request("POST", f"/zones/{zone_id}/dns_records", body)
-'''
-          new = '''        if rows:
-            if not expected_record_id:
-                raise EdgeConflict("hostname already has a CNAME not owned by this GenOS instance")
-            matches = [
-                row
-                for row in rows
-                if isinstance(row, dict) and str(row.get("id") or "") == expected_record_id
-            ]
-            if len(matches) != 1:
-                raise EdgeConflict("GenOS-managed DNS record identity no longer matches provider state")
-            payload = self._request("PUT", f"/zones/{zone_id}/dns_records/{expected_record_id}", body)
-        else:
-            if expected_record_id:
-                raise EdgeConflict("GenOS-managed DNS record is missing; refusing blind replacement")
-            payload = self._request("POST", f"/zones/{zone_id}/dns_records", body)
-'''
-          assert old in s
-          s = s.replace(old, new)
-          old = '''            dns = client.upsert_dns_cname(zone_id=clean_zone, hostname=clean_host, tunnel_id=tunnel_id)
-'''
-          new = '''            dns = client.upsert_dns_cname(
-                zone_id=clean_zone,
-                hostname=clean_host,
-                tunnel_id=tunnel_id,
-                expected_record_id=(
-                    str(previous.get("dns_record_id") or "")
-                    if previous.get("hostname") == clean_host and previous.get("dns_record_id")
-                    else None
-                ),
-            )
-'''
-          assert old in s
-          s = s.replace(old, new)
-          old = '''            client.upsert_dns_cname(zone_id=zone_id, hostname=hostname, tunnel_id=tunnel_id)
-'''
-          new = '''            client.upsert_dns_cname(
-                zone_id=zone_id,
-                hostname=hostname,
-                tunnel_id=tunnel_id,
-                expected_record_id=str(previous.get("dns_record_id") or "") or None,
-            )
-'''
-          assert old in s
-          s = s.replace(old, new)
-          p.write_text(s, encoding='utf-8')
-
-          p = Path('tests/test_mvp10.py')
-          s = p.read_text(encoding='utf-8')
-          old_import = 'from genos.edge import EdgeBindingStore, EdgeRemoteError, EdgeService, normalize_hostname'
-          new_import = 'from genos.edge import CloudflareAPI, EdgeBindingStore, EdgeConflict, EdgeRemoteError, EdgeService, normalize_hostname'
-          assert old_import in s
-          s = s.replace(old_import, new_import)
-          old = '''    def upsert_dns_cname(self, *, zone_id: str, hostname: str, tunnel_id: str):
-        assert zone_id == ZONE and tunnel_id == self.tunnel_id
-        self.calls.append(("dns", hostname))
-        if hostname == self.fail_hostname:
-            raise EdgeRemoteError("fixture dns failure")
-        record_id = self.dns.setdefault(hostname, f"dns-{len(self.dns)+1}")
-        return {"id": record_id, "name": hostname, "content": f"{tunnel_id}.cfargotunnel.com"}
-'''
-          new = '''    def upsert_dns_cname(self, *, zone_id: str, hostname: str, tunnel_id: str, expected_record_id: str | None = None):
-        assert zone_id == ZONE and tunnel_id == self.tunnel_id
-        self.calls.append(("dns", hostname))
-        if hostname == self.fail_hostname:
-            raise EdgeRemoteError("fixture dns failure")
-        existing = self.dns.get(hostname)
-        if existing and expected_record_id != existing:
-            raise EdgeConflict("fixture ownership conflict")
-        if expected_record_id and existing != expected_record_id:
-            raise EdgeConflict("fixture managed record missing")
-        record_id = existing or f"dns-{len(self.dns)+1}"
-        self.dns[hostname] = record_id
-        return {"id": record_id, "name": hostname, "content": f"{tunnel_id}.cfargotunnel.com"}
-'''
-          assert old in s
-          s = s.replace(old, new)
-          marker = '''    def test_hostname_validation_rejects_urls_and_paths(self):
-'''
-          addition = '''    def test_cloudflare_adapter_refuses_unowned_existing_cname(self):
-        api = CloudflareAPI("fixture-api-token")
-        calls = []
-        def request(method, path, body=None):
-            calls.append((method, path, body))
-            if method == "GET":
-                return {"success": True, "result": [{"id": "foreign-record", "name": "occupied.example.test", "content": "other.example.test"}]}
-            raise AssertionError("mutation must not occur for an unowned CNAME")
-        api._request = request  # type: ignore[method-assign]
-        with self.assertRaises(EdgeConflict):
-            api.upsert_dns_cname(zone_id=ZONE, hostname="occupied.example.test", tunnel_id="11111111-2222-4333-8444-555555555555")
-        self.assertEqual([item[0] for item in calls], ["GET"])
-
-'''
-          assert marker in s
-          s = s.replace(marker, addition + marker)
-          p.write_text(s, encoding='utf-8')
-
-      - name: Verify patched product
-        run: |
-          python -m pip install --disable-pip-version-check -e .
-          python -m unittest -v tests.test_mvp10
-          python -m py_compile src/genos/edge.py src/genos/edge_runtime.py src/genos/edge_cli.py
-          grep -q 'pkg.cloudflare.com/cloudflared any main' src/genos/edge_cli.py
-
-      - name: Restore normal contract workflow and remove temporary helper
-        shell: python
-        run: |
-          from pathlib import Path
-          expr = '$' + '{{ github.event.pull_request.head.sha || github.sha }}'
-          final = '''name: MVP-10 Cloudflare Guided Edge Contract
+name: MVP-10 Cloudflare Guided Edge Contract
 
 on:
   pull_request:
@@ -177,14 +16,14 @@ jobs:
       - name: Checkout exact reviewed head
         uses: actions/checkout@v4
         with:
-          ref: __EXPR__
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           fetch-depth: 1
           persist-credentials: false
       - name: Verify exact checkout
         shell: bash
         run: |
           set -euo pipefail
-          expected_sha="__EXPR__"
+          expected_sha="${{ github.event.pull_request.head.sha || github.sha }}"
           tested_sha="$(git rev-parse HEAD)"
           echo "tested_sha=${tested_sha}"
           test "${tested_sha}" = "${expected_sha}"
@@ -206,20 +45,8 @@ jobs:
           grep -q 'env.pop("TUNNEL_TOKEN"' src/genos/edge_runtime.py
           grep -q 'pkg.cloudflare.com/cloudflared any main' src/genos/edge_cli.py
           grep -q 'remote_resources_deleted.*False' src/genos/edge.py
+          grep -q 'GenOS-managed DNS record' src/genos/edge.py
           grep -q 'genos-edge = "genos.edge_cli:main"' pyproject.toml
-          ! grep -R -E 'shell=True|os\\.system\\(' src/genos/edge.py src/genos/edge_runtime.py src/genos/edge_cli.py
+          ! grep -R -E 'shell=True|os\.system\(' src/genos/edge.py src/genos/edge_runtime.py src/genos/edge_cli.py
       - name: Compile edge modules
         run: python -m py_compile src/genos/edge.py src/genos/edge_runtime.py src/genos/edge_cli.py
-'''.replace('__EXPR__', expr)
-          Path('.github/workflows/mvp10-cloudflare-edge.yml').write_text(final, encoding='utf-8')
-          helper = Path('.github/workflows/mvp10-final-review-fix-once.yml')
-          if helper.exists():
-              helper.unlink()
-
-      - name: Commit reviewed fixes
-        run: |
-          git config user.name 'Genesis PLAN'
-          git config user.email 'genesis.corp.os@gmail.com'
-          git add -A
-          git commit -m 'fix(mvp10): protect DNS ownership and align Cloudflare repo'
-          git push origin HEAD:plan/mvp-10-cloudflare-edge
