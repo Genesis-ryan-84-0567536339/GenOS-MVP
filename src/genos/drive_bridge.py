@@ -233,6 +233,8 @@ class DriveConnectionService:
             "kanban_folder_id": _optional_text(base.get("kanban_folder_id")),
             "index_file_id": _optional_text(base.get("index_file_id")),
             "protocol_file_id": _optional_text(base.get("protocol_file_id")),
+            "report_markdown_file_id": _optional_text(base.get("report_markdown_file_id")),
+            "report_json_file_id": _optional_text(base.get("report_json_file_id")),
             "account_email": _optional_text(base.get("account_email")),
             "account_id": _optional_text(base.get("account_id")),
             "protocol_version": DRIVE_PROTOCOL_VERSION,
@@ -241,6 +243,10 @@ class DriveConnectionService:
             "last_report_fingerprint": _optional_text(base.get("last_report_fingerprint")),
             "last_verified_at": _optional_text(base.get("last_verified_at")),
             "last_error_code": _optional_text(base.get("last_error_code")),
+            "mcp_grant_state": _optional_text(base.get("mcp_grant_state")),
+            "mcp_grant_agent_id": _optional_text(base.get("mcp_grant_agent_id")),
+            "mcp_grant_scope": _optional_text(base.get("mcp_grant_scope")),
+            "mcp_grant_checked_at": _optional_text(base.get("mcp_grant_checked_at")),
             "updated_at": _utc_now(),
         }
         payload.update(changes)
