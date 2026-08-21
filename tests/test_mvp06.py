@@ -5,8 +5,11 @@ import json
 import tempfile
 import unittest
 
+from genos.cli import build_parser
+from genos.contracts import SupportClass
 from genos.drive_bridge import DRIVE_CONSUMER_SCOPE, DriveConnectionService, DriveNeedsAction
 from genos.drive_store import DriveStoreError, _clean_payload
+from genos.observability import ObservabilityService
 from genos.report_bridge import DriveReportService
 from genos.state import JsonStateStore
 
@@ -96,7 +99,7 @@ class StubObservability:
     def snapshot(self):
         self.calls += 1
         return {
-            "schema_version": "1.1",
+            "schema_version": "1.2",
             "authority": "genos-observability-v1",
             "read_only": True,
             "generated_at": f"2026-08-21T00:00:0{self.calls}Z",
@@ -163,6 +166,73 @@ class DriveConnectionTests(unittest.TestCase):
     def test_binding_payload_rejects_raw_secret_fields(self) -> None:
         with self.assertRaises(DriveStoreError):
             _clean_payload({"instance_id": INSTANCE_ID, "state": "READY", "access_token": RAW_TOKEN})
+
+
+class DriveObservabilityTests(unittest.TestCase):
+    def test_ready_drive_binding_is_projected_from_read_only_binding_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "manifest.json").write_text("{}\n", encoding="utf-8")
+            calls = []
+
+            def baseline(_cwd):
+                return [], SupportClass.SUPPORTED, "fixture"
+
+            def binding_reader():
+                calls.append("read")
+                return {
+                    "state": "READY",
+                    "account_email": "owner@example.test",
+                    "root_folder_id": "folder-1",
+                    "protocol_version": "1.0",
+                    "last_verified_at": "2026-08-21T01:00:00Z",
+                    "last_report_fingerprint": "sha256:fixture",
+                }
+
+            snapshot = ObservabilityService(
+                state_root=root,
+                baseline_collector=baseline,
+                drive_binding_reader=binding_reader,
+            ).snapshot()
+            drive = next(item for item in snapshot["observations"] if item["check_id"] == "drive")
+            self.assertEqual(drive["state"], "PASS")
+            self.assertEqual(drive["observed"]["state"], "READY")
+            self.assertEqual(drive["source"], "Product DB drive_binding read-only")
+            self.assertEqual(calls, ["read"])
+            self.assertIn("drive", snapshot["sections"]["integrations"])
+
+    def test_uninstalled_host_does_not_touch_drive_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            touched = []
+
+            def baseline(_cwd):
+                return [], SupportClass.SUPPORTED, "fixture"
+
+            def forbidden_reader():
+                touched.append(True)
+                raise AssertionError("uninstalled host must not query Drive binding")
+
+            snapshot = ObservabilityService(
+                state_root=Path(temp),
+                baseline_collector=baseline,
+                drive_binding_reader=forbidden_reader,
+            ).snapshot()
+            drive = next(item for item in snapshot["observations"] if item["check_id"] == "drive")
+            self.assertEqual(drive["state"], "NOT_INSTALLED")
+            self.assertEqual(touched, [])
+
+
+class DriveCliContractTests(unittest.TestCase):
+    def test_drive_connect_requires_typed_secretref_id(self) -> None:
+        args = build_parser().parse_args(["drive", "connect", "--secret-id", SECRET_ID, "--json"])
+        self.assertEqual(args.command, "drive")
+        self.assertEqual(args.drive_command, "connect")
+        self.assertEqual(args.secret_id, SECRET_ID)
+
+    def test_scheduled_report_is_explicit(self) -> None:
+        args = build_parser().parse_args(["report", "system", "--scheduled", "--json"])
+        self.assertEqual(args.command, "report")
+        self.assertTrue(args.scheduled)
 
 
 class ReportBridgeTests(unittest.TestCase):
