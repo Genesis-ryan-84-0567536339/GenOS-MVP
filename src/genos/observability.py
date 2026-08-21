@@ -11,6 +11,8 @@ from typing import Any, Callable
 from .agent_cli_update import AntigravityCliManager
 from .agent_runtime import AgentRuntimeError, AgentRuntimeStore
 from .contracts import Observation, ObservationState, SupportClass, utc_now
+from .drive_store import DriveStoreError, PostgresDriveMetadataStore
+from .product_store import PostgresProductStore, ProductStoreError
 from .recon import collect_all
 from .redaction import redact
 
@@ -24,10 +26,10 @@ GENOS_SERVICES: dict[str, str] = {
 }
 _FUTURE_SURFACES: dict[str, str] = {
     "mcp": "MVP-06_or_later",
-    "drive": "MVP-06",
     "tunnel": "MVP-10",
 }
 BaselineCollector = Callable[[str | None], tuple[list[Observation], SupportClass, str]]
+DriveBindingReader = Callable[[], dict[str, Any] | None]
 
 
 class ObservabilityService:
@@ -38,9 +40,11 @@ class ObservabilityService:
         *,
         state_root: Path | str = DEFAULT_STATE_ROOT,
         baseline_collector: BaselineCollector = collect_all,
+        drive_binding_reader: DriveBindingReader | None = None,
     ) -> None:
         self.state_root = Path(state_root)
         self.baseline_collector = baseline_collector
+        self.drive_binding_reader = drive_binding_reader or self._read_drive_binding
 
     def snapshot(self, *, cwd: str | None = None) -> dict[str, Any]:
         baseline, support_class, support_reason = self.baseline_collector(cwd)
@@ -56,13 +60,14 @@ class ObservabilityService:
                 self._agent_observation(),
                 self._provider_observation(),
                 self._provider_cli_update_observation(),
+                self._drive_observation(),
                 *self._future_surface_observations(),
             ]
         )
         generated_at = utc_now()
         return redact(
             {
-                "schema_version": "1.1",
+                "schema_version": "1.2",
                 "authority": "genos-observability-v1",
                 "read_only": True,
                 "generated_at": generated_at,
@@ -361,6 +366,72 @@ class ObservabilityService:
             expected={"provider_cli": "antigravity", "policy": "stable/6h/idle-only/atomic-rollback"},
             source=str(root / "update-state.json"),
         )
+
+    def _drive_observation(self) -> Observation:
+        if not self._installed():
+            return Observation(
+                "drive",
+                ObservationState.NOT_INSTALLED,
+                observed={"configured": False, "state": "NOT_CONFIGURED"},
+                expected={"available_after_package": "MVP-06"},
+                source="Product DB drive_binding read-only",
+            )
+        try:
+            binding = self.drive_binding_reader()
+        except (ProductStoreError, DriveStoreError, OSError, ValueError):
+            return Observation(
+                "drive",
+                ObservationState.UNKNOWN,
+                observed={"configured": None, "state": "UNKNOWN"},
+                source="Product DB drive_binding read-only",
+                remediation="Use typed Drive status/verify; Doctor does not mutate Drive state.",
+            )
+        if binding is None:
+            return Observation(
+                "drive",
+                ObservationState.WARN,
+                observed={"configured": False, "state": "UNCONFIGURED"},
+                source="Product DB drive_binding read-only",
+            )
+        drive_state = str(binding.get("state") or "UNKNOWN")
+        if drive_state == "READY":
+            state = ObservationState.PASS
+        elif drive_state == "DEGRADED":
+            state = ObservationState.FAIL
+        elif drive_state in {
+            "UNCONFIGURED",
+            "NEEDS_AUTH",
+            "AUTHENTICATED",
+            "FOLDER_BOUND",
+            "WRITE_VERIFIED",
+            "READ_VERIFIED",
+            "INSTANCE_BOUND",
+            "NEEDS_ACTION",
+        }:
+            state = ObservationState.WARN
+        else:
+            state = ObservationState.UNKNOWN
+        return Observation(
+            "drive",
+            state,
+            observed={
+                "configured": drive_state == "READY",
+                "state": drive_state,
+                "account_email": binding.get("account_email"),
+                "root_folder_id": binding.get("root_folder_id"),
+                "protocol_version": binding.get("protocol_version"),
+                "last_verified_at": binding.get("last_verified_at"),
+                "last_error_code": binding.get("last_error_code"),
+                "last_report_fingerprint": binding.get("last_report_fingerprint"),
+            },
+            expected={"state": "READY", "authority": "local-product-store", "remote_role": "collaboration-replica"},
+            source="Product DB drive_binding read-only",
+            remediation="Use typed Drive connect/verify; never repair by blind credential recreation.",
+        )
+
+    def _read_drive_binding(self) -> dict[str, Any] | None:
+        # Deliberately no ensure_schema(): Doctor/observability stays read-only.
+        return PostgresDriveMetadataStore(PostgresProductStore()).get_drive_binding()
 
     def _future_surface_observations(self) -> list[Observation]:
         return [
