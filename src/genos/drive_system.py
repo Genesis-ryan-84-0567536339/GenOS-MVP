@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
+from typing import Any
 import uuid
 
 from .auth_service import CredentialService
@@ -24,6 +25,17 @@ class DriveSystemServices:
     connection: DriveConnectionService
     reports: DriveReportService
     metadata: PostgresDriveMetadataStore
+
+    def connect(self, *, secret_id: str, root_name: str = "GenOS") -> dict[str, Any]:
+        drive = self.connection.connect(secret_id=secret_id, root_name=root_name)
+        initial_report = self.reports.publish(manual=True)
+        return {"state": drive.get("state", "UNKNOWN"), "drive": drive, "initial_report": initial_report}
+
+    def scheduled_scan(self) -> dict[str, Any]:
+        status = self.connection.status()
+        if status.get("state") != "READY":
+            return {"state": "NOT_CONFIGURED", "remote_write": False}
+        return self.reports.publish(manual=False)
 
 
 def build_drive_system(
