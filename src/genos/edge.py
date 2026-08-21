@@ -15,7 +15,6 @@ import urllib.request
 import uuid
 
 from .auth_service import CredentialService
-from .redaction import redact
 
 
 EDGE_API_SCOPE = "cloudflare-edge-api"
@@ -68,6 +67,15 @@ def normalize_hostname(value: str) -> str:
     return ascii_name
 
 
+def _secretref_uuid(value: Any, *, field: str) -> str | None:
+    if value in {None, ""}:
+        return None
+    try:
+        return str(uuid.UUID(str(value)))
+    except ValueError as exc:
+        raise EdgeError(f"invalid {field}") from exc
+
+
 class EdgeBindingStore:
     """Durable non-secret edge binding metadata.
 
@@ -94,6 +102,22 @@ class EdgeBindingStore:
         "last_error_code",
         "updated_at",
         "rollback",
+    }
+    _ROLLBACK_ALLOWED = {
+        "state",
+        "mode",
+        "hostname",
+        "account_id",
+        "zone_id",
+        "api_secret_id",
+        "tunnel_id",
+        "tunnel_secret_id",
+        "dns_record_id",
+        "origin",
+        "tunnel_state",
+        "public_state",
+        "last_verified_at",
+        "last_error_code",
     }
 
     def __init__(self, root: str | os.PathLike[str] = "/var/lib/genos") -> None:
@@ -125,10 +149,16 @@ class EdgeBindingStore:
         if unknown:
             raise EdgeError("unsupported edge metadata key")
         normalized = self._public(payload)
+        normalized["api_secret_id"] = _secretref_uuid(normalized.get("api_secret_id"), field="api_secret_id")
+        normalized["tunnel_secret_id"] = _secretref_uuid(normalized.get("tunnel_secret_id"), field="tunnel_secret_id")
+        rollback = normalized.get("rollback")
+        if isinstance(rollback, dict):
+            rollback["api_secret_id"] = _secretref_uuid(rollback.get("api_secret_id"), field="rollback api_secret_id")
+            rollback["tunnel_secret_id"] = _secretref_uuid(rollback.get("tunnel_secret_id"), field="rollback tunnel_secret_id")
         normalized["schema_version"] = "1.0"
         normalized["updated_at"] = _utc_now()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        serialized = json.dumps(redact(normalized), ensure_ascii=False, sort_keys=True, indent=2) + "\n"
+        serialized = json.dumps(normalized, ensure_ascii=False, sort_keys=True, indent=2) + "\n"
         fd, temp_name = tempfile.mkstemp(prefix=".binding.", dir=str(self.path.parent), text=True)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -143,7 +173,20 @@ class EdgeBindingStore:
         return normalized
 
     def _public(self, payload: dict[str, Any]) -> dict[str, Any]:
-        return redact({key: payload.get(key) for key in self._ALLOWED if key in payload})
+        # The strict allowlist is the sanitizer here. SecretRef UUIDs are safe
+        # identifiers and must remain visible so typed consumers can resolve the
+        # actual material through SecretProvider. No raw credential field is
+        # accepted by this store.
+        result = {key: payload.get(key) for key in self._ALLOWED if key in payload}
+        rollback = result.get("rollback")
+        if rollback is not None:
+            if not isinstance(rollback, dict):
+                raise EdgeError("edge rollback metadata is invalid")
+            nested_unknown = set(rollback) - self._ROLLBACK_ALLOWED
+            if nested_unknown:
+                raise EdgeError("unsupported edge rollback metadata key")
+            result["rollback"] = {key: rollback.get(key) for key in self._ROLLBACK_ALLOWED if key in rollback}
+        return result
 
 
 class CloudflareAPI:
@@ -274,7 +317,8 @@ class PublicEdgeProbe:
             protected_request = urllib.request.Request(f"https://{clean}/api/v1/auth/me", method="GET")
             protected_status = 0
             try:
-                urllib.request.urlopen(protected_request, timeout=15, context=context)  # noqa: S310
+                with urllib.request.urlopen(protected_request, timeout=15, context=context):  # noqa: S310
+                    protected_status = 200
             except urllib.error.HTTPError as exc:
                 protected_status = exc.code
                 exc.close()
@@ -325,10 +369,13 @@ class EdgeService:
         clean_account = normalize_cloudflare_id(account_id, field="account_id")
         clean_zone = normalize_cloudflare_id(zone_id, field="zone_id")
         clean_host = normalize_hostname(hostname)
+        clean_api_secret_id = _secretref_uuid(api_secret_id, field="api_secret_id")
+        if clean_api_secret_id is None:
+            raise EdgeNeedsAction("Cloudflare API SecretRef is required")
         previous = self.store.get()
-        raw_api_token = self.credentials.get_secret_for_consumer(api_secret_id, consumer=EDGE_API_SCOPE)
+        raw_api_token = self.credentials.get_secret_for_consumer(clean_api_secret_id, consumer=EDGE_API_SCOPE)
         client = self.client_factory(raw_api_token)
-        tunnel_id = str(previous.get("tunnel_id") or "") if previous.get("api_secret_id") == api_secret_id else ""
+        tunnel_id = str(previous.get("tunnel_id") or "") if previous.get("api_secret_id") == clean_api_secret_id else ""
         created = False
         if not tunnel_id:
             tunnel = client.create_tunnel(account_id=clean_account, name=_bounded_tunnel_name(tunnel_name))
@@ -342,7 +389,20 @@ class EdgeService:
             tunnel_secret_id = self._persist_tunnel_token(previous, tunnel_id=tunnel_id, tunnel_token=tunnel_token)
         except Exception as exc:
             if previous.get("mode") == "DOMAIN" and previous.get("tunnel_id"):
-                self._rollback_remote(previous, client)
+                try:
+                    old_secret_id = _secretref_uuid(previous.get("api_secret_id"), field="previous api_secret_id")
+                    if old_secret_id is None:
+                        raise EdgeNeedsAction("previous Cloudflare API SecretRef is unavailable")
+                    old_raw_token = self.credentials.get_secret_for_consumer(old_secret_id, consumer=EDGE_API_SCOPE)
+                    rollback_client = self.client_factory(old_raw_token)
+                    self._rollback_remote(previous, rollback_client)
+                except Exception as rollback_exc:
+                    preserved = dict(previous)
+                    preserved["last_error_code"] = "RECONFIGURE_ROLLBACK_NEEDS_ACTION"
+                    self.store.save(_filter_store(preserved))
+                    raise EdgeRemoteError(
+                        "Cloudflare rollback could not restore the previous route; local mode remains available"
+                    ) from rollback_exc
                 restored = dict(previous)
                 restored["last_error_code"] = "RECONFIGURE_ROLLED_BACK"
                 self.store.save(_filter_store(restored))
@@ -352,7 +412,13 @@ class EdgeService:
                         "schema_version": "1.0",
                         "state": "NEEDS_ACTION",
                         "mode": "LOCAL",
+                        "account_id": clean_account,
+                        "zone_id": clean_zone,
+                        "api_secret_id": clean_api_secret_id,
+                        "tunnel_id": tunnel_id,
                         "origin": MISSION_CONTROL_ORIGIN,
+                        "tunnel_state": "REMOTE_RESOURCE_PRESERVED",
+                        "public_state": "NOT_CONFIGURED",
                         "last_error_code": "EDGE_CONFIGURE_FAILED_EXTERNAL_TUNNEL_PRESERVED",
                     }
                 )
@@ -366,7 +432,7 @@ class EdgeService:
             "hostname": clean_host,
             "account_id": clean_account,
             "zone_id": clean_zone,
-            "api_secret_id": api_secret_id,
+            "api_secret_id": clean_api_secret_id,
             "tunnel_id": tunnel_id,
             "tunnel_secret_id": tunnel_secret_id,
             "dns_record_id": str(dns.get("id") or ""),
@@ -382,7 +448,10 @@ class EdgeService:
         current = self.store.get()
         if current.get("mode") != "DOMAIN" or not current.get("tunnel_id"):
             return {**current, "state": "LOCAL_ONLY", "verified": True, "remote_write": False}
-        raw_api_token = self.credentials.get_secret_for_consumer(str(current["api_secret_id"]), consumer=EDGE_API_SCOPE)
+        api_secret_id = _secretref_uuid(current.get("api_secret_id"), field="api_secret_id")
+        if api_secret_id is None:
+            raise EdgeNeedsAction("Cloudflare API SecretRef is unavailable")
+        raw_api_token = self.credentials.get_secret_for_consumer(api_secret_id, consumer=EDGE_API_SCOPE)
         client = self.client_factory(raw_api_token)
         tunnel = client.tunnel_status(account_id=str(current["account_id"]), tunnel_id=str(current["tunnel_id"]))
         tunnel_state = str(tunnel.get("status") or "UNKNOWN").upper()
@@ -425,7 +494,10 @@ class EdgeService:
         rollback = current.get("rollback") if isinstance(current.get("rollback"), dict) else None
         if not rollback:
             raise EdgeConflict("no previous edge configuration is available")
-        raw_api_token = self.credentials.get_secret_for_consumer(str(rollback["api_secret_id"]), consumer=EDGE_API_SCOPE)
+        api_secret_id = _secretref_uuid(rollback.get("api_secret_id"), field="rollback api_secret_id")
+        if api_secret_id is None:
+            raise EdgeNeedsAction("previous Cloudflare API SecretRef is unavailable")
+        raw_api_token = self.credentials.get_secret_for_consumer(api_secret_id, consumer=EDGE_API_SCOPE)
         client = self.client_factory(raw_api_token)
         self._rollback_remote(rollback, client)
         restored = dict(rollback)
@@ -485,22 +557,7 @@ def _bounded_tunnel_name(value: str) -> str:
 def _rollback_projection(payload: dict[str, Any]) -> dict[str, Any] | None:
     if payload.get("mode") != "DOMAIN" or not payload.get("hostname"):
         return None
-    allowed = {
-        "state",
-        "mode",
-        "hostname",
-        "account_id",
-        "zone_id",
-        "api_secret_id",
-        "tunnel_id",
-        "tunnel_secret_id",
-        "dns_record_id",
-        "origin",
-        "tunnel_state",
-        "public_state",
-        "last_verified_at",
-        "last_error_code",
-    }
+    allowed = EdgeBindingStore._ROLLBACK_ALLOWED
     return {key: payload.get(key) for key in allowed if key in payload}
 
 
