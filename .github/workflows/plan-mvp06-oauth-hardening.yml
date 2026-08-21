@@ -1,0 +1,80 @@
+name: PLAN MVP-06 OAuth Hardening
+
+on:
+  pull_request:
+    types: [synchronize, reopened]
+    paths:
+      - '.github/workflows/plan-mvp06-oauth-hardening.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  harden:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 1
+      - name: Apply reviewed OAuth lifecycle hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          oauth_path = Path('src/genos/drive_oauth.py')
+          oauth = oauth_path.read_text(encoding='utf-8')
+          old_config = '''        if not client_id and not client_secret:\n            return None\n        if not client_id or not client_secret:\n            raise DriveNeedsAction("Google Drive OAuth application configuration is incomplete")\n'''
+          new_config = '''        if not client_id or not client_secret:\n            # Distribution configuration is optional until Drive is used. A\n            # partial config must not take down the rest of Product API; the\n            # Drive OAuth surface truthfully projects NOT_CONFIGURED instead.\n            return None\n'''
+          if oauth.count(old_config) != 1:
+              raise SystemExit('unexpected OAuth config block')
+          oauth = oauth.replace(old_config, new_config)
+
+          start = oauth.index('    def poll(self) -> dict[str, Any]:\n')
+          end = oauth.index('    def clear(self, *, state: str = "DISCONNECTED"', start)
+          new_poll = '''    def poll(self) -> dict[str, Any]:\n        config = self._require_config()\n        # One device code must have exactly one in-flight poll inside this\n        # process. RLock keeps concurrent HTTP/CLI callers from consuming the\n        # same successful grant twice and creating duplicate SecretRefs.\n        with self._lock:\n            self._expire_if_needed()\n            session = self._session\n            if session is None:\n                if self._last.state in {"AUTHORIZED", "DENIED", "EXPIRED"}:\n                    return self._last.to_dict()\n                raise DriveNeedsAction("Google Drive authorization has not been started")\n            now = self.clock()\n            if now < session.next_poll_monotonic:\n                retry = max(1, int(session.next_poll_monotonic - now + 0.999))\n                self._last = _replace_projection(session.projection, retry_after_seconds=retry)\n                session.projection = self._last\n                return self._last.to_dict()\n            try:\n                token_payload = self.device_poll(config, session.device_code)\n            except _AuthorizationPending:\n                return self._continue_waiting(slow_down=False)\n            except _SlowDown:\n                return self._continue_waiting(slow_down=True)\n            except _AccessDenied:\n                return self._terminal("DENIED", "USER_DENIED")\n            except _AuthorizationExpired:\n                return self._terminal("EXPIRED", "AUTHORIZATION_EXPIRED")\n\n            access_token = _checked_secret(token_payload.get("access_token"), "access token")\n            refresh_token = _checked_secret(token_payload.get("refresh_token"), "refresh token")\n            token_type = _checked_public_text(token_payload.get("token_type", "Bearer"), "token type", max_length=32)\n            if token_type.lower() != "bearer":\n                raise DriveNeedsAction("Google Drive authorization returned an unsupported token type")\n            granted = str(token_payload.get("scope") or "").split()\n            if GOOGLE_DRIVE_FILE_SCOPE not in granted:\n                raise DriveNeedsAction("Google Drive authorization did not grant the required drive.file scope")\n            if not access_token:\n                raise DriveNeedsAction("Google Drive authorization did not return a usable access token")\n            bundle = json.dumps(\n                {\n                    "client_id": config.client_id,\n                    "client_secret": config.client_secret,\n                    "refresh_token": refresh_token,\n                },\n                ensure_ascii=False,\n                sort_keys=True,\n                separators=(",", ":"),\n            )\n            try:\n                credential = self.credentials.add(\n                    name=f"google-drive-{uuid.uuid4().hex[:12]}",\n                    provider_name="google-drive",\n                    raw_secret=bundle,\n                    consumer_scopes=[DRIVE_CONSUMER_SCOPE],\n                    source="google-device-oauth",\n                )\n            except Exception:\n                self._session = None\n                self._last = GoogleDeviceAuthorizationProjection(\n                    state="NEEDS_ACTION",\n                    reason="CREDENTIAL_PERSISTENCE_FAILED",\n                )\n                raise\n            secret_id = str(credential["secret_id"])\n            root_name = session.projection.root_name or "GenOS"\n            self._session = None\n            self._last = GoogleDeviceAuthorizationProjection(\n                state="AUTHORIZED",\n                secret_id=secret_id,\n                root_name=root_name,\n            )\n            return self._last.to_dict()\n\n'''
+          oauth = oauth[:start] + new_poll + oauth[end:]
+
+          old_request = '''def request_google_device_authorization(config: GoogleOAuthClientConfig) -> dict[str, Any]:\n    fields = {"client_id": config.client_id, "scope": config.scope}\n    return _post_google_json(GOOGLE_DEVICE_ENDPOINT, fields, max_bytes=MAX_DEVICE_RESPONSE_BYTES, purpose="device authorization")\n'''
+          new_request = '''def request_google_device_authorization(config: GoogleOAuthClientConfig) -> dict[str, Any]:\n    fields = {"client_id": config.client_id, "scope": config.scope}\n    try:\n        return _post_google_json(\n            GOOGLE_DEVICE_ENDPOINT,\n            fields,\n            max_bytes=MAX_DEVICE_RESPONSE_BYTES,\n            purpose="device authorization",\n        )\n    except _GoogleOAuthResponseError as exc:\n        if exc.error in {"admin_policy_enforced", "invalid_client", "org_internal"}:\n            raise DriveNeedsAction("Google Drive OAuth application requires configuration or policy action") from exc\n        raise DriveNeedsAction("Google Drive device authorization was rejected") from exc\n'''
+          if oauth.count(old_request) != 1:
+              raise SystemExit('unexpected device request function')
+          oauth = oauth.replace(old_request, new_request)
+          oauth_path.write_text(oauth, encoding='utf-8')
+
+          system_path = Path('src/genos/drive_system.py')
+          system = system_path.read_text(encoding='utf-8')
+          old_start = '''    def oauth_start(self, *, root_name: str = "GenOS") -> dict[str, Any]:\n        return self._oauth().start(root_name=root_name)\n'''
+          new_start = '''    def oauth_start(self, *, root_name: str = "GenOS") -> dict[str, Any]:\n        current = self.connection.status()\n        if current.get("state") == "READY":\n            raise DriveNeedsAction("Drive is already connected; use explicit reauthorize to change Google account")\n        return self._oauth().start(root_name=root_name)\n'''
+          if system.count(old_start) != 1:
+              raise SystemExit('unexpected oauth_start block')
+          system = system.replace(old_start, new_start)
+          old_reconnect = '''        if state == "DEGRADED" and secret_id:\n            return self.connect(secret_id=secret_id, root_name=selected_root)\n        return self.oauth_start(root_name=selected_root)\n'''
+          new_reconnect = '''        if state == "DEGRADED" and secret_id:\n            return self.connect(secret_id=secret_id, root_name=selected_root)\n        if state == "NEEDS_ACTION" and secret_id:\n            return self.reauthorize(root_name=selected_root)\n        return self.oauth_start(root_name=selected_root)\n'''
+          if system.count(old_reconnect) != 1:
+              raise SystemExit('unexpected reconnect block')
+          system_path.write_text(system.replace(old_reconnect, new_reconnect), encoding='utf-8')
+
+          test_path = Path('tests/test_mvp06_oauth.py')
+          tests = test_path.read_text(encoding='utf-8')
+          partial_anchor = '        self.assertIsNone(GoogleOAuthClientConfig.from_environment({"IGNORED": "1"}))\n'
+          partial_insert = partial_anchor + '''        self.assertIsNone(\n            GoogleOAuthClientConfig.from_environment({"GENOS_GOOGLE_DRIVE_OAUTH_CLIENT_ID": CLIENT_ID})\n        )\n'''
+          if tests.count(partial_anchor) != 1:
+              raise SystemExit('unexpected config test anchor')
+          tests = tests.replace(partial_anchor, partial_insert)
+          wiring_anchor = '''    def test_unconfigured_scheduled_scan_does_not_publish(self) -> None:\n'''
+          wiring_tests = '''    def test_authorize_requires_explicit_reauthorize_when_drive_is_ready(self) -> None:\n        services = DriveSystemServices(\n            connection=_StubConnection(state="READY", secret_id=SECRET_ID),\n            reports=_StubReports(),\n            metadata=_StubMetadata(),\n            oauth=_StubOAuth(),  # type: ignore[arg-type]\n        )\n        with self.assertRaises(DriveNeedsAction):\n            services.oauth_start()\n\n    def test_reconnect_needs_action_disables_old_secret_and_starts_new_user_authorization(self) -> None:\n        connection = _StubConnection(state="NEEDS_ACTION", secret_id=SECRET_ID)\n        credentials = _RecordingCredentials()\n        oauth = _StubOAuth()\n        services = DriveSystemServices(\n            connection=connection,\n            reports=_StubReports(),\n            metadata=_StubMetadata(),\n            oauth=oauth,  # type: ignore[arg-type]\n            credentials=credentials,  # type: ignore[arg-type]\n        )\n        result = services.reconnect()\n        self.assertEqual(result["state"], "WAITING_USER")\n        self.assertEqual(credentials.disabled, [SECRET_ID])\n        self.assertEqual(oauth.starts, ["GenOS"])\n\n'''
+          if tests.count(wiring_anchor) != 1:
+              raise SystemExit('unexpected wiring test anchor')
+          test_path.write_text(tests.replace(wiring_anchor, wiring_tests + wiring_anchor), encoding='utf-8')
+          PY
+          PYTHONPATH=src python3 -m compileall -q src/genos tests/test_mvp06_oauth.py
+          PYTHONPATH=src python3 -m unittest tests.test_mvp06_oauth -v
+          git config user.name 'PLAN MVP-06 OAuth Hardening'
+          git config user.email 'genesis.corp.os@gmail.com'
+          git add src/genos/drive_oauth.py src/genos/drive_system.py tests/test_mvp06_oauth.py
+          git commit -m 'fix(mvp06): harden user OAuth account-switch and polling lifecycle'
+          git push origin HEAD:${{ github.head_ref }}
