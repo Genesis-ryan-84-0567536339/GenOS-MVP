@@ -145,8 +145,36 @@ ssh_guest "$INSTALL_CMD" > "$WORK_DIR/install.json"
 FIRST_INSTANCE_ID="$(ssh_guest 'sudo cat /etc/genos/instance-id')"
 FIRST_BOOT_ID="$(ssh_guest 'cat /proc/sys/kernel/random/boot_id')"
 
+wait_for_core_services() {
+  local attempts=45
+  local interval_seconds=2
+  local units=(
+    postgresql.service
+    genos-product-api.service
+    genos-runtime.service
+    genos-worker.service
+    genos-mission-control.service
+  )
+
+  for _ in $(seq 1 "$attempts"); do
+    # systemctl returns success when any listed unit is active, so check each
+    # unit independently to prevent PostgreSQL masking a failed GenOS service.
+    if ssh_guest "for unit in ${units[*]}; do sudo systemctl is-active --quiet \"\$unit\" || exit 1; done" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep "$interval_seconds"
+  done
+
+  echo "GenOS core services did not become active within $((attempts * interval_seconds)) seconds" >&2
+  ssh_guest "sudo systemctl show --no-pager --property=Id,ActiveState,SubState,Result ${units[*]}" >&2 || true
+  return 1
+}
+
 verify_core() {
-  ssh_guest "sudo systemctl is-active postgresql.service genos-product-api.service genos-runtime.service genos-worker.service genos-mission-control.service" >/dev/null
+  # SSH can accept connections before systemd has completed service recovery
+  # after a reboot. Wait for the bounded product readiness condition instead of
+  # treating that normal boot window as a product failure.
+  wait_for_core_services
   ssh_guest "sudo python3 - <<'PY'
 import json, urllib.error, urllib.request
 for role, port in [('product-api',17880),('runtime',17881),('mission-control',17882)]:
