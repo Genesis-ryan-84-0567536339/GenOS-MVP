@@ -1,19 +1,22 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path
 from typing import Any
 import uuid
 
 from .auth_service import CredentialService
-from .drive_bridge import DriveConnectionService, DriveRemote
+from .contracts import utc_now
+from .drive_bridge import DriveConnectionService, DriveNeedsAction, DriveRemote
+from .drive_mcp import DriveMcpGrantProbe, OptionalDriveMcpGrantProbe
 from .drive_oauth import GoogleDriveRemoteFactory
 from .drive_store import PostgresDriveMetadataStore
 from .observability import ObservabilityService
 from .product_store import PostgresProductStore
 from .report_bridge import DriveReportService
+from .report_history import ReportHistoryStore
 from .secret_provider import LocalFileSecretProvider
 from .state import JsonStateStore
 
@@ -22,16 +25,77 @@ class DriveSystemError(RuntimeError):
     pass
 
 
+class HistoryAwareDriveReports:
+    def __init__(self, reports: DriveReportService, history: ReportHistoryStore) -> None:
+        self.reports = reports
+        self.history = history
+        self.remote_factory = reports.remote_factory
+
+    def publish(self, *, manual: bool = True) -> dict[str, Any]:
+        result = dict(self.reports.publish(manual=manual))
+        if result.get("state") == "PUBLISHED":
+            result["history"] = self.history.record(result, manual=manual)
+        elif result.get("state") == "NO_CHANGE":
+            result["history"] = {
+                "recorded": False,
+                "reason": "NO_CHANGE",
+                "diff": {
+                    "state": "UNCHANGED",
+                    "previous_fingerprint": result.get("fingerprint"),
+                    "current_fingerprint": result.get("fingerprint"),
+                },
+            }
+        return result
+
+
 @dataclass(frozen=True, slots=True)
 class DriveSystemServices:
     connection: DriveConnectionService
-    reports: DriveReportService
+    reports: HistoryAwareDriveReports
     metadata: PostgresDriveMetadataStore
+    mcp_grant_probe: DriveMcpGrantProbe = field(default_factory=OptionalDriveMcpGrantProbe)
 
     def connect(self, *, secret_id: str, root_name: str = "GenOS") -> dict[str, Any]:
         drive = self.connection.connect(secret_id=secret_id, root_name=root_name)
+        instance_id = _required_text(drive, "instance_id")
+        root_folder_id = _required_text(drive, "root_folder_id")
+        try:
+            mcp_grant = dict(self.mcp_grant_probe.test(instance_id=instance_id, root_folder_id=root_folder_id))
+        except Exception:
+            mcp_grant = {
+                "state": "UNKNOWN",
+                "configured": None,
+                "agent_id": "agy-gen",
+                "scope": "drive-collaboration-replica",
+                "credential_passthrough": False,
+                "reason": "MCP_GRANT_PROBE_UNAVAILABLE",
+            }
+        checkpoint = dict(drive)
+        checkpoint.update(
+            {
+                "state": "MCP_GRANT_TESTED",
+                "mcp_grant_state": str(mcp_grant.get("state") or "UNKNOWN"),
+                "mcp_grant_agent_id": _optional_text(mcp_grant.get("agent_id")),
+                "mcp_grant_scope": _optional_text(mcp_grant.get("scope")),
+                "mcp_grant_checked_at": utc_now(),
+            }
+        )
+        checkpoint = self.metadata.upsert_drive_binding(checkpoint)
+        if mcp_grant.get("configured") is True and mcp_grant.get("state") != "PASS":
+            blocked = dict(checkpoint)
+            blocked.update({"state": "NEEDS_ACTION", "last_error_code": "MCP_GRANT_TEST_FAILED"})
+            self.metadata.upsert_drive_binding(blocked)
+            raise DriveNeedsAction("Configured Drive MCP grant test failed")
+        ready = dict(checkpoint)
+        ready.update({"state": "READY", "last_error_code": None})
+        ready = self.metadata.upsert_drive_binding(ready)
         initial_report = self.reports.publish(manual=True)
-        return {"state": drive.get("state", "UNKNOWN"), "drive": drive, "initial_report": initial_report}
+        return {
+            "state": "READY",
+            "drive": ready,
+            "mcp_grant": mcp_grant,
+            "initial_report": initial_report,
+        }
 
     def scheduled_scan(self) -> dict[str, Any]:
         status = self.connection.status()
@@ -46,6 +110,7 @@ def build_drive_system(
     credentials: CredentialService | None = None,
     observability: ObservabilityService | None = None,
     remote_factory: Callable[[str], DriveRemote] | None = None,
+    mcp_grant_probe: DriveMcpGrantProbe | None = None,
 ) -> DriveSystemServices:
     store = product_store or PostgresProductStore()
     store.ensure_schema()
@@ -62,14 +127,20 @@ def build_drive_system(
         remote_factory=shared_remote_factory,
         instance_id=system_instance_id(),
     )
-    reports = DriveReportService(
+    report_service = DriveReportService(
         metadata_store=metadata,
         credentials=credentials,
         remote_factory=shared_remote_factory,
         observability=observability or ObservabilityService(state_root=state_root),
         jobs=JsonStateStore(state_root),
     )
-    return DriveSystemServices(connection=connection, reports=reports, metadata=metadata)
+    reports = HistoryAwareDriveReports(report_service, ReportHistoryStore(state_root))
+    return DriveSystemServices(
+        connection=connection,
+        reports=reports,
+        metadata=metadata,
+        mcp_grant_probe=mcp_grant_probe or OptionalDriveMcpGrantProbe(),
+    )
 
 
 def system_instance_id() -> str:
@@ -88,3 +159,14 @@ def system_instance_id() -> str:
         except ValueError:
             continue
     raise DriveSystemError("GenOS instance id is unavailable")
+
+
+def _required_text(payload: dict[str, Any], key: str) -> str:
+    value = payload.get(key)
+    if not isinstance(value, str) or not value:
+        raise DriveSystemError(f"Drive connection result is missing {key}")
+    return value
+
+
+def _optional_text(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None

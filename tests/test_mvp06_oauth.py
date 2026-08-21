@@ -72,7 +72,19 @@ class _StubConnection:
 
     def connect(self, *, secret_id: str, root_name: str = "GenOS"):
         self.connect_calls.append((secret_id, root_name))
-        return {"state": "READY", "root_folder_id": "root-fixture"}
+        return {
+            "state": "READY",
+            "instance_id": INSTANCE_ID,
+            "secret_id": secret_id,
+            "root_folder_id": "root-fixture",
+            "reports_folder_id": "reports-fixture",
+            "kanban_folder_id": "kanban-fixture",
+            "protocol_file_id": "protocol-fixture",
+            "index_file_id": "index-fixture",
+            "protocol_version": "1.0",
+            "schema_version": "1.0",
+            "last_error_code": None,
+        }
 
     def status(self):
         return {"state": self.state}
@@ -90,16 +102,30 @@ class _StubReports:
         return {"state": "PUBLISHED" if manual else "NO_CHANGE", "remote_write": manual}
 
 
+class _StubMetadata:
+    def __init__(self) -> None:
+        self.value = None
+        self.history = []
+
+    def upsert_drive_binding(self, payload):
+        self.value = dict(payload)
+        self.history.append(dict(payload))
+        return dict(payload)
+
+
 class DriveSystemWiringTests(unittest.TestCase):
     def test_connect_publishes_initial_report_and_scheduled_scan_uses_nonmanual_path(self) -> None:
         connection = _StubConnection()
         reports = _StubReports()
-        services = DriveSystemServices(connection=connection, reports=reports, metadata=object())  # type: ignore[arg-type]
+        metadata = _StubMetadata()
+        services = DriveSystemServices(connection=connection, reports=reports, metadata=metadata)  # type: ignore[arg-type]
         result = services.connect(secret_id=SECRET_ID, root_name="GenOS")
         self.assertEqual(result["state"], "READY")
+        self.assertEqual(result["mcp_grant"]["state"], "NOT_CONFIGURED")
         self.assertEqual(result["initial_report"]["state"], "PUBLISHED")
         self.assertEqual(connection.connect_calls, [(SECRET_ID, "GenOS")])
         self.assertEqual(reports.manual_calls, [True])
+        self.assertEqual(metadata.value["state"], "READY")
 
         scheduled = services.scheduled_scan()
         self.assertEqual(scheduled["state"], "NO_CHANGE")
@@ -108,7 +134,7 @@ class DriveSystemWiringTests(unittest.TestCase):
     def test_unconfigured_scheduled_scan_does_not_publish(self) -> None:
         connection = _StubConnection(state="UNCONFIGURED")
         reports = _StubReports()
-        services = DriveSystemServices(connection=connection, reports=reports, metadata=object())  # type: ignore[arg-type]
+        services = DriveSystemServices(connection=connection, reports=reports, metadata=_StubMetadata())  # type: ignore[arg-type]
         result = services.scheduled_scan()
         self.assertEqual(result, {"state": "NOT_CONFIGURED", "remote_write": False})
         self.assertEqual(reports.manual_calls, [])

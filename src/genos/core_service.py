@@ -141,7 +141,7 @@ def _reconcile_core_agent(state_dir: Path, instance_id: str, *, force_cli_update
 
 
 def _scheduled_drive_scan() -> dict[str, object]:
-    """One isolated 30-minute scan; never throws into Agent/worker health."""
+    """One isolated 30-minute scan; failure is queued for the next cadence."""
     try:
         from .drive_system import build_drive_system
         result = build_drive_system().scheduled_scan()
@@ -152,9 +152,10 @@ def _scheduled_drive_scan() -> dict[str, object]:
         }
     except Exception as exc:
         return {
-            "state": "DEGRADED",
+            "state": "RETRY_SCHEDULED",
             "reason": f"DRIVE_SCAN_{type(exc).__name__}",
             "remote_write": False,
+            "retry_after_seconds": DRIVE_SCAN_INTERVAL_SECONDS,
             "observed_at": _utc_now(),
         }
 

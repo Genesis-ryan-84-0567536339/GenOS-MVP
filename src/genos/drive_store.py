@@ -29,6 +29,10 @@ _ALLOWED_KEYS = {
     "last_report_fingerprint",
     "last_verified_at",
     "last_error_code",
+    "mcp_grant_state",
+    "mcp_grant_agent_id",
+    "mcp_grant_scope",
+    "mcp_grant_checked_at",
     "updated_at",
 }
 _RAW_SECRET_KEYS = {
