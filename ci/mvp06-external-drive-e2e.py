@@ -84,6 +84,20 @@ def _cleanup(access_token: str, result: dict[str, Any]) -> None:
         _delete_drive_object(access_token, value)
 
 
+def _partial_result(services: Any, result: dict[str, Any] | None) -> dict[str, Any] | None:
+    if result is not None:
+        return result
+    if services is None:
+        return None
+    try:
+        binding = services.metadata.get_drive_binding()
+    except Exception:
+        return None
+    if not isinstance(binding, dict) or not binding:
+        return None
+    return {"drive": binding, "initial_report": {}}
+
+
 def main() -> int:
     raw_credential = os.environ.get(RAW_CREDENTIAL_ENV, "")
     tested_sha = os.environ.get("GITHUB_HEAD_SHA") or os.environ.get("GITHUB_SHA") or "UNKNOWN"
@@ -103,11 +117,18 @@ def main() -> int:
     instance_id = str(uuid.uuid4())
     root_name = f"GenOS-MVP06-E2E-{tested_sha[:8]}-{uuid.uuid4().hex[:8]}"
     result: dict[str, Any] | None = None
+    services: Any = None
     cleanup_state = "NOT_RUN"
     factory = GoogleDriveRemoteFactory()
     access_token = ""
+    descriptor: Any = None
 
     try:
+        # Resolve once up front so every failure after a remote mutation has a
+        # cleanup credential. Product calls still resolve through SecretRef and
+        # the shared factory independently; this token is cleanup-only.
+        access_token, descriptor = factory.resolve(raw_credential)
+
         with tempfile.TemporaryDirectory(prefix="genos-mvp06-external-") as temp:
             root = Path(temp)
             os.environ["GENOS_INSTANCE_ID"] = instance_id
@@ -169,7 +190,6 @@ def main() -> int:
             if raw_credential in dump:
                 raise RuntimeError("raw Drive credential leaked into Product DB dump")
 
-            access_token, descriptor = factory.resolve(raw_credential)
             _cleanup(access_token, result)
             cleanup_state = "PASS"
             _write_evidence(
@@ -192,9 +212,10 @@ def main() -> int:
         print("GENOS_MVP06_EXTERNAL_DRIVE_E2E_PASS")
         return 0
     except Exception as exc:
-        if result is not None and access_token:
+        cleanup_target = _partial_result(services, result)
+        if cleanup_target is not None and access_token:
             try:
-                _cleanup(access_token, result)
+                _cleanup(access_token, cleanup_target)
                 cleanup_state = "PASS_AFTER_FAILURE"
             except Exception:
                 cleanup_state = "FAILED"
