@@ -112,6 +112,24 @@ class TypedRepairTests(unittest.TestCase):
                 ]
             }
 
+    class SequencedObservability:
+        def __init__(self, states: list[str]) -> None:
+            self.states = list(states)
+            self.calls = 0
+
+        def snapshot(self):
+            index = min(self.calls, len(self.states) - 1)
+            state = self.states[index]
+            self.calls += 1
+            return {
+                "observations": [
+                    {
+                        "check_id": "genos_services",
+                        "observed": {"units": {"worker": state}},
+                    }
+                ]
+            }
+
     def test_arbitrary_service_target_is_rejected(self) -> None:
         service = RepairService(observability=self.FakeObservability("failed"))  # type: ignore[arg-type]
         with self.assertRaises(RepairError):
@@ -139,6 +157,19 @@ class TypedRepairTests(unittest.TestCase):
         plan = service.plan(action="restart-service", target="worker")
         self.assertFalse(plan.mutation_allowed)
         self.assertEqual(plan.reason, "INSUFFICIENT_LIVE_EVIDENCE")
+
+    def test_execute_rechecks_live_evidence_and_cancels_stale_plan(self) -> None:
+        observability = self.SequencedObservability(["failed", "active"])
+        service = RepairService(observability=observability)  # type: ignore[arg-type]
+        plan = service.plan(action="restart-service", target="worker")
+        self.assertTrue(plan.mutation_allowed)
+        with patch("genos.repair._run") as run:
+            result = service.execute(plan)
+        run.assert_not_called()
+        self.assertEqual(result["state"], "NO_ACTION")
+        self.assertEqual(result["reason"], "PRECONDITION_CHANGED")
+        self.assertEqual(result["plan"]["reason"], "NO_REPAIR_REQUIRED")
+        self.assertEqual(observability.calls, 2)
 
 
 if __name__ == "__main__":
