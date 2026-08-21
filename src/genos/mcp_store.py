@@ -308,8 +308,8 @@ def normalize_endpoint(value: str) -> str:
     if len(text) > 2048:
         raise McpStoreError("MCP endpoint too long")
     parsed = urlparse(text)
-    if parsed.username or parsed.password or parsed.fragment:
-        raise McpStoreError("MCP endpoint must not embed credentials or fragment")
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise McpStoreError("MCP endpoint must not embed credentials, query parameters, or fragment")
     host = (parsed.hostname or "").lower()
     if parsed.scheme == "https" and host:
         return text

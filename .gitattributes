@@ -1,0 +1,2 @@
+# The official MCP schema is vendored byte-for-byte and includes its final blank line.
+src/genos/schemas/mcp_2026_07_28.json whitespace=-blank-at-eof

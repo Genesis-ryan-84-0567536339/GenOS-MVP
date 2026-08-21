@@ -350,6 +350,7 @@ class ProductAPIHandler(BaseHTTPRequestHandler):
             if self.path == _MCP_PRINCIPALS:
                 self.app.auth.authenticate(self._bearer_token())
                 body = self._read_json()
+                _reject_unknown_fields(body, {"name", "scopes"})
                 scopes = _required_string_list(body, "scopes")
                 self._json(201, {"mcp": self.app.mcp_create_principal(name=_required_text(body, "name"), scopes=scopes)})
                 return
@@ -361,10 +362,11 @@ class ProductAPIHandler(BaseHTTPRequestHandler):
                     self._reject_nonempty_body(); self._json(200, {"mcp": self.app.mcp_rotate_principal(principal_id)}); return
                 if operation == "revoke":
                     self._reject_nonempty_body(); self._json(200, {"principal": self.app.mcp_revoke_principal(principal_id)}); return
-                body = self._read_json(); self._json(200, {"principal": self.app.mcp_replace_scopes(principal_id, _required_string_list(body, "scopes"))}); return
+                body = self._read_json(); _reject_unknown_fields(body, {"scopes"}); self._json(200, {"principal": self.app.mcp_replace_scopes(principal_id, _required_string_list(body, "scopes"))}); return
             if self.path == _MCP_UPSTREAMS:
                 self.app.auth.authenticate(self._bearer_token())
                 body = self._read_json()
+                _reject_unknown_fields(body, {"namespace", "name", "endpoint", "secret_id"})
                 secret_id = body.get("secret_id")
                 if secret_id is not None and not isinstance(secret_id, str): raise AuthError("secret_id must be a string")
                 upstream = self.app.mcp_register_upstream(namespace=_required_text(body, "namespace"), name=_required_text(body, "name"), endpoint=_required_text(body, "endpoint"), secret_id=secret_id)
@@ -580,6 +582,11 @@ def _required_text(payload: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value:
         raise AuthError(f"{key} is required")
     return value
+
+
+def _reject_unknown_fields(payload: dict[str, Any], allowed: set[str]) -> None:
+    if any(key not in allowed for key in payload):
+        raise AuthError("request contains unsupported fields")
 
 
 def _required_string_list(payload: dict[str, Any], key: str) -> list[str]:

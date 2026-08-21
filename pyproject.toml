@@ -7,7 +7,7 @@ name = "genos-mvp"
 version = "0.1.0.dev0"
 description = "GenOS MVP lifecycle and typed host reconnaissance foundation"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["jsonschema>=4.10,<5"]
 
 [project.scripts]
 genos = "genos.cli:main"
@@ -17,3 +17,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+genos = ["schemas/*.json"]

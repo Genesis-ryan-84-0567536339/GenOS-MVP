@@ -234,11 +234,12 @@ class NativeProvisioner:
         profile = get_profile(self.planned.plan.profile)
         if profile.package_manager != "apt":
             raise InstallError(f"package manager not implemented: {profile.package_manager}")
-        if _dpkg_packages_present(self.runner, ["postgresql", "postgresql-client"]):
+        packages = ["postgresql", "postgresql-client", "ca-certificates", "python3-jsonschema"]
+        if _dpkg_packages_present(self.runner, packages):
             return
         self.runner.run(["apt-get", "update"], timeout=300)
         self.runner.run(
-            ["apt-get", "install", "-y", "postgresql", "postgresql-client", "ca-certificates"],
+            ["apt-get", "install", "-y", *packages],
             timeout=600,
         )
 
