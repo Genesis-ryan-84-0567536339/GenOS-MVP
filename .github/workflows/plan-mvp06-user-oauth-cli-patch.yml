@@ -1,0 +1,56 @@
+name: PLAN MVP-06 User OAuth CLI Patch
+
+on:
+  pull_request:
+    types: [synchronize, reopened]
+    paths:
+      - '.github/workflows/plan-mvp06-user-oauth-cli-patch.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          fetch-depth: 1
+      - name: Patch typed Drive OAuth CLI and config edge case
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          oauth = Path('src/genos/drive_oauth.py')
+          text = oauth.read_text(encoding='utf-8')
+          old = '        source = env or os.environ\n'
+          new = '        source = env if env is not None else os.environ\n'
+          if text.count(old) != 1:
+              raise SystemExit('unexpected OAuth environment source pattern')
+          oauth.write_text(text.replace(old, new), encoding='utf-8')
+
+          cli = Path('src/genos/cli.py')
+          text = cli.read_text(encoding='utf-8')
+          anchor = '''    drive_verify = drive_sub.add_parser("verify", help="Re-verify the current Drive account and protocol binding")\n    drive_verify.add_argument("--json", action="store_true", dest="as_json")\n'''
+          insertion = anchor + '''    drive_authorize = drive_sub.add_parser("authorize", help="Start user-owned Google Drive authorization")\n    drive_authorize.add_argument("--root-name", default="GenOS")\n    drive_authorize.add_argument("--json", action="store_true", dest="as_json")\n    drive_auth_status = drive_sub.add_parser("auth-status", help="Show Google Drive authorization state without provider mutation")\n    drive_auth_status.add_argument("--json", action="store_true", dest="as_json")\n    drive_auth_poll = drive_sub.add_parser("auth-poll", help="Poll the active Google Drive authorization at the provider-approved cadence")\n    drive_auth_poll.add_argument("--json", action="store_true", dest="as_json")\n    drive_disconnect = drive_sub.add_parser("disconnect", help="Disable the bound Drive SecretRef without deleting remote Drive content")\n    drive_disconnect.add_argument("--json", action="store_true", dest="as_json")\n    drive_reauthorize = drive_sub.add_parser("reauthorize", help="Disconnect the current binding and start authorization for a chosen Google account")\n    drive_reauthorize.add_argument("--root-name", default=None)\n    drive_reauthorize.add_argument("--json", action="store_true", dest="as_json")\n    drive_reconnect = drive_sub.add_parser("reconnect", help="Recover a degraded binding or start user authorization when required")\n    drive_reconnect.add_argument("--root-name", default=None)\n    drive_reconnect.add_argument("--json", action="store_true", dest="as_json")\n'''
+          if text.count(anchor) != 1:
+              raise SystemExit('unexpected Drive parser anchor')
+          text = text.replace(anchor, insertion)
+
+          dispatch_anchor = '''        if args.drive_command == "connect":\n            payload = services.connect(secret_id=args.secret_id, root_name=args.root_name)\n            _emit_safe(payload, as_json=args.as_json)\n            return 0 if payload.get("state") == "READY" else 3\n'''
+          dispatch = '''        if args.drive_command == "authorize":\n            payload = services.oauth_start(root_name=args.root_name)\n            _emit_safe(payload, as_json=args.as_json)\n            return 0\n        if args.drive_command == "auth-status":\n            payload = services.oauth_status()\n            _emit_safe(payload, as_json=args.as_json)\n            return 0 if payload.get("state") in {"WAITING_USER", "AUTHORIZED"} else 3\n        if args.drive_command == "auth-poll":\n            payload = services.oauth_poll()\n            _emit_safe(payload, as_json=args.as_json)\n            return 0 if payload.get("state") in {"WAITING_USER", "AUTHORIZED", "READY"} else 3\n        if args.drive_command == "disconnect":\n            payload = services.disconnect()\n            _emit_safe(payload, as_json=args.as_json)\n            return 0 if payload.get("state") == "DISCONNECTED" else 3\n        if args.drive_command == "reauthorize":\n            payload = services.reauthorize(root_name=args.root_name)\n            _emit_safe(payload, as_json=args.as_json)\n            return 0 if payload.get("state") == "WAITING_USER" else 3\n        if args.drive_command == "reconnect":\n            payload = services.reconnect(root_name=args.root_name)\n            _emit_safe(payload, as_json=args.as_json)\n            return 0 if payload.get("state") in {"WAITING_USER", "READY"} else 3\n''' + dispatch_anchor
+          if text.count(dispatch_anchor) != 1:
+              raise SystemExit('unexpected Drive dispatch anchor')
+          text = text.replace(dispatch_anchor, dispatch)
+          cli.write_text(text, encoding='utf-8')
+          PY
+          PYTHONPATH=src python3 -m py_compile src/genos/drive_oauth.py src/genos/cli.py
+          git config user.name 'PLAN MVP-06 OAuth Patch'
+          git config user.email 'genesis.corp.os@gmail.com'
+          git add src/genos/drive_oauth.py src/genos/cli.py
+          git commit -m 'feat(mvp06): add user-driven Drive OAuth CLI lifecycle'
+          git push origin HEAD:${{ github.head_ref }}
