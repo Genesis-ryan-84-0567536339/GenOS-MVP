@@ -16,7 +16,6 @@ on:
       - 'ci/mvp06-external-drive-e2e.py'
       - 'tests/test_mvp06*.py'
       - '.github/workflows/mvp06-drive-contract.yml'
-      - '.github/workflows/mvp06-external-drive-e2e.yml'
   workflow_dispatch:
 
 permissions:
