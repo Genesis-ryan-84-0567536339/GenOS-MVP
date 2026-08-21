@@ -1,0 +1,81 @@
+name: MVP-06 Drive OAuth and Report Contract
+
+on:
+  pull_request:
+    paths:
+      - 'src/genos/drive_*.py'
+      - 'src/genos/report_*.py'
+      - 'src/genos/observability.py'
+      - 'src/genos/product_api.py'
+      - 'src/genos/cli.py'
+      - 'src/genos/core_service.py'
+      - 'src/genos/auth_service.py'
+      - 'src/genos/product_store.py'
+      - 'src/genos/secret_provider.py'
+      - 'ci/fresh-host-e2e.sh'
+      - 'tests/test_mvp06*.py'
+      - '.github/workflows/mvp06-drive-contract.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drive-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout exact reviewed head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Verify exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
+          fi
+      - name: Compile MVP-06 surfaces
+        run: PYTHONPATH=src python -m compileall -q src/genos tests/test_mvp06.py tests/test_mvp06_oauth.py
+      - name: User-owned OAuth, Drive and report contract tests
+        run: PYTHONPATH=src python -m unittest discover -s tests -p 'test_mvp06*.py' -v
+      - name: Typed Setup-facing CLI parse smoke
+        run: |
+          PYTHONPATH=src python - <<'PY'
+          from genos.cli import build_parser
+          secret_id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+          connect = build_parser().parse_args(['drive','connect','--secret-id',secret_id,'--json'])
+          assert connect.command == 'drive' and connect.drive_command == 'connect'
+          auth_start = build_parser().parse_args(['drive','authorize','--root-name','GenOS','--json'])
+          assert auth_start.drive_command == 'authorize' and auth_start.root_name == 'GenOS'
+          auth_status = build_parser().parse_args(['drive','auth-status','--json'])
+          assert auth_status.drive_command == 'auth-status'
+          auth_poll = build_parser().parse_args(['drive','auth-poll','--json'])
+          assert auth_poll.drive_command == 'auth-poll'
+          disconnect = build_parser().parse_args(['drive','disconnect','--json'])
+          assert disconnect.drive_command == 'disconnect'
+          reauthorize = build_parser().parse_args(['drive','reauthorize','--json'])
+          assert reauthorize.drive_command == 'reauthorize'
+          reconnect = build_parser().parse_args(['drive','reconnect','--json'])
+          assert reconnect.drive_command == 'reconnect'
+          scheduled = build_parser().parse_args(['report','system','--scheduled','--json'])
+          assert scheduled.command == 'report' and scheduled.scheduled is True
+          PY
+      - name: Guard against maintainer-personal Drive acceptance coupling
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git grep -n "GENOS_MVP06_DRIVE_CREDENTIAL" -- ':!.github/workflows/mvp06-drive-contract.yml'; then
+            echo 'MVP-06 must not depend on a maintainer personal Drive credential'
+            exit 1
+          fi
+          if git grep -n "NEEDS_EXTERNAL_GENOS_CREDENTIAL" -- ':!.github/workflows/mvp06-drive-contract.yml'; then
+            echo 'obsolete external-owner credential gate remains in required implementation paths'
+            exit 1
+          fi
+          echo 'USER_OWNED_GOOGLE_DRIVE_OAUTH_CONTRACT_PASS'

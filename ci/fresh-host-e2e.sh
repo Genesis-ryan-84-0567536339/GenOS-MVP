@@ -162,6 +162,13 @@ try:
     raise AssertionError('Mission Control root unexpectedly returned success before MVP-08')
 except urllib.error.HTTPError as exc:
     assert exc.code == 503, exc.code
+try:
+    urllib.request.urlopen('http://127.0.0.1:17880/api/v1/drive', timeout=5)
+    raise AssertionError('Drive API unexpectedly allowed unauthenticated access')
+except urllib.error.HTTPError as exc:
+    assert exc.code == 401, exc.code
+    error_payload = json.loads(exc.read().decode('utf-8'))
+    assert error_payload['error'] == 'unauthorized', error_payload
 assert json.load(open('/var/lib/genos/worker/heartbeat.json', encoding='utf-8'))['status'] == 'ok'
 manifest=json.load(open('/var/lib/genos/manifest.json', encoding='utf-8'))
 assert manifest['state'] == 'READY_LOCAL_CORE', manifest
@@ -173,6 +180,8 @@ assert manifest['support_evidence'] == 'VERIFIED_PROFILE', manifest
 assert manifest['services']['mission_control_ui'] == 'NOT_IMPLEMENTED_BEFORE_MVP_08_VISUAL_APPROVAL', manifest
 PY"
   ssh_guest "sudo -u genos psql -d genos -tAc 'SELECT 1' | grep -qx 1"
+  ssh_guest "sudo -u genos psql -d genos -tAc \"SELECT CASE WHEN to_regclass('public.drive_binding') IS NOT NULL THEN 1 ELSE 0 END\" | grep -qx 1"
+  ssh_guest "sudo -u genos psql -d genos -tAc \"SELECT CASE WHEN EXISTS (SELECT 1 FROM genos_schema_migration WHERE version=4) THEN 1 ELSE 0 END\" | grep -qx 1"
 }
 verify_guest
 
@@ -215,7 +224,7 @@ verify_guest
 python3 - "$EVIDENCE" <<PY
 import json, sys
 payload = {
-    "schema_version": "1.0",
+    "schema_version": "1.1",
     "profile_id": "ubuntu-24.04-amd64-native",
     "profile_state_during_run": "VERIFIED",
     "image_url": "$IMAGE_URL",
@@ -229,6 +238,8 @@ payload = {
     "rerun": "PASS",
     "reboot_recovery": "PASS",
     "local_core_health": "PASS",
+    "drive_schema_v4": "PASS",
+    "drive_api_owner_auth_boundary": "PASS",
     "support_class": "SUPPORTED",
     "support_evidence": "VERIFIED_PROFILE",
     "mission_control_ui": "NOT_IMPLEMENTED_BEFORE_MVP_08_VISUAL_APPROVAL"

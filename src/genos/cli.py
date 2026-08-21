@@ -14,11 +14,18 @@ from .agent_runtime import AgentNeedsAction, AgentRuntimeError, AgentRuntimeStor
 from .agent_secure_runtime import SecretAwareGeminiAdapter, SecureTmuxController
 from .agent_tool_links import ensure_system_links
 from .agent_tools import AgentToolError, AgentToolProvisioner
+from .auth_service import CredentialError
+from .drive_bridge import DriveBridgeError, DriveNeedsAction, DriveRemoteError
+from .drive_store import DriveStoreError
+from .drive_system import DriveSystemError, build_drive_system
 from .install import InstallError, NativeProvisioner, ReleaseArtifact, build_native_install
 from .observability import GENOS_SERVICES, ObservabilityService
+from .product_store import ProductStoreError
 from .recon import collect_all
 from .redaction import redact
 from .repair import RepairError, RepairService
+from .report_bridge import ReportBridgeError
+from .secret_provider import SecretProviderError
 from .state import JsonStateStore
 
 
@@ -65,6 +72,38 @@ def build_parser() -> argparse.ArgumentParser:
     install.add_argument("--json", action="store_true", dest="as_json")
     install.add_argument("--candidate-e2e", action="store_true", help=argparse.SUPPRESS)
 
+    drive = sub.add_parser("drive", help="Operate the typed Google Drive collaboration bridge")
+    drive_sub = drive.add_subparsers(dest="drive_command", required=True)
+    drive_status = drive_sub.add_parser("status", help="Show local Drive binding state without remote mutation")
+    drive_status.add_argument("--json", action="store_true", dest="as_json")
+    drive_connect = drive_sub.add_parser("connect", help="Bind a drive-sync SecretRef and verify the remote collaboration root")
+    drive_connect.add_argument("--secret-id", required=True, help="SecretRef UUID granted to consumer drive-sync")
+    drive_connect.add_argument("--root-name", default="GenOS")
+    drive_connect.add_argument("--json", action="store_true", dest="as_json")
+    drive_verify = drive_sub.add_parser("verify", help="Re-verify the current Drive account and protocol binding")
+    drive_verify.add_argument("--json", action="store_true", dest="as_json")
+    drive_authorize = drive_sub.add_parser("authorize", help="Start user-owned Google Drive authorization")
+    drive_authorize.add_argument("--root-name", default="GenOS")
+    drive_authorize.add_argument("--json", action="store_true", dest="as_json")
+    drive_auth_status = drive_sub.add_parser("auth-status", help="Show Google Drive authorization state without provider mutation")
+    drive_auth_status.add_argument("--json", action="store_true", dest="as_json")
+    drive_auth_poll = drive_sub.add_parser("auth-poll", help="Poll the active Google Drive authorization at the provider-approved cadence")
+    drive_auth_poll.add_argument("--json", action="store_true", dest="as_json")
+    drive_disconnect = drive_sub.add_parser("disconnect", help="Disable the bound Drive SecretRef without deleting remote Drive content")
+    drive_disconnect.add_argument("--json", action="store_true", dest="as_json")
+    drive_reauthorize = drive_sub.add_parser("reauthorize", help="Disconnect the current binding and start authorization for a chosen Google account")
+    drive_reauthorize.add_argument("--root-name", default=None)
+    drive_reauthorize.add_argument("--json", action="store_true", dest="as_json")
+    drive_reconnect = drive_sub.add_parser("reconnect", help="Recover a degraded binding or start user authorization when required")
+    drive_reconnect.add_argument("--root-name", default=None)
+    drive_reconnect.add_argument("--json", action="store_true", dest="as_json")
+
+    report = sub.add_parser("report", help="Build/publish reports from the shared observability authority")
+    report_sub = report.add_subparsers(dest="report_command", required=True)
+    system_report = report_sub.add_parser("system", help="Publish the sanitized System Report to the bound Drive replica")
+    system_report.add_argument("--scheduled", action="store_true", help="Skip remote write when significant state is unchanged")
+    system_report.add_argument("--json", action="store_true", dest="as_json")
+
     agent = sub.add_parser("agent", help="Operate the single MVP Core Agent agy-gen through typed controls")
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
     for name in ("status", "probe", "restart"):
@@ -83,7 +122,7 @@ def build_parser() -> argparse.ArgumentParser:
     task.add_argument("--prompt", required=True)
     task.add_argument("--json", action="store_true", dest="as_json")
 
-    auth = agent_sub.add_parser("auth", help="Run Gemini interactive auth in the persistent agy-gen tmux session")
+    auth = agent_sub.add_parser("auth", help="Run Antigravity interactive auth in the persistent agy-gen tmux session")
     auth_sub = auth.add_subparsers(dest="auth_command", required=True)
     for name in ("start", "status", "verify"):
         item = auth_sub.add_parser(name)
@@ -112,6 +151,10 @@ def main(argv: list[str] | None = None) -> int:
         return _repair(args)
     if args.command == "install":
         return _install(args)
+    if args.command == "drive":
+        return _drive(args)
+    if args.command == "report":
+        return _report(args)
     if args.command == "agent":
         return _agent(args)
     return _not_implemented(args.command)
@@ -227,6 +270,69 @@ def _install(args: argparse.Namespace) -> int:
             }
         )
         _emit(payload, as_json=args.as_json)
+        return 4
+
+
+def _drive(args: argparse.Namespace) -> int:
+    try:
+        services = build_drive_system()
+        if args.drive_command == "status":
+            payload = services.connection.status()
+            _emit_safe(payload, as_json=args.as_json)
+            return 0 if payload.get("state") == "READY" else 3
+        if args.drive_command == "authorize":
+            payload = services.oauth_start(root_name=args.root_name)
+            _emit_safe(payload, as_json=args.as_json)
+            return 0
+        if args.drive_command == "auth-status":
+            payload = services.oauth_status()
+            _emit_safe(payload, as_json=args.as_json)
+            return 0 if payload.get("state") in {"WAITING_USER", "AUTHORIZED"} else 3
+        if args.drive_command == "auth-poll":
+            payload = services.oauth_poll()
+            _emit_safe(payload, as_json=args.as_json)
+            return 0 if payload.get("state") in {"WAITING_USER", "AUTHORIZED", "READY"} else 3
+        if args.drive_command == "disconnect":
+            payload = services.disconnect()
+            _emit_safe(payload, as_json=args.as_json)
+            return 0 if payload.get("state") == "DISCONNECTED" else 3
+        if args.drive_command == "reauthorize":
+            payload = services.reauthorize(root_name=args.root_name)
+            _emit_safe(payload, as_json=args.as_json)
+            return 0 if payload.get("state") == "WAITING_USER" else 3
+        if args.drive_command == "reconnect":
+            payload = services.reconnect(root_name=args.root_name)
+            _emit_safe(payload, as_json=args.as_json)
+            return 0 if payload.get("state") in {"WAITING_USER", "READY"} else 3
+        if args.drive_command == "connect":
+            payload = services.connect(secret_id=args.secret_id, root_name=args.root_name)
+            _emit_safe(payload, as_json=args.as_json)
+            return 0 if payload.get("state") == "READY" else 3
+        if args.drive_command == "verify":
+            payload = services.connection.verify()
+            _emit_safe(payload, as_json=args.as_json)
+            return 0 if payload.get("state") == "READY" else 3
+    except DriveNeedsAction:
+        _emit_safe({"state": "NEEDS_ACTION", "error_type": "DriveNeedsAction"}, as_json=args.as_json)
+        return 3
+    except (DriveBridgeError, DriveStoreError, DriveSystemError, CredentialError, ProductStoreError, SecretProviderError, OSError):
+        _emit_safe({"state": "FAILED", "error_type": "DRIVE_BACKEND_UNAVAILABLE"}, as_json=args.as_json)
+        return 4
+    raise SystemExit(2)
+
+
+def _report(args: argparse.Namespace) -> int:
+    if args.report_command != "system":
+        raise SystemExit(2)
+    try:
+        result = build_drive_system().reports.publish(manual=not bool(args.scheduled))
+        _emit_safe(result, as_json=args.as_json)
+        return 0 if result.get("state") in {"PUBLISHED", "NO_CHANGE"} else 3
+    except DriveNeedsAction:
+        _emit_safe({"state": "NEEDS_ACTION", "error_type": "DriveNeedsAction"}, as_json=args.as_json)
+        return 3
+    except (ReportBridgeError, DriveRemoteError, DriveStoreError, DriveSystemError, CredentialError, ProductStoreError, SecretProviderError, OSError):
+        _emit_safe({"state": "FAILED", "error_type": "REPORT_BACKEND_UNAVAILABLE"}, as_json=args.as_json)
         return 4
 
 
@@ -349,6 +455,16 @@ def _emit_agent(payload: dict[str, Any], *, as_json: bool) -> None:
         print(f"auth_url: {payload['auth_url']}")
     if payload.get("evidence"):
         print(f"evidence: {payload['evidence']}")
+
+
+def _emit_safe(payload: dict[str, Any], *, as_json: bool) -> None:
+    """Emit typed Drive/report projections whose schemas reject raw secrets."""
+    if as_json:
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=2))
+        return
+    print(f"state: {payload.get('state', 'UNKNOWN')}")
+    if payload.get("job") and isinstance(payload["job"], dict):
+        print(f"job: {payload['job'].get('job_id', 'UNKNOWN')}")
 
 
 def _emit(payload: dict[str, Any], as_json: bool) -> None:

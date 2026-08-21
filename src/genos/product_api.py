@@ -22,8 +22,12 @@ from .auth_service import (
     CredentialService,
     OwnerAuthService,
 )
+from .drive_bridge import DriveBridgeError, DriveNeedsAction, DriveRemoteError
+from .drive_store import DriveStoreError
+from .drive_system import DriveSystemError, DriveSystemServices, build_drive_system
 from .observability import ObservabilityService
 from .product_store import PostgresProductStore, ProductStoreError
+from .report_bridge import ReportBridgeError
 from .secret_provider import LocalFileSecretProvider, SecretProviderError
 
 
@@ -31,6 +35,9 @@ MAX_JSON_BODY = 64 * 1024
 _CREDENTIAL_ACTION = re.compile(r"^/api/v1/credentials/([0-9a-fA-F-]{36})/(rotate|test|disable)$")
 _AGENT_ID = "agy-gen"
 _AGENT_AUTH_BASE = f"/api/v1/agents/{_AGENT_ID}/auth"
+_DRIVE_BASE = "/api/v1/drive"
+_DRIVE_OAUTH = f"{_DRIVE_BASE}/oauth"
+_SYSTEM_REPORT = "/api/v1/reports/system"
 
 
 class ProductAPIApp:
@@ -42,6 +49,7 @@ class ProductAPIApp:
         agent_store: AgentRuntimeStore,
         agent_auth: AgentAuthBridge,
         observability: ObservabilityService | None = None,
+        drive_system: DriveSystemServices | None = None,
     ) -> None:
         self.auth = auth
         self.credentials = credentials
@@ -49,6 +57,7 @@ class ProductAPIApp:
         self.agent_store = agent_store
         self.agent_auth = agent_auth
         self.observability = observability or ObservabilityService()
+        self.drive_system = drive_system
 
     @classmethod
     def from_system(cls) -> "ProductAPIApp":
@@ -56,20 +65,59 @@ class ProductAPIApp:
         store.ensure_schema()
         secret_root = os.environ.get("GENOS_SECRET_DIR", "/var/lib/genos/secrets")
         provider = LocalFileSecretProvider(secret_root)
+        credentials = CredentialService(store, provider)
         agent_root = Path(os.environ.get("GENOS_AGY_GEN_DIR", "/var/lib/genos/agents/agy-gen"))
         agent_store = AgentRuntimeStore(agent_root)
+        observability = ObservabilityService()
+        drive_system = build_drive_system(product_store=store, credentials=credentials, observability=observability)
         return cls(
             OwnerAuthService(store),
-            CredentialService(store, provider),
+            credentials,
             store,
             agent_store,
             AgentAuthBridge(agent_store),
-            ObservabilityService(),
+            observability,
+            drive_system,
         )
 
     def read_observability(self) -> dict[str, Any]:
         """Return the same authoritative read model used by `genos doctor`."""
         return self.observability.snapshot()
+
+    def drive_status(self) -> dict[str, Any]:
+        return self._drive().connection.status()
+
+    def drive_connect(self, *, secret_id: str, root_name: str = "GenOS") -> dict[str, Any]:
+        return self._drive().connect(secret_id=secret_id, root_name=root_name)
+
+    def drive_verify(self) -> dict[str, Any]:
+        return self._drive().connection.verify()
+
+    def drive_oauth_status(self) -> dict[str, Any]:
+        return self._drive().oauth_status()
+
+    def drive_oauth_start(self, *, root_name: str = "GenOS") -> dict[str, Any]:
+        return self._drive().oauth_start(root_name=root_name)
+
+    def drive_oauth_poll(self) -> dict[str, Any]:
+        return self._drive().oauth_poll()
+
+    def drive_disconnect(self) -> dict[str, Any]:
+        return self._drive().disconnect()
+
+    def drive_reauthorize(self, *, root_name: str | None = None) -> dict[str, Any]:
+        return self._drive().reauthorize(root_name=root_name)
+
+    def drive_reconnect(self, *, root_name: str | None = None) -> dict[str, Any]:
+        return self._drive().reconnect(root_name=root_name)
+
+    def publish_system_report(self, *, manual: bool = True) -> dict[str, Any]:
+        return self._drive().reports.publish(manual=manual)
+
+    def _drive(self) -> DriveSystemServices:
+        if self.drive_system is None:
+            raise DriveSystemError("Drive system is not configured")
+        return self.drive_system
 
 
 class ProductAPIHandler(BaseHTTPRequestHandler):
@@ -103,6 +151,14 @@ class ProductAPIHandler(BaseHTTPRequestHandler):
             if self.path == "/api/v1/credentials":
                 self.app.auth.authenticate(self._bearer_token())
                 self._json(200, {"credentials": self.app.credentials.list()})
+                return
+            if self.path == _DRIVE_BASE:
+                self.app.auth.authenticate(self._bearer_token())
+                self._json(200, {"drive": self.app.drive_status()})
+                return
+            if self.path == _DRIVE_OAUTH:
+                self.app.auth.authenticate(self._bearer_token())
+                self._json(200, {"oauth": self.app.drive_oauth_status()})
                 return
             if self.path == _AGENT_AUTH_BASE:
                 self.app.auth.authenticate(self._bearer_token())
@@ -148,6 +204,56 @@ class ProductAPIHandler(BaseHTTPRequestHandler):
                     source="owner-api",
                 )
                 self._json(201, {"credential": record})
+                return
+            if self.path == f"{_DRIVE_BASE}/connect":
+                self.app.auth.authenticate(self._bearer_token())
+                body = self._read_json()
+                result = self.app.drive_connect(
+                    secret_id=_required_text(body, "secret_id"),
+                    root_name=_optional_root_name(body),
+                )
+                self._json(200, {"drive": result})
+                return
+            if self.path == f"{_DRIVE_BASE}/verify":
+                self.app.auth.authenticate(self._bearer_token())
+                self._reject_nonempty_body()
+                self._json(200, {"drive": self.app.drive_verify()})
+                return
+            if self.path == f"{_DRIVE_OAUTH}/start":
+                self.app.auth.authenticate(self._bearer_token())
+                body = self._read_optional_json()
+                self._json(200, {"oauth": self.app.drive_oauth_start(root_name=_optional_root_name(body))})
+                return
+            if self.path == f"{_DRIVE_OAUTH}/poll":
+                self.app.auth.authenticate(self._bearer_token())
+                self._reject_nonempty_body()
+                self._json(200, {"oauth": self.app.drive_oauth_poll()})
+                return
+            if self.path == f"{_DRIVE_BASE}/disconnect":
+                self.app.auth.authenticate(self._bearer_token())
+                self._reject_nonempty_body()
+                self._json(200, {"drive": self.app.drive_disconnect()})
+                return
+            if self.path == f"{_DRIVE_BASE}/reauthorize":
+                self.app.auth.authenticate(self._bearer_token())
+                body = self._read_optional_json()
+                root_name = body.get("root_name")
+                if root_name is not None and not isinstance(root_name, str):
+                    raise AuthError("root_name must be a string")
+                self._json(200, {"oauth": self.app.drive_reauthorize(root_name=root_name)})
+                return
+            if self.path == f"{_DRIVE_BASE}/reconnect":
+                self.app.auth.authenticate(self._bearer_token())
+                body = self._read_optional_json()
+                root_name = body.get("root_name")
+                if root_name is not None and not isinstance(root_name, str):
+                    raise AuthError("root_name must be a string")
+                self._json(200, {"drive": self.app.drive_reconnect(root_name=root_name)})
+                return
+            if self.path == _SYSTEM_REPORT:
+                self.app.auth.authenticate(self._bearer_token())
+                self._reject_nonempty_body()
+                self._json(200, {"report": self.app.publish_system_report(manual=True)})
                 return
             if self.path == f"{_AGENT_AUTH_BASE}/start":
                 self.app.auth.authenticate(self._bearer_token())
@@ -246,7 +352,6 @@ class ProductAPIHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 raise AuthError("invalid Content-Length") from exc
             if length > 0:
-                # Drain a bounded body before returning an error.
                 self.rfile.read(min(length, MAX_JSON_BODY))
                 raise AuthError("request body not allowed")
 
@@ -269,13 +374,21 @@ class ProductAPIHandler(BaseHTTPRequestHandler):
         if isinstance(exc, AgentNeedsAction):
             self._json(409, {"error": "agent_needs_action"})
             return
-        if isinstance(exc, (AuthError, CredentialError, AgentAuthError, ValueError)):
-            self._json(400, {"error": "invalid_request"})
+        if isinstance(exc, DriveNeedsAction):
+            self._json(409, {"error": "drive_needs_action"})
             return
-        if isinstance(exc, (ProductStoreError, SecretProviderError, AgentRuntimeError)):
+        if isinstance(exc, DriveRemoteError):
             self._json(503, {"error": "backend_unavailable"})
             return
-        # Do not echo exception details: they may contain operational data.
+        if isinstance(exc, (AuthError, CredentialError, AgentAuthError, DriveBridgeError, ValueError)):
+            self._json(400, {"error": "invalid_request"})
+            return
+        if isinstance(
+            exc,
+            (ProductStoreError, SecretProviderError, AgentRuntimeError, DriveStoreError, DriveSystemError, ReportBridgeError),
+        ):
+            self._json(503, {"error": "backend_unavailable"})
+            return
         self._json(500, {"error": "internal_error"})
 
     def _json(self, status: int, payload: dict[str, Any]) -> None:
@@ -293,6 +406,13 @@ def _required_text(payload: dict[str, Any], key: str) -> str:
     if not isinstance(value, str) or not value:
         raise AuthError(f"{key} is required")
     return value
+
+
+def _optional_root_name(payload: dict[str, Any]) -> str:
+    root_name = payload.get("root_name", "GenOS")
+    if not isinstance(root_name, str):
+        raise AuthError("root_name must be a string")
+    return root_name
 
 
 def attach_product_api(server: ThreadingHTTPServer) -> None:
