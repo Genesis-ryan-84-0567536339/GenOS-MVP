@@ -1,0 +1,51 @@
+name: MVP-10 Cloudflare Guided Edge Contract
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  edge-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout exact reviewed head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_sha="${{ github.event.pull_request.head.sha || github.sha }}"
+          tested_sha="$(git rev-parse HEAD)"
+          echo "tested_sha=${tested_sha}"
+          test "${tested_sha}" = "${expected_sha}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install product package
+        run: python -m pip install --disable-pip-version-check -e .
+      - name: Typed edge contract
+        run: python -m unittest -v tests.test_mvp10
+      - name: Static secret and execution boundary guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"' src/genos/edge.py
+          grep -q '"--token-file"' src/genos/edge_runtime.py
+          ! grep -q '"--token",' src/genos/edge_runtime.py
+          grep -q 'TUNNEL_TOKEN' src/genos/edge_runtime.py
+          grep -q 'env.pop("TUNNEL_TOKEN"' src/genos/edge_runtime.py
+          grep -q 'pkg.cloudflare.com/cloudflared noble main' src/genos/edge_cli.py
+          grep -q 'remote_resources_deleted.*False' src/genos/edge.py
+          grep -q 'genos-edge = "genos.edge_cli:main"' pyproject.toml
+          ! grep -R -E 'shell=True|os\.system\(' src/genos/edge.py src/genos/edge_runtime.py src/genos/edge_cli.py
+      - name: Compile edge modules
+        run: python -m py_compile src/genos/edge.py src/genos/edge_runtime.py src/genos/edge_cli.py
