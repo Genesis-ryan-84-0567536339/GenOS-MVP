@@ -266,7 +266,7 @@ def _drive(args: argparse.Namespace) -> int:
             _emit_safe(payload, as_json=args.as_json)
             return 0 if payload.get("state") == "READY" else 3
         if args.drive_command == "connect":
-            payload = services.connection.connect(secret_id=args.secret_id, root_name=args.root_name)
+            payload = services.connect(secret_id=args.secret_id, root_name=args.root_name)
             _emit_safe(payload, as_json=args.as_json)
             return 0 if payload.get("state") == "READY" else 3
         if args.drive_command == "verify":

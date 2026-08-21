@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import os
 from pathlib import Path
@@ -7,7 +8,8 @@ from typing import Any
 import uuid
 
 from .auth_service import CredentialService
-from .drive_bridge import DriveConnectionService, GoogleDriveRemote
+from .drive_bridge import DriveConnectionService, DriveRemote
+from .drive_oauth import GoogleDriveRemoteFactory
 from .drive_store import PostgresDriveMetadataStore
 from .observability import ObservabilityService
 from .product_store import PostgresProductStore
@@ -43,6 +45,7 @@ def build_drive_system(
     product_store: PostgresProductStore | None = None,
     credentials: CredentialService | None = None,
     observability: ObservabilityService | None = None,
+    remote_factory: Callable[[str], DriveRemote] | None = None,
 ) -> DriveSystemServices:
     store = product_store or PostgresProductStore()
     store.ensure_schema()
@@ -52,16 +55,17 @@ def build_drive_system(
         secret_root = os.environ.get("GENOS_SECRET_DIR", "/var/lib/genos/secrets")
         credentials = CredentialService(store, LocalFileSecretProvider(secret_root))
     state_root = Path(os.environ.get("GENOS_STATE_DIR", "/var/lib/genos"))
+    shared_remote_factory = remote_factory or GoogleDriveRemoteFactory()
     connection = DriveConnectionService(
         store=metadata,
         credentials=credentials,
-        remote_factory=GoogleDriveRemote,
+        remote_factory=shared_remote_factory,
         instance_id=system_instance_id(),
     )
     reports = DriveReportService(
         metadata_store=metadata,
         credentials=credentials,
-        remote_factory=GoogleDriveRemote,
+        remote_factory=shared_remote_factory,
         observability=observability or ObservabilityService(state_root=state_root),
         jobs=JsonStateStore(state_root),
     )

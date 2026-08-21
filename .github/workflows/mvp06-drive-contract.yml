@@ -1,0 +1,42 @@
+name: MVP-06 Drive Report Contract
+
+on:
+  pull_request:
+    paths:
+      - 'src/genos/drive_*.py'
+      - 'src/genos/report_bridge.py'
+      - 'src/genos/observability.py'
+      - 'src/genos/product_api.py'
+      - 'src/genos/cli.py'
+      - 'src/genos/core_service.py'
+      - 'ci/fresh-host-e2e.sh'
+      - 'tests/test_mvp06*.py'
+      - '.github/workflows/mvp06-drive-contract.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drive-contract:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Compile MVP-06 surfaces
+        run: PYTHONPATH=src python -m compileall -q src/genos tests/test_mvp06.py tests/test_mvp06_oauth.py
+      - name: Drive and report contract tests
+        run: PYTHONPATH=src python -m unittest discover -s tests -p 'test_mvp06*.py' -v
+      - name: Typed CLI parse smoke
+        run: |
+          PYTHONPATH=src python - <<'PY'
+          from genos.cli import build_parser
+          secret_id = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee'
+          connect = build_parser().parse_args(['drive','connect','--secret-id',secret_id,'--json'])
+          assert connect.command == 'drive' and connect.drive_command == 'connect'
+          scheduled = build_parser().parse_args(['report','system','--scheduled','--json'])
+          assert scheduled.command == 'report' and scheduled.scheduled is True
+          PY
