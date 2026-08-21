@@ -87,7 +87,7 @@ class ProductAPIApp:
         return self._drive().connection.status()
 
     def drive_connect(self, *, secret_id: str, root_name: str = "GenOS") -> dict[str, Any]:
-        return self._drive().connection.connect(secret_id=secret_id, root_name=root_name)
+        return self._drive().connect(secret_id=secret_id, root_name=root_name)
 
     def drive_verify(self) -> dict[str, Any]:
         return self._drive().connection.verify()
@@ -298,7 +298,6 @@ class ProductAPIHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 raise AuthError("invalid Content-Length") from exc
             if length > 0:
-                # Drain a bounded body before returning an error.
                 self.rfile.read(min(length, MAX_JSON_BODY))
                 raise AuthError("request body not allowed")
 
@@ -324,16 +323,18 @@ class ProductAPIHandler(BaseHTTPRequestHandler):
         if isinstance(exc, DriveNeedsAction):
             self._json(409, {"error": "drive_needs_action"})
             return
+        if isinstance(exc, DriveRemoteError):
+            self._json(503, {"error": "backend_unavailable"})
+            return
         if isinstance(exc, (AuthError, CredentialError, AgentAuthError, DriveBridgeError, ValueError)):
             self._json(400, {"error": "invalid_request"})
             return
         if isinstance(
             exc,
-            (ProductStoreError, SecretProviderError, AgentRuntimeError, DriveStoreError, DriveRemoteError, DriveSystemError, ReportBridgeError),
+            (ProductStoreError, SecretProviderError, AgentRuntimeError, DriveStoreError, DriveSystemError, ReportBridgeError),
         ):
             self._json(503, {"error": "backend_unavailable"})
             return
-        # Do not echo exception details: they may contain operational data.
         self._json(500, {"error": "internal_error"})
 
     def _json(self, status: int, payload: dict[str, Any]) -> None:
