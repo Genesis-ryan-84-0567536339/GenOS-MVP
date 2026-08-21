@@ -48,7 +48,7 @@ class MVP09ProductAPIHandler(ProductAPIHandler):
                 return
             if self.path == _AGENT_TASKS:
                 self.app.auth.authenticate(self._bearer_token())
-                self._json(200, {"tasks": self._tasks().history(limit=100)})
+                self._json(200, {"tasks": self._tasks().history(limit=8)})
                 return
             if self.path == _AGENT_LIBRARY:
                 self.app.auth.authenticate(self._bearer_token())
@@ -56,7 +56,7 @@ class MVP09ProductAPIHandler(ProductAPIHandler):
                 return
             if self.path == _JOBS:
                 self.app.auth.authenticate(self._bearer_token())
-                self._json(200, {"jobs": self._jobs().list_jobs(limit=200)})
+                self._json(200, {"jobs": self._jobs().list_jobs(limit=100)})
                 return
             if self.path == _REPORT_HISTORY:
                 self.app.auth.authenticate(self._bearer_token())
@@ -65,7 +65,7 @@ class MVP09ProductAPIHandler(ProductAPIHandler):
                     200,
                     {
                         "latest": history.latest(),
-                        "reports": history.list_history(limit=200),
+                        "reports": history.list_history(limit=50),
                     },
                 )
                 return
