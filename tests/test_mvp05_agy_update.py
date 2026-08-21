@@ -118,6 +118,32 @@ class OfficialManifestStagingTests(unittest.TestCase):
                 }
             )
 
+    def test_release_archive_rejects_symlink_entries(self) -> None:
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w:gz") as archive:
+            info = tarfile.TarInfo("antigravity")
+            info.type = tarfile.SYMTYPE
+            info.linkname = "/bin/sh"
+            archive.addfile(info)
+        with tempfile.TemporaryDirectory() as temp:
+            archive_path = Path(temp) / "bad.tar.gz"
+            archive_path.write_bytes(output.getvalue())
+            with self.assertRaises(AgentCliUpdateError):
+                AntigravityCliManager._extract_release_binary(archive_path, Path(temp) / "agy")
+
+    def test_release_archive_rejects_path_escape(self) -> None:
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w:gz") as archive:
+            payload = b"x"
+            info = tarfile.TarInfo("../antigravity")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+        with tempfile.TemporaryDirectory() as temp:
+            archive_path = Path(temp) / "bad.tar.gz"
+            archive_path.write_bytes(output.getvalue())
+            with self.assertRaises(AgentCliUpdateError):
+                AntigravityCliManager._extract_release_binary(archive_path, Path(temp) / "agy")
+
 
 class ManagedAgyUpdateTests(unittest.TestCase):
     def test_initial_install_and_upgrade_keep_previous_for_rollback(self) -> None:
