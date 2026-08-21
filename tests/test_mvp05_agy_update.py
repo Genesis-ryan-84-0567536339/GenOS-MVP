@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import json
 from pathlib import Path
+import tarfile
 import tempfile
 import unittest
 
-from genos.agent_cli_update import AntigravityCliManager
+from genos.agent_cli_update import (
+    AGY_TRUSTED_MANIFEST_HOST,
+    AgentCliUpdateError,
+    AntigravityCliManager,
+)
 
 
 class FixtureManager(AntigravityCliManager):
@@ -30,6 +37,86 @@ class FixtureManager(AntigravityCliManager):
             "installer_sha256": "a" * 64,
             "binary_sha256": digest,
         }
+
+
+class FakeOpener:
+    def __init__(self, payloads: dict[str, bytes]) -> None:
+        self.payloads = payloads
+        self.calls: list[str] = []
+
+    def __call__(self, url: str, *, timeout: float):
+        self.calls.append(url)
+        try:
+            return io.BytesIO(self.payloads[url])
+        except KeyError as exc:
+            raise OSError(f"unexpected fixture URL: {url}") from exc
+
+
+class OfficialManifestStagingTests(unittest.TestCase):
+    @staticmethod
+    def _release_archive(version: str) -> bytes:
+        executable = (
+            "#!/bin/sh\n"
+            f"if [ \"$1\" = \"--version\" ]; then echo '{version}'; exit 0; fi\n"
+            "if [ \"$1\" = \"--help\" ]; then echo '--model --effort --output-format'; exit 0; fi\n"
+            "exit 0\n"
+        ).encode()
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w:gz") as archive:
+            info = tarfile.TarInfo("antigravity")
+            info.size = len(executable)
+            info.mode = 0o755
+            archive.addfile(info, io.BytesIO(executable))
+        return output.getvalue()
+
+    def test_stage_uses_installer_published_manifest_and_sha512(self) -> None:
+        version = "1.2.3"
+        manifest_base = f"https://{AGY_TRUSTED_MANIFEST_HOST}"
+        manifest_url = f"{manifest_base}/manifests/linux_amd64.json"
+        archive_url = (
+            "https://storage.googleapis.com/antigravity-public/antigravity-cli/"
+            f"{version}-fixture/linux-x64/cli_linux_x64.tar.gz"
+        )
+        archive = self._release_archive(version)
+        installer = f'DOWNLOAD_BASE_URL="{manifest_base}"\n'.encode()
+        manifest = json.dumps(
+            {
+                "version": version,
+                "url": archive_url,
+                "sha512": hashlib.sha512(archive).hexdigest(),
+            }
+        ).encode()
+        opener = FakeOpener(
+            {
+                "https://antigravity.google/cli/install.sh": installer,
+                manifest_url: manifest,
+                archive_url: archive,
+            }
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            manager = AntigravityCliManager(root / "tools", agent_state_root=root / "agy-gen", opener=opener)
+            manager._ensure_writable_layout()
+            staged = manager._stage_latest()
+            candidate = Path(staged["binary"])
+            try:
+                self.assertEqual(staged["version"], version)
+                self.assertEqual(staged["installer_sha256"], hashlib.sha256(installer).hexdigest())
+                self.assertEqual(staged["binary_sha256"], hashlib.sha256(candidate.read_bytes()).hexdigest())
+                self.assertEqual(opener.calls, ["https://antigravity.google/cli/install.sh", manifest_url, archive_url])
+            finally:
+                candidate.unlink(missing_ok=True)
+
+    def test_manifest_rejects_non_google_release_url(self) -> None:
+        manager = AntigravityCliManager("/tmp/unused-agy-test")
+        with self.assertRaises(AgentCliUpdateError):
+            manager._validate_manifest(
+                {
+                    "version": "1.2.3",
+                    "url": "https://example.com/cli_linux_x64.tar.gz",
+                    "sha512": "a" * 128,
+                }
+            )
 
 
 class ManagedAgyUpdateTests(unittest.TestCase):
