@@ -10,7 +10,6 @@ from urllib import request as urlrequest
 import uuid
 
 from .auth_service import CredentialService
-from .redaction import redact
 
 
 DRIVE_CONSUMER_SCOPE = "drive-sync"
@@ -124,7 +123,7 @@ class DriveConnectionService:
                 last_verified_at=None,
                 last_error_code=None,
             ).to_dict()
-        return redact(dict(current))
+        return dict(current)
 
     def connect(self, *, secret_id: str, root_name: str = DEFAULT_ROOT_NAME) -> dict[str, Any]:
         root_name = _normalize_name(root_name)
@@ -136,12 +135,7 @@ class DriveConnectionService:
         if existing_secret and str(existing_secret) != secret_id and current.get("state") == "READY":
             raise DriveNeedsAction("Drive credential change requires explicit rebind")
 
-        checkpoint = self._checkpoint(
-            current,
-            state="NEEDS_AUTH",
-            secret_id=secret_id,
-            last_error_code=None,
-        )
+        checkpoint = self._checkpoint(current, state="NEEDS_AUTH", secret_id=secret_id, last_error_code=None)
         try:
             raw_access_token = self.credentials.get_secret_for_consumer(secret_id, consumer=DRIVE_CONSUMER_SCOPE)
             remote = self.remote_factory(raw_access_token)
@@ -193,13 +187,9 @@ class DriveConnectionService:
             if not isinstance(decoded, dict) or decoded.get("instance_id") != self.instance_id:
                 raise DriveRemoteError("Drive protocol instance binding mismatch")
             checkpoint = self._checkpoint(checkpoint, state="INSTANCE_BOUND")
-            return self._checkpoint(
-                checkpoint,
-                state="READY",
-                last_verified_at=_utc_now(),
-                last_error_code=None,
-            )
-        except DriveNeedsAction:
+            return self._checkpoint(checkpoint, state="READY", last_verified_at=_utc_now(), last_error_code=None)
+        except DriveNeedsAction as exc:
+            self._checkpoint(checkpoint, state="NEEDS_ACTION", last_error_code=_error_code(exc))
             raise
         except Exception as exc:
             error_code = _error_code(exc)
@@ -254,7 +244,7 @@ class DriveConnectionService:
             "updated_at": _utc_now(),
         }
         payload.update(changes)
-        return redact(self.store.upsert_drive_binding(payload))
+        return self.store.upsert_drive_binding(payload)
 
     def _protocol_json(self, *, root_id: str) -> str:
         payload = {
