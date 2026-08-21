@@ -1,4 +1,4 @@
-name: MVP-07 Kanban Drive Collaboration Contract
+name: MVP-07 Kanban Drive MCP Hub Contract
 
 on:
   pull_request:
@@ -6,6 +6,8 @@ on:
       - 'src/genos/kanban*.py'
       - 'src/genos/artifact_store.py'
       - 'src/genos/drive_collab.py'
+      - 'src/genos/mcp_*.py'
+      - 'src/genos/install.py'
       - 'src/genos/product_api.py'
       - 'src/genos/cli.py'
       - 'src/genos/core_service.py'
@@ -18,7 +20,7 @@ permissions:
   contents: read
 
 jobs:
-  kanban-drive-contract:
+  kanban-drive-mcp-contract:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
@@ -38,16 +40,36 @@ jobs:
             test "$(git rev-parse HEAD)" = "${{ github.event.pull_request.head.sha }}"
           fi
       - name: Compile MVP-07 surfaces
-        run: PYTHONPATH=src python -m compileall -q src/genos tests/test_mvp07.py
-      - name: Kanban and Drive collaboration contract tests
+        run: PYTHONPATH=src python -m compileall -q src/genos tests
+      - name: Kanban Drive and unified MCP contract tests
         run: PYTHONPATH=src python -m unittest discover -s tests -p 'test_mvp07*.py' -v
       - name: Authority and secret-boundary guard
         shell: bash
         run: |
           set -euo pipefail
-          ! grep -R "Drive.*authority" -n src/genos/kanban*.py src/genos/drive_collab.py | grep -vi "local\|replica" || true
-          ! grep -R -E "access_token|refresh_token|client_secret|raw_secret" -n tests/test_mvp07*.py src/genos/kanban*.py src/genos/artifact_store.py || {
-            echo 'MVP-07 Card/artifact surfaces must not contain provider credential fields'
-            exit 1
-          }
+          PYTHONPATH=src python - <<'PY'
+          from genos.kanban_store import _clean_json, KanbanStoreError
+          from genos.mcp_store import normalize_endpoint, scope_allows, McpStoreError
+
+          for key in ('access_token', 'refresh_token', 'client_secret', 'raw_secret', 'password'):
+              try:
+                  _clean_json({key: 'fixture-secret'})
+              except KanbanStoreError:
+                  pass
+              else:
+                  raise AssertionError(f'forbidden Card event credential field accepted: {key}')
+
+          try:
+              normalize_endpoint('https://user:secret@example.com/mcp')
+          except McpStoreError:
+              pass
+          else:
+              raise AssertionError('MCP endpoint embedded credential accepted')
+
+          assert scope_allows(['genos.*'], 'genos.cards.list')
+          assert not scope_allows(['genos.cards.list'], 'genos.cards.transition')
+          print('MVP07_SECRET_AUTHORITY_GUARD_PASS')
+          PY
+          grep -R "remote_role.*collaboration-replica" -n src/genos/drive_collab.py >/dev/null
+          ! grep -R "shell=True" -n src/genos/mcp_*.py
           echo 'MVP07_AUTHORITY_GUARD_PASS'
