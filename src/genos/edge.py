@@ -22,6 +22,7 @@ EDGE_TUNNEL_SCOPE = "cloudflare-edge-tunnel"
 CLOUDFLARE_API = "https://api.cloudflare.com/client/v4"
 MISSION_CONTROL_ORIGIN = "http://127.0.0.1:17882"
 MAX_RESPONSE_BYTES = 512 * 1024
+_DNS_COMMENT = "Managed by GenOS"
 _ID32 = re.compile(r"^[A-Fa-f0-9]{32}$")
 _HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
 
@@ -153,8 +154,12 @@ class EdgeBindingStore:
         normalized["tunnel_secret_id"] = _secretref_uuid(normalized.get("tunnel_secret_id"), field="tunnel_secret_id")
         rollback = normalized.get("rollback")
         if isinstance(rollback, dict):
-            rollback["api_secret_id"] = _secretref_uuid(rollback.get("api_secret_id"), field="rollback api_secret_id")
-            rollback["tunnel_secret_id"] = _secretref_uuid(rollback.get("tunnel_secret_id"), field="rollback tunnel_secret_id")
+            rollback["api_secret_id"] = _secretref_uuid(
+                rollback.get("api_secret_id"), field="rollback api_secret_id"
+            )
+            rollback["tunnel_secret_id"] = _secretref_uuid(
+                rollback.get("tunnel_secret_id"), field="rollback tunnel_secret_id"
+            )
         normalized["schema_version"] = "1.0"
         normalized["updated_at"] = _utc_now()
         self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -173,10 +178,6 @@ class EdgeBindingStore:
         return normalized
 
     def _public(self, payload: dict[str, Any]) -> dict[str, Any]:
-        # The strict allowlist is the sanitizer here. SecretRef UUIDs are safe
-        # identifiers and must remain visible so typed consumers can resolve the
-        # actual material through SecretProvider. No raw credential field is
-        # accepted by this store.
         result = {key: payload.get(key) for key in self._ALLOWED if key in payload}
         rollback = result.get("rollback")
         if rollback is not None:
@@ -185,7 +186,9 @@ class EdgeBindingStore:
             nested_unknown = set(rollback) - self._ROLLBACK_ALLOWED
             if nested_unknown:
                 raise EdgeError("unsupported edge rollback metadata key")
-            result["rollback"] = {key: rollback.get(key) for key in self._ROLLBACK_ALLOWED if key in rollback}
+            result["rollback"] = {
+                key: rollback.get(key) for key in self._ROLLBACK_ALLOWED if key in rollback
+            }
         return result
 
 
@@ -245,30 +248,57 @@ class CloudflareAPI:
             "config_src": str(result.get("config_src") or "UNKNOWN"),
         }
 
-    def upsert_dns_cname(self, *, zone_id: str, hostname: str, tunnel_id: str) -> dict[str, Any]:
+    def upsert_dns_cname(
+        self,
+        *,
+        zone_id: str,
+        hostname: str,
+        tunnel_id: str,
+        expected_record_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Create/update only a DNS record proven to belong to this GenOS tunnel.
+
+        Existing foreign CNAMEs are never overwritten. A missing local record ID
+        may be recovered only when provider state has the GenOS marker and points
+        at the exact same tunnel, covering interrupted first configuration safely.
+        """
         query = urlencode({"type": "CNAME", "name": hostname})
         listing = self._request("GET", f"/zones/{zone_id}/dns_records?{query}")
         rows = listing.get("result") if isinstance(listing.get("result"), list) else []
+        target = f"{tunnel_id}.cfargotunnel.com"
         body = {
             "type": "CNAME",
             "name": hostname,
-            "content": f"{tunnel_id}.cfargotunnel.com",
+            "content": target,
             "ttl": 1,
             "proxied": True,
-            "comment": "Managed by GenOS",
+            "comment": _DNS_COMMENT,
         }
         if rows:
-            record_id = str(rows[0].get("id") or "") if isinstance(rows[0], dict) else ""
+            if len(rows) != 1 or not isinstance(rows[0], dict):
+                raise EdgeConflict("hostname has ambiguous existing CNAME state")
+            row = rows[0]
+            record_id = str(row.get("id") or "")
             if not record_id:
                 raise EdgeRemoteError("Cloudflare DNS record response is invalid")
+            if expected_record_id:
+                if record_id != expected_record_id:
+                    raise EdgeConflict("GenOS-managed DNS record identity no longer matches provider state")
+            else:
+                provider_content = str(row.get("content") or "").rstrip(".").lower()
+                provider_comment = str(row.get("comment") or "")
+                if provider_content != target.lower() or provider_comment != _DNS_COMMENT:
+                    raise EdgeConflict("hostname already has a CNAME not owned by this GenOS instance")
             payload = self._request("PUT", f"/zones/{zone_id}/dns_records/{record_id}", body)
         else:
+            if expected_record_id:
+                raise EdgeConflict("GenOS-managed DNS record is missing; refusing blind replacement")
             payload = self._request("POST", f"/zones/{zone_id}/dns_records", body)
         result = _result_dict(payload)
         record_id = str(result.get("id") or "")
         if not record_id:
             raise EdgeRemoteError("Cloudflare DNS mutation returned no record id")
-        return {"id": record_id, "name": hostname, "content": body["content"], "proxied": True}
+        return {"id": record_id, "name": hostname, "content": target, "proxied": True}
 
     def _request(self, method: str, path: str, body: dict[str, Any] | None = None) -> dict[str, Any]:
         if not path.startswith("/"):
@@ -311,20 +341,28 @@ class PublicEdgeProbe:
                 with context.wrap_socket(sock, server_hostname=clean) as tls:
                     cert = tls.getpeercert()
                     version = tls.version() or "UNKNOWN"
-            with urllib.request.urlopen(f"https://{clean}/health", timeout=15, context=context) as response:  # noqa: S310
+            with urllib.request.urlopen(
+                f"https://{clean}/health", timeout=15, context=context
+            ) as response:  # noqa: S310 - verified user-selected public hostname
                 health_status = response.status
                 health_payload = json.loads(response.read(64 * 1024).decode("utf-8"))
             protected_request = urllib.request.Request(f"https://{clean}/api/v1/auth/me", method="GET")
             protected_status = 0
             try:
-                with urllib.request.urlopen(protected_request, timeout=15, context=context):  # noqa: S310
+                with urllib.request.urlopen(
+                    protected_request, timeout=15, context=context
+                ):  # noqa: S310 - verified user-selected public hostname
                     protected_status = 200
             except urllib.error.HTTPError as exc:
                 protected_status = exc.code
                 exc.close()
         except (OSError, ssl.SSLError, urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise EdgeRemoteError("public DNS/TLS target is not healthy") from exc
-        if health_status != 200 or not isinstance(health_payload, dict) or health_payload.get("role") != "mission-control":
+        if (
+            health_status != 200
+            or not isinstance(health_payload, dict)
+            or health_payload.get("role") != "mission-control"
+        ):
             raise EdgeRemoteError("public target does not project Mission Control health")
         if protected_status != 401:
             raise EdgeRemoteError("public Product API session protection did not reject an anonymous request")
@@ -373,27 +411,54 @@ class EdgeService:
         if clean_api_secret_id is None:
             raise EdgeNeedsAction("Cloudflare API SecretRef is required")
         previous = self.store.get()
-        raw_api_token = self.credentials.get_secret_for_consumer(clean_api_secret_id, consumer=EDGE_API_SCOPE)
+        raw_api_token = self.credentials.get_secret_for_consumer(
+            clean_api_secret_id, consumer=EDGE_API_SCOPE
+        )
         client = self.client_factory(raw_api_token)
-        tunnel_id = str(previous.get("tunnel_id") or "") if previous.get("api_secret_id") == clean_api_secret_id else ""
+        tunnel_id = (
+            str(previous.get("tunnel_id") or "")
+            if previous.get("api_secret_id") == clean_api_secret_id
+            else ""
+        )
         created = False
         if not tunnel_id:
-            tunnel = client.create_tunnel(account_id=clean_account, name=_bounded_tunnel_name(tunnel_name))
+            tunnel = client.create_tunnel(
+                account_id=clean_account, name=_bounded_tunnel_name(tunnel_name)
+            )
             tunnel_id = str(tunnel["id"])
             created = True
         rollback = _rollback_projection(previous)
         try:
-            client.configure_tunnel(account_id=clean_account, tunnel_id=tunnel_id, hostname=clean_host)
-            dns = client.upsert_dns_cname(zone_id=clean_zone, hostname=clean_host, tunnel_id=tunnel_id)
-            tunnel_token = client.tunnel_token(account_id=clean_account, tunnel_id=tunnel_id)
-            tunnel_secret_id = self._persist_tunnel_token(previous, tunnel_id=tunnel_id, tunnel_token=tunnel_token)
+            client.configure_tunnel(
+                account_id=clean_account, tunnel_id=tunnel_id, hostname=clean_host
+            )
+            dns = client.upsert_dns_cname(
+                zone_id=clean_zone,
+                hostname=clean_host,
+                tunnel_id=tunnel_id,
+                expected_record_id=(
+                    str(previous.get("dns_record_id") or "")
+                    if previous.get("hostname") == clean_host and previous.get("dns_record_id")
+                    else None
+                ),
+            )
+            tunnel_token = client.tunnel_token(
+                account_id=clean_account, tunnel_id=tunnel_id
+            )
+            tunnel_secret_id = self._persist_tunnel_token(
+                previous, tunnel_id=tunnel_id, tunnel_token=tunnel_token
+            )
         except Exception as exc:
             if previous.get("mode") == "DOMAIN" and previous.get("tunnel_id"):
                 try:
-                    old_secret_id = _secretref_uuid(previous.get("api_secret_id"), field="previous api_secret_id")
+                    old_secret_id = _secretref_uuid(
+                        previous.get("api_secret_id"), field="previous api_secret_id"
+                    )
                     if old_secret_id is None:
                         raise EdgeNeedsAction("previous Cloudflare API SecretRef is unavailable")
-                    old_raw_token = self.credentials.get_secret_for_consumer(old_secret_id, consumer=EDGE_API_SCOPE)
+                    old_raw_token = self.credentials.get_secret_for_consumer(
+                        old_secret_id, consumer=EDGE_API_SCOPE
+                    )
                     rollback_client = self.client_factory(old_raw_token)
                     self._rollback_remote(previous, rollback_client)
                 except Exception as rollback_exc:
@@ -451,13 +516,23 @@ class EdgeService:
         api_secret_id = _secretref_uuid(current.get("api_secret_id"), field="api_secret_id")
         if api_secret_id is None:
             raise EdgeNeedsAction("Cloudflare API SecretRef is unavailable")
-        raw_api_token = self.credentials.get_secret_for_consumer(api_secret_id, consumer=EDGE_API_SCOPE)
+        raw_api_token = self.credentials.get_secret_for_consumer(
+            api_secret_id, consumer=EDGE_API_SCOPE
+        )
         client = self.client_factory(raw_api_token)
-        tunnel = client.tunnel_status(account_id=str(current["account_id"]), tunnel_id=str(current["tunnel_id"]))
+        tunnel = client.tunnel_status(
+            account_id=str(current["account_id"]), tunnel_id=str(current["tunnel_id"])
+        )
         tunnel_state = str(tunnel.get("status") or "UNKNOWN").upper()
         if tunnel_state not in {"HEALTHY", "DEGRADED"}:
             degraded = dict(current)
-            degraded.update({"state": "DEGRADED", "tunnel_state": tunnel_state, "last_error_code": "TUNNEL_NOT_HEALTHY"})
+            degraded.update(
+                {
+                    "state": "DEGRADED",
+                    "tunnel_state": tunnel_state,
+                    "last_error_code": "TUNNEL_NOT_HEALTHY",
+                }
+            )
             self.store.save(_filter_store(degraded))
             raise EdgeNeedsAction("Cloudflare tunnel is not healthy yet")
         public = self.public_probe.verify(str(current["hostname"]))
@@ -494,10 +569,14 @@ class EdgeService:
         rollback = current.get("rollback") if isinstance(current.get("rollback"), dict) else None
         if not rollback:
             raise EdgeConflict("no previous edge configuration is available")
-        api_secret_id = _secretref_uuid(rollback.get("api_secret_id"), field="rollback api_secret_id")
+        api_secret_id = _secretref_uuid(
+            rollback.get("api_secret_id"), field="rollback api_secret_id"
+        )
         if api_secret_id is None:
             raise EdgeNeedsAction("previous Cloudflare API SecretRef is unavailable")
-        raw_api_token = self.credentials.get_secret_for_consumer(api_secret_id, consumer=EDGE_API_SCOPE)
+        raw_api_token = self.credentials.get_secret_for_consumer(
+            api_secret_id, consumer=EDGE_API_SCOPE
+        )
         client = self.client_factory(raw_api_token)
         self._rollback_remote(rollback, client)
         restored = dict(rollback)
@@ -506,8 +585,12 @@ class EdgeService:
         restored["last_error_code"] = None
         return self.store.save(_filter_store(restored))
 
-    def _persist_tunnel_token(self, previous: dict[str, Any], *, tunnel_id: str, tunnel_token: str) -> str:
-        existing = previous.get("tunnel_secret_id") if previous.get("tunnel_id") == tunnel_id else None
+    def _persist_tunnel_token(
+        self, previous: dict[str, Any], *, tunnel_id: str, tunnel_token: str
+    ) -> str:
+        existing = (
+            previous.get("tunnel_secret_id") if previous.get("tunnel_id") == tunnel_id else None
+        )
         if isinstance(existing, str) and existing:
             rotated = self.credentials.rotate(existing, tunnel_token, source="cloudflare-edge")
             return str(rotated["secret_id"])
@@ -530,8 +613,15 @@ class EdgeService:
         if not (account_id and zone_id and tunnel_id and hostname):
             return
         try:
-            client.configure_tunnel(account_id=account_id, tunnel_id=tunnel_id, hostname=hostname)
-            client.upsert_dns_cname(zone_id=zone_id, hostname=hostname, tunnel_id=tunnel_id)
+            client.configure_tunnel(
+                account_id=account_id, tunnel_id=tunnel_id, hostname=hostname
+            )
+            client.upsert_dns_cname(
+                zone_id=zone_id,
+                hostname=hostname,
+                tunnel_id=tunnel_id,
+                expected_record_id=str(previous.get("dns_record_id") or "") or None,
+            )
         except Exception as exc:
             raise EdgeRemoteError("Cloudflare rollback failed; local mode remains available") from exc
 
