@@ -7,6 +7,9 @@ import grp
 import json
 import os
 import tempfile
+import time
+import urllib.error
+import urllib.request
 
 from .install import ReleaseArtifact
 from .lifecycle import LifecycleError
@@ -60,6 +63,42 @@ class ReleaseCandidateLifecycleService(HardenedLifecycleService):
             "rollback_checkpoint_sha256": checkpoint["sha256"],
             "health": health,
         }
+
+    def _default_health_probe(self) -> dict[str, Any]:
+        """Verify required local core only; optional OAuth/provider state is not an update blocker."""
+        if not self._is_live_layout():
+            return {"state": "PASS", "source": "non-live-fixture"}
+        deadline = time.monotonic() + 30.0
+        last_reason = "UNKNOWN"
+        while time.monotonic() < deadline:
+            try:
+                mcp_port = int((self.paths.config / "mcp-port").read_text(encoding="utf-8").strip())
+                for role, port in (
+                    ("product-api", 17880),
+                    ("runtime", 17881),
+                    ("mcp-hub", mcp_port),
+                    ("mission-control", 17882),
+                ):
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2) as response:  # noqa: S310 - fixed loopback
+                        payload = json.loads(response.read().decode("utf-8"))
+                    if response.status != 200 or payload.get("status") != "ok" or payload.get("role") != role:
+                        raise LifecycleError(f"{role} local health mismatch")
+                heartbeat = self.paths.state / "worker" / "heartbeat.json"
+                worker = json.loads(heartbeat.read_text(encoding="utf-8"))
+                if worker.get("status") != "ok" or worker.get("role") != "worker":
+                    raise LifecycleError("worker heartbeat is not healthy")
+                db = self.runner.run(
+                    ["runuser", "-u", "genos", "--", "psql", "-d", "genos", "-tAc", "SELECT 1"],
+                    check=False,
+                    timeout=10,
+                )
+                if db.returncode != 0 or db.stdout.strip() != "1":
+                    raise LifecycleError("Product DB local peer health failed")
+                return {"state": "PASS", "source": "mvp11-local-core"}
+            except (OSError, ValueError, json.JSONDecodeError, urllib.error.URLError, TimeoutError, LifecycleError) as exc:
+                last_reason = type(exc).__name__
+                time.sleep(0.5)
+        return {"state": "FAIL", "source": "mvp11-local-core", "reason": last_reason}
 
     def _write_release_identity(self, release: ReleaseArtifact) -> None:
         env_path = self.paths.config / "genos.env"
