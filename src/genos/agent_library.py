@@ -11,6 +11,11 @@ from .agent_runtime import AgentRuntimeStore, AgentRuntimeError
 from .redaction import redact
 
 
+MAX_LIBRARY_CONTENT_BYTES = 48 * 1024
+MAX_PUBLIC_CONTENT_CHARS = 16 * 1024
+MAX_PUBLIC_REVISIONS = 50
+
+
 class AgentLibraryError(AgentRuntimeError):
     pass
 
@@ -41,7 +46,7 @@ class AgentLibraryService:
             raise AgentLibraryError("kind must be memory or skill")
         if not isinstance(content, str) or not content.strip():
             raise AgentLibraryError("revision content is required")
-        if len(content.encode("utf-8")) > 256 * 1024:
+        if len(content.encode("utf-8")) > MAX_LIBRARY_CONTENT_BYTES:
             raise AgentLibraryError("revision content is too large")
         revision = self.store.append_revision(kind, name, content, source=source)
         bindings = self._bindings()
@@ -84,13 +89,14 @@ class AgentLibraryService:
             binding = bindings.get(key) if isinstance(bindings.get(key), dict) else {}
             active_revision = int(binding.get("active_revision") or revisions[-1].get("revision") or 1)
             state = str(binding.get("state") or "ACTIVE")
+            visible = revisions[-MAX_PUBLIC_REVISIONS:]
             public_revisions = [
                 self._public_revision(
                     revision,
                     active=state == "ACTIVE" and int(revision.get("revision", -1)) == active_revision,
                     state=state if int(revision.get("revision", -1)) == active_revision else "SUPERSEDED",
                 )
-                for revision in revisions
+                for revision in visible
             ]
             items.append(
                 {
@@ -98,7 +104,7 @@ class AgentLibraryService:
                     "name": target.name,
                     "state": state,
                     "active_revision": active_revision,
-                    "revision_count": len(public_revisions),
+                    "revision_count": len(revisions),
                     "revisions": list(reversed(public_revisions)),
                 }
             )
@@ -115,9 +121,7 @@ class AgentLibraryService:
                 "created_at": revision.get("created_at"),
                 "state": state,
                 "active": bool(active),
-                # Owner-authenticated UI may inspect the revision, but keep a
-                # bounded projection and digest so support/audit does not need it.
-                "content": content[:64 * 1024],
+                "content": content[:MAX_PUBLIC_CONTENT_CHARS],
                 "content_sha256": hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest(),
             }
         )
