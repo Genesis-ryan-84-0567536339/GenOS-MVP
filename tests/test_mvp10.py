@@ -6,7 +6,14 @@ import tempfile
 import unittest
 import uuid
 
-from genos.edge import EdgeBindingStore, EdgeRemoteError, EdgeService, normalize_hostname
+from genos.edge import (
+    CloudflareAPI,
+    EdgeBindingStore,
+    EdgeConflict,
+    EdgeRemoteError,
+    EdgeService,
+    normalize_hostname,
+)
 
 
 ACCOUNT = "a" * 32
@@ -26,10 +33,24 @@ class FakeCredentials:
         assert consumer == "cloudflare-edge-tunnel"
         return self.values[secret_id]
 
-    def add(self, *, name: str, provider_name: str, raw_secret: str, consumer_scopes: list[str], source: str):
+    def add(
+        self,
+        *,
+        name: str,
+        provider_name: str,
+        raw_secret: str,
+        consumer_scopes: list[str],
+        source: str,
+    ):
         secret_id = str(uuid.uuid4())
         self.values[secret_id] = raw_secret
-        record = {"secret_id": secret_id, "name": name, "provider": provider_name, "active_revision": 1, "consumer_scopes": consumer_scopes}
+        record = {
+            "secret_id": secret_id,
+            "name": name,
+            "provider": provider_name,
+            "active_revision": 1,
+            "consumer_scopes": consumer_scopes,
+        }
         self.records[secret_id] = record
         return dict(record)
 
@@ -61,12 +82,23 @@ class FakeCloudflare:
         self.hostname = hostname
         return {"hostname": hostname}
 
-    def upsert_dns_cname(self, *, zone_id: str, hostname: str, tunnel_id: str):
+    def upsert_dns_cname(
+        self,
+        *,
+        zone_id: str,
+        hostname: str,
+        tunnel_id: str,
+        expected_record_id: str | None = None,
+    ):
         assert zone_id == ZONE and tunnel_id == self.tunnel_id
         self.calls.append(("dns", hostname))
         if hostname == self.fail_hostname:
             raise EdgeRemoteError("fixture dns failure")
-        record_id = self.dns.setdefault(hostname, f"dns-{len(self.dns)+1}")
+        existing = self.dns.get(hostname)
+        if expected_record_id and existing != expected_record_id:
+            raise EdgeConflict("fixture managed DNS record mismatch")
+        record_id = existing or f"dns-{len(self.dns)+1}"
+        self.dns[hostname] = record_id
         return {"id": record_id, "name": hostname, "content": f"{tunnel_id}.cfargotunnel.com"}
 
     def tunnel_token(self, *, account_id: str, tunnel_id: str):
@@ -98,7 +130,9 @@ class EdgeMVP10Tests(unittest.TestCase):
         service = EdgeService(
             store=EdgeBindingStore(Path(temp)),
             credentials=credentials,  # type: ignore[arg-type]
-            client_factory=lambda raw: cloudflare if raw == "raw-cloudflare-api-token-fixture" else (_ for _ in ()).throw(AssertionError("wrong token")),
+            client_factory=lambda raw: cloudflare
+            if raw == "raw-cloudflare-api-token-fixture"
+            else (_ for _ in ()).throw(AssertionError("wrong token")),
             public_probe=FakeProbe(),  # type: ignore[arg-type]
         )
         return credentials, cloudflare, service
@@ -136,10 +170,20 @@ class EdgeMVP10Tests(unittest.TestCase):
     def test_reconfigure_failure_rolls_route_back_and_preserves_local_truth(self):
         with tempfile.TemporaryDirectory() as temp:
             _credentials, cloudflare, service = self.fixture(temp)
-            service.configure(api_secret_id=API_SECRET, account_id=ACCOUNT, zone_id=ZONE, hostname="old.example.test")
+            service.configure(
+                api_secret_id=API_SECRET,
+                account_id=ACCOUNT,
+                zone_id=ZONE,
+                hostname="old.example.test",
+            )
             cloudflare.fail_hostname = "new.example.test"
             with self.assertRaises(EdgeRemoteError):
-                service.configure(api_secret_id=API_SECRET, account_id=ACCOUNT, zone_id=ZONE, hostname="new.example.test")
+                service.configure(
+                    api_secret_id=API_SECRET,
+                    account_id=ACCOUNT,
+                    zone_id=ZONE,
+                    hostname="new.example.test",
+                )
             current = service.status()
             self.assertEqual(current["hostname"], "old.example.test")
             self.assertEqual(current["last_error_code"], "RECONFIGURE_ROLLED_BACK")
@@ -149,16 +193,90 @@ class EdgeMVP10Tests(unittest.TestCase):
     def test_disable_is_unbind_only_and_does_not_delete_remote_resources(self):
         with tempfile.TemporaryDirectory() as temp:
             _credentials, _cloudflare, service = self.fixture(temp)
-            service.configure(api_secret_id=API_SECRET, account_id=ACCOUNT, zone_id=ZONE, hostname="console.example.test")
+            service.configure(
+                api_secret_id=API_SECRET,
+                account_id=ACCOUNT,
+                zone_id=ZONE,
+                hostname="console.example.test",
+            )
             disabled = service.disable()
             self.assertEqual(disabled["state"], "DISABLED")
             self.assertEqual(disabled["mode"], "LOCAL")
             self.assertFalse(disabled["remote_resources_deleted"])
             self.assertTrue(disabled["local_core_required"])
 
+    def test_cloudflare_adapter_refuses_unowned_existing_cname_without_mutation(self):
+        api = CloudflareAPI("fixture-api-token")
+        calls: list[tuple[str, str, object]] = []
+
+        def request(method: str, path: str, body=None):
+            calls.append((method, path, body))
+            if method == "GET":
+                return {
+                    "success": True,
+                    "result": [
+                        {
+                            "id": "foreign-record",
+                            "name": "occupied.example.test",
+                            "content": "other.example.test",
+                            "comment": "not GenOS",
+                        }
+                    ],
+                }
+            raise AssertionError("foreign DNS record must not be mutated")
+
+        api._request = request  # type: ignore[method-assign]
+        with self.assertRaises(EdgeConflict):
+            api.upsert_dns_cname(
+                zone_id=ZONE,
+                hostname="occupied.example.test",
+                tunnel_id="11111111-2222-4333-8444-555555555555",
+            )
+        self.assertEqual([item[0] for item in calls], ["GET"])
+
+    def test_cloudflare_adapter_recovers_matching_genos_record_after_interruption(self):
+        api = CloudflareAPI("fixture-api-token")
+        tunnel_id = "11111111-2222-4333-8444-555555555555"
+        calls: list[tuple[str, str, object]] = []
+
+        def request(method: str, path: str, body=None):
+            calls.append((method, path, body))
+            if method == "GET":
+                return {
+                    "success": True,
+                    "result": [
+                        {
+                            "id": "owned-record",
+                            "name": "resume.example.test",
+                            "content": f"{tunnel_id}.cfargotunnel.com",
+                            "comment": "Managed by GenOS",
+                        }
+                    ],
+                }
+            if method == "PUT":
+                return {
+                    "success": True,
+                    "result": {"id": "owned-record", "name": "resume.example.test"},
+                }
+            raise AssertionError("unexpected provider call")
+
+        api._request = request  # type: ignore[method-assign]
+        result = api.upsert_dns_cname(
+            zone_id=ZONE,
+            hostname="resume.example.test",
+            tunnel_id=tunnel_id,
+        )
+        self.assertEqual(result["id"], "owned-record")
+        self.assertEqual([item[0] for item in calls], ["GET", "PUT"])
+
     def test_hostname_validation_rejects_urls_and_paths(self):
         self.assertEqual(normalize_hostname("Console.Example.Test."), "console.example.test")
-        for value in ("https://example.test", "example.test/path", "localhost", "-bad.example"):
+        for value in (
+            "https://example.test",
+            "example.test/path",
+            "localhost",
+            "-bad.example",
+        ):
             with self.assertRaises(Exception):
                 normalize_hostname(value)
 
