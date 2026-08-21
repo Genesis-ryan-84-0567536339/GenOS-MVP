@@ -56,7 +56,7 @@ class GoogleOAuthClientConfig:
 
     @classmethod
     def from_environment(cls, env: Mapping[str, str] | None = None) -> GoogleOAuthClientConfig | None:
-        source = env or os.environ
+        source = env if env is not None else os.environ
         client_id = str(source.get("GENOS_GOOGLE_DRIVE_OAUTH_CLIENT_ID") or "").strip()
         client_secret = str(source.get("GENOS_GOOGLE_DRIVE_OAUTH_CLIENT_SECRET") or "").strip()
         if not client_id and not client_secret:

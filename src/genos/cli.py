@@ -82,6 +82,21 @@ def build_parser() -> argparse.ArgumentParser:
     drive_connect.add_argument("--json", action="store_true", dest="as_json")
     drive_verify = drive_sub.add_parser("verify", help="Re-verify the current Drive account and protocol binding")
     drive_verify.add_argument("--json", action="store_true", dest="as_json")
+    drive_authorize = drive_sub.add_parser("authorize", help="Start user-owned Google Drive authorization")
+    drive_authorize.add_argument("--root-name", default="GenOS")
+    drive_authorize.add_argument("--json", action="store_true", dest="as_json")
+    drive_auth_status = drive_sub.add_parser("auth-status", help="Show Google Drive authorization state without provider mutation")
+    drive_auth_status.add_argument("--json", action="store_true", dest="as_json")
+    drive_auth_poll = drive_sub.add_parser("auth-poll", help="Poll the active Google Drive authorization at the provider-approved cadence")
+    drive_auth_poll.add_argument("--json", action="store_true", dest="as_json")
+    drive_disconnect = drive_sub.add_parser("disconnect", help="Disable the bound Drive SecretRef without deleting remote Drive content")
+    drive_disconnect.add_argument("--json", action="store_true", dest="as_json")
+    drive_reauthorize = drive_sub.add_parser("reauthorize", help="Disconnect the current binding and start authorization for a chosen Google account")
+    drive_reauthorize.add_argument("--root-name", default=None)
+    drive_reauthorize.add_argument("--json", action="store_true", dest="as_json")
+    drive_reconnect = drive_sub.add_parser("reconnect", help="Recover a degraded binding or start user authorization when required")
+    drive_reconnect.add_argument("--root-name", default=None)
+    drive_reconnect.add_argument("--json", action="store_true", dest="as_json")
 
     report = sub.add_parser("report", help="Build/publish reports from the shared observability authority")
     report_sub = report.add_subparsers(dest="report_command", required=True)
@@ -265,6 +280,30 @@ def _drive(args: argparse.Namespace) -> int:
             payload = services.connection.status()
             _emit_safe(payload, as_json=args.as_json)
             return 0 if payload.get("state") == "READY" else 3
+        if args.drive_command == "authorize":
+            payload = services.oauth_start(root_name=args.root_name)
+            _emit_safe(payload, as_json=args.as_json)
+            return 0
+        if args.drive_command == "auth-status":
+            payload = services.oauth_status()
+            _emit_safe(payload, as_json=args.as_json)
+            return 0 if payload.get("state") in {"WAITING_USER", "AUTHORIZED"} else 3
+        if args.drive_command == "auth-poll":
+            payload = services.oauth_poll()
+            _emit_safe(payload, as_json=args.as_json)
+            return 0 if payload.get("state") in {"WAITING_USER", "AUTHORIZED", "READY"} else 3
+        if args.drive_command == "disconnect":
+            payload = services.disconnect()
+            _emit_safe(payload, as_json=args.as_json)
+            return 0 if payload.get("state") == "DISCONNECTED" else 3
+        if args.drive_command == "reauthorize":
+            payload = services.reauthorize(root_name=args.root_name)
+            _emit_safe(payload, as_json=args.as_json)
+            return 0 if payload.get("state") == "WAITING_USER" else 3
+        if args.drive_command == "reconnect":
+            payload = services.reconnect(root_name=args.root_name)
+            _emit_safe(payload, as_json=args.as_json)
+            return 0 if payload.get("state") in {"WAITING_USER", "READY"} else 3
         if args.drive_command == "connect":
             payload = services.connect(secret_id=args.secret_id, root_name=args.root_name)
             _emit_safe(payload, as_json=args.as_json)
