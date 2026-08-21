@@ -10,6 +10,8 @@ on:
       - ci/fresh-host-e2e.sh
       - ci/fresh-host-mvp03-e2e.sh
       - src/genos/install.py
+      - src/genos/mission_control.py
+      - src/genos/web/app.js
 
 permissions:
   contents: write
@@ -50,6 +52,11 @@ jobs:
           except urllib.error.HTTPError as exc:
               assert exc.code == 503, exc.code
               exc.close()"""
+          old_ui_probe_mvp03 = """try:
+              urllib.request.urlopen('http://127.0.0.1:17882/', timeout=5)
+              raise AssertionError('Mission Control root unexpectedly returned success before MVP-08')
+          except urllib.error.HTTPError as exc:
+              assert exc.code == 503, exc.code"""
           new_ui_probe = """with urllib.request.urlopen('http://127.0.0.1:17882/', timeout=5) as response:
               mission_html=response.read().decode('utf-8')
               mission_status=response.status
@@ -65,7 +72,7 @@ jobs:
           assert mission_asset_status == 200, mission_asset_status
           assert mission_asset, 'Mission Control app.js is empty'"""
           replace_exact("ci/fresh-host-e2e.sh", old_ui_probe, new_ui_probe)
-          replace_exact("ci/fresh-host-mvp03-e2e.sh", old_ui_probe, new_ui_probe)
+          replace_exact("ci/fresh-host-mvp03-e2e.sh", old_ui_probe_mvp03, new_ui_probe)
 
           replace_exact(
               "src/genos/install.py",
@@ -84,11 +91,22 @@ jobs:
               "READY",
               expected=1,
           )
+
+          # One-time MCP credential must leave the DOM regardless of how the dialog closes.
+          close_line = 'document.getElementById("close-token").addEventListener("click", () => { document.getElementById("one-time-token").textContent=""; document.getElementById("one-time-dialog").close(); });'
+          close_hardened = close_line + '\ndocument.getElementById("one-time-dialog").addEventListener("close", () => { document.getElementById("one-time-token").textContent=""; });'
+          replace_exact("src/genos/web/app.js", close_line, close_hardened)
+
+          # BaseHTTPRequestHandler's default formatted message can include query strings; log only sanitized route metadata.
+          old_log = '''    def log_message(self, fmt: str, *args: object) -> None:\n        # Fixed route paths are safe to record; credentials, headers and bodies\n        # are never logged by this service.\n        print(json.dumps({"event": "mission_control_http", "message": fmt % args}, ensure_ascii=False), flush=True)'''
+          new_log = '''    def log_message(self, fmt: str, *args: object) -> None:\n        # Log only sanitized route metadata. Never record query strings, headers\n        # or request bodies because callers can place sensitive text there.\n        path = self.path.split("?", 1)[0]\n        print(json.dumps({"event": "mission_control_http", "method": self.command, "path": path}, ensure_ascii=False), flush=True)'''
+          replace_exact("src/genos/mission_control.py", old_log, new_log)
           PY
           python3 -m compileall -q src ci/mvp09_browser_e2e.py
           grep -q '"mission_control_ui": "READY"' src/genos/install.py
           grep -q "frame-ancestors 'none'" ci/fresh-host-e2e.sh
           grep -q "frame-ancestors 'none'" ci/fresh-host-mvp03-e2e.sh
+          grep -q 'one-time-dialog.*addEventListener("close"' src/genos/web/app.js
           git diff --check
       - name: Commit patch
         shell: bash
@@ -100,6 +118,6 @@ jobs:
           fi
           git config user.name "genos-plan-ci"
           git config user.email "genos-plan-ci@users.noreply.github.com"
-          git add ci/mvp09_browser_e2e.py ci/fresh-host-e2e.sh ci/fresh-host-mvp03-e2e.sh src/genos/install.py
-          git commit -m "fix: align fresh-host gates with approved Mission Control UI"
+          git add ci/mvp09_browser_e2e.py ci/fresh-host-e2e.sh ci/fresh-host-mvp03-e2e.sh src/genos/install.py src/genos/mission_control.py src/genos/web/app.js
+          git commit -m "fix: align Mission Control gates and harden transient credentials"
           git push origin HEAD:plan/mvp-09-mission-control-ui
