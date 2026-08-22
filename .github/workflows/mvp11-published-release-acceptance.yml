@@ -1,0 +1,102 @@
+name: MVP-11 Published Release Acceptance
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/mvp11-published-release-acceptance.yml'
+      - '.github/workflows/release-package.yml'
+      - 'ci/mvp11-published-release-e2e.sh'
+  workflow_run:
+    workflows: ['MVP Release Package']
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  published-release-fresh-host:
+    if: github.event_name == 'pull_request' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    steps:
+      - name: Checkout acceptance harness
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || 'main' }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Resolve actual main prerelease
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          main_sha="$(git rev-parse origin/main)"
+          tag="mvp-rc-${main_sha:0:12}"
+          echo "main_sha=$main_sha" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isPrerelease,targetCommitish,publishedAt > "$RUNNER_TEMP/release.json"
+          python3 - "$RUNNER_TEMP/release.json" "$tag" "$main_sha" <<'PY'
+          import json, sys
+          p=json.load(open(sys.argv[1], encoding='utf-8'))
+          assert p['tagName'] == sys.argv[2], p
+          assert p['isPrerelease'] is True, p
+          assert p['targetCommitish'] == sys.argv[3], p
+          assert p.get('publishedAt'), p
+          PY
+
+      - name: Download immutable prerelease assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.release.outputs.tag }}
+          MAIN_SHA: ${{ steps.release.outputs.main_sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/published-release"
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/published-release"
+          cd "$RUNNER_TEMP/published-release"
+          test -f SHA256SUMS
+          test -f install-metadata.json
+          test -f bootstrap.sh
+          test -f "genos-mvp-${MAIN_SHA}.tar.gz"
+
+          # Compatibility verification for the already-published RC whose
+          # checksum file used build-time `dist/` paths. The packaging fix in
+          # this PR makes future releases use portable basenames.
+          mkdir -p dist
+          ln -sfn "../genos-mvp-${MAIN_SHA}.tar.gz" "dist/genos-mvp-${MAIN_SHA}.tar.gz"
+          ln -sfn ../bootstrap.sh dist/bootstrap.sh
+          sha256sum --check SHA256SUMS
+
+          python3 - "$MAIN_SHA" <<'PY'
+          import json, sys
+          p=json.load(open('install-metadata.json', encoding='utf-8'))
+          assert p['git_sha'] == sys.argv[1], p
+          assert p['archive'] == f"genos-mvp-{sys.argv[1]}.tar.gz", p
+          assert p['release_state'] == 'RELEASE_CANDIDATE', p
+          assert p['certified_target'] == 'ubuntu-24.04-amd64-native', p
+          PY
+
+      - name: Install isolated VM tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
+
+      - name: Fresh install actual published prerelease and reboot
+        shell: bash
+        run: bash ci/mvp11-published-release-e2e.sh "$RUNNER_TEMP/published-release"
+
+      - name: Upload sanitized published-release evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mvp11-published-release-${{ steps.release.outputs.main_sha }}
+          path: ${{ runner.temp }}/genos-published-release-e2e/published-release-evidence.json
+          if-no-files-found: error
+          retention-days: 30

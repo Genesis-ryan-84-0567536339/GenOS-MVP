@@ -48,7 +48,10 @@ jobs:
           git archive --format=tar.gz --output="$archive" HEAD
           cp scripts/bootstrap.sh dist/bootstrap.sh
           chmod 755 dist/bootstrap.sh
-          sha256sum "$archive" dist/bootstrap.sh > dist/SHA256SUMS
+          (
+            cd dist
+            sha256sum "genos-mvp-${TARGET_SHA}.tar.gz" bootstrap.sh > SHA256SUMS
+          )
           python3 - "$archive" <<'PY'
           from pathlib import Path, PurePosixPath
           import sys, tarfile
@@ -83,7 +86,10 @@ jobs:
           }
           Path('dist/install-metadata.json').write_text(json.dumps(metadata, indent=2, sort_keys=True) + '\n', encoding='utf-8')
           PY
-          sha256sum --check dist/SHA256SUMS
+          (
+            cd dist
+            sha256sum --check SHA256SUMS
+          )
 
       - name: Upload verified package artifact
         uses: actions/upload-artifact@v4
@@ -115,7 +121,10 @@ jobs:
           set -euo pipefail
           short="${GITHUB_SHA:0:12}"
           tag="mvp-rc-${short}"
-          sha256sum --check dist/SHA256SUMS
+          (
+            cd dist
+            sha256sum --check SHA256SUMS
+          )
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" dist/* --clobber
           else
