@@ -28,6 +28,17 @@ _MCP_PRINCIPAL_PREFIX = "/api/v1/mcp/principals/"
 _MCP_ROTATE_SUFFIX = "/rotate"
 
 
+def _drive_oauth_browser_projection(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep the approved UI compatible with the canonical sanitized URL key."""
+
+    oauth = dict(payload)
+    verification_url = oauth.get("verification_url") or oauth.get("verification_uri")
+    if isinstance(verification_url, str) and verification_url:
+        oauth["verification_url"] = verification_url
+        oauth["verification_uri"] = verification_url
+    return oauth
+
+
 class MVP09ProductAPIHandler(ProductAPIHandler):
     """MVP-09 UI endpoints layered over existing Product domain authorities.
 
@@ -75,16 +86,7 @@ class MVP09ProductAPIHandler(ProductAPIHandler):
                 return
             if self.path == _DRIVE_OAUTH:
                 self.app.auth.authenticate(self._bearer_token())
-                oauth = dict(self.app.drive_oauth_status())
-                # The backend canonical name is verification_url. MVP-09's
-                # approved browser contract originally consumed verification_uri.
-                # Project both aliases to the same sanitized HTTPS URL so old and
-                # new Mission Control assets remain compatible during update.
-                verification_url = oauth.get("verification_url") or oauth.get("verification_uri")
-                if isinstance(verification_url, str) and verification_url:
-                    oauth["verification_url"] = verification_url
-                    oauth["verification_uri"] = verification_url
-                self._json(200, {"oauth": oauth})
+                self._json(200, {"oauth": _drive_oauth_browser_projection(self.app.drive_oauth_status())})
                 return
             super().do_GET()
         except Exception as exc:
