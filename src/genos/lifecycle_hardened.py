@@ -265,6 +265,9 @@ class HardenedLifecycleService(LifecycleService):
             raise LifecycleError("target release directory already exists with different digest")
         self.paths.releases.mkdir(parents=True, exist_ok=True)
         temp = Path(tempfile.mkdtemp(prefix=f".{release.git_sha}.", dir=str(self.paths.releases)))
+        # mkdtemp is 0700 by design. Releases are immutable code trees that must
+        # remain traversable by the least-privilege `genos` service identity.
+        os.chmod(temp, 0o755)
         try:
             with tarfile.open(release.archive, "r:*") as archive:
                 members = archive.getmembers()
