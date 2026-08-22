@@ -4,24 +4,25 @@ on:
   pull_request:
     paths:
       - '.github/workflows/mvp11-published-release-acceptance.yml'
+      - '.github/workflows/release-package.yml'
       - 'ci/mvp11-published-release-e2e.sh'
-  push:
-    branches: [main]
-    paths:
-      - '.github/workflows/mvp11-published-release-acceptance.yml'
-      - 'ci/mvp11-published-release-e2e.sh'
+  workflow_run:
+    workflows: ['MVP Release Package']
+    types: [completed]
 
 permissions:
   contents: read
 
 jobs:
   published-release-fresh-host:
+    if: github.event_name == 'pull_request' || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.head_branch == 'main')
     runs-on: ubuntu-24.04
     timeout-minutes: 70
     steps:
       - name: Checkout acceptance harness
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || 'main' }}
           fetch-depth: 0
           persist-credentials: false
 
@@ -62,7 +63,15 @@ jobs:
           test -f install-metadata.json
           test -f bootstrap.sh
           test -f "genos-mvp-${MAIN_SHA}.tar.gz"
+
+          # Compatibility verification for the already-published RC whose
+          # checksum file used build-time `dist/` paths. The packaging fix in
+          # this PR makes future releases use portable basenames.
+          mkdir -p dist
+          ln -sfn "../genos-mvp-${MAIN_SHA}.tar.gz" "dist/genos-mvp-${MAIN_SHA}.tar.gz"
+          ln -sfn ../bootstrap.sh dist/bootstrap.sh
           sha256sum --check SHA256SUMS
+
           python3 - "$MAIN_SHA" <<'PY'
           import json, sys
           p=json.load(open('install-metadata.json', encoding='utf-8'))
