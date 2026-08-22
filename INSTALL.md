@@ -32,6 +32,8 @@ Normal first-run UX:
 5. MCP Hub tự có một endpoint loopback bền vững; tạo Agent principal/token một lần và cấp scope ngay trong Console;
 6. upstream MCP như GitHub/Google Drive được đăng ký tập trung trong Hub, Agent chỉ cần endpoint/token GenOS.
 
+**User không tạo Google Cloud OAuth client, không sửa file config và không copy access/refresh token.** Bản phát hành dành cho user phải mang sẵn OAuth application identity thuộc distribution GenOS; user chỉ bấm Connect, mở trang Google và cho phép tài khoản Drive họ chọn. Credential tái sử dụng của từng user sau đó chỉ đi vào SecretProvider/SecretRef của instance. `install-metadata.json` của release user phải ghi `google_drive_oauth_distribution_state=CONFIGURED`; release thiếu trạng thái này chỉ là build kỹ thuật và không được coi là bản sẵn sàng cho final user journey.
+
 MCP Hub **không hard-code một port cố định**: installer chọn một port loopback không xung đột trong managed range, lưu tại `/etc/genos/mcp-port` và giữ nguyên qua restart/reboot/update/restore. Endpoint chính xác luôn xem trong **Connections & Credentials → Unified MCP Hub**; Agent ngoài chỉ cấu hình endpoint + one-time GenOS token ở đó, không cần cài credential/upstream MCP riêng trên từng Agent.
 
 ## Lifecycle
