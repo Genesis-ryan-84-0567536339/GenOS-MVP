@@ -10,7 +10,7 @@ requires-python = ">=3.11"
 dependencies = ["jsonschema>=4.10,<5"]
 
 [project.scripts]
-genos = "genos.cli:main"
+genos = "genos.cli_mvp11:main"
 genos-edge = "genos.edge_cli:main"
 
 [tool.setuptools]
