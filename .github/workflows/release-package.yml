@@ -46,9 +46,9 @@ jobs:
           mkdir -p dist
           archive="dist/genos-mvp-${TARGET_SHA}.tar.gz"
           git archive --format=tar.gz --output="$archive" HEAD
-          sha256sum "$archive" > dist/SHA256SUMS
           cp scripts/bootstrap.sh dist/bootstrap.sh
           chmod 755 dist/bootstrap.sh
+          sha256sum "$archive" dist/bootstrap.sh > dist/SHA256SUMS
           python3 - "$archive" <<'PY'
           from pathlib import Path, PurePosixPath
           import sys, tarfile
@@ -68,19 +68,22 @@ jobs:
           from pathlib import Path
           sha = os.environ['TARGET_SHA']
           archive = Path('dist') / f'genos-mvp-{sha}.tar.gz'
+          bootstrap = Path('dist/bootstrap.sh')
           digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          bootstrap_digest = hashlib.sha256(bootstrap.read_bytes()).hexdigest()
           metadata = {
               'schema_version': '1.0',
               'git_sha': sha,
               'archive': archive.name,
               'sha256': digest,
-              'bootstrap': 'bootstrap.sh',
+              'bootstrap': bootstrap.name,
+              'bootstrap_sha256': bootstrap_digest,
               'certified_target': 'ubuntu-24.04-amd64-native',
               'release_state': 'RELEASE_CANDIDATE',
           }
           Path('dist/install-metadata.json').write_text(json.dumps(metadata, indent=2, sort_keys=True) + '\n', encoding='utf-8')
           PY
-          grep -F "$(sha256sum "$archive" | awk '{print $1}')" dist/SHA256SUMS
+          sha256sum --check dist/SHA256SUMS
 
       - name: Upload verified package artifact
         uses: actions/upload-artifact@v4
@@ -112,6 +115,7 @@ jobs:
           set -euo pipefail
           short="${GITHUB_SHA:0:12}"
           tag="mvp-rc-${short}"
+          sha256sum --check dist/SHA256SUMS
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" dist/* --clobber
           else
@@ -119,5 +123,5 @@ jobs:
               --target "$GITHUB_SHA" \
               --prerelease \
               --title "GenOS MVP Release Candidate ${short}" \
-              --notes "Verified GenOS MVP release candidate for Ubuntu Server 24.04 LTS amd64 native. Download install-metadata.json, the matching tar.gz and bootstrap.sh; verify SHA-256 before installation. External Owner/Google/MCP authorization remains user-driven during final runtime acceptance."
+              --notes "Verified GenOS MVP release candidate for Ubuntu Server 24.04 LTS amd64 native. Download SHA256SUMS, install-metadata.json, the matching tar.gz and bootstrap.sh; verify both the archive and bootstrap checksums before installation. External Owner/Google/MCP authorization remains user-driven during final runtime acceptance."
           fi
