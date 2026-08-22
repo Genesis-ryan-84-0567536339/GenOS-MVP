@@ -1,0 +1,106 @@
+name: MVP-11 Release Candidate Lifecycle Contract
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle-contract:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout exact reviewed head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_sha="${{ github.event.pull_request.head.sha || github.sha }}"
+          tested_sha="$(git rev-parse HEAD)"
+          echo "tested_sha=${tested_sha}"
+          test "${tested_sha}" = "${expected_sha}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install exact package
+        run: python -m pip install --disable-pip-version-check -e .
+      - name: Lifecycle contract tests
+        run: python -m unittest -v tests.test_mvp11 tests.test_mvp11_reinstall
+      - name: Compile release-candidate lifecycle
+        run: python -m py_compile src/genos/lifecycle.py src/genos/lifecycle_hardened.py src/genos/lifecycle_release.py src/genos/reinstall.py src/genos/cli_mvp11.py src/genos/__main__.py
+      - name: Static destructive and secret boundary guard
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -q 'genos = "genos.cli_mvp11:main"' pyproject.toml
+          grep -q 'from .cli_mvp11 import main' src/genos/__main__.py
+          grep -q 'prepare_reinstall_from_preserved_state' src/genos/cli_mvp11.py
+          grep -q 'install_checkpoint_reset' src/genos/reinstall.py
+          grep -q 'DROP ROLE IF EXISTS genos' src/genos/lifecycle_hardened.py
+          grep -q 'remote_resources_deleted.*False' src/genos/lifecycle_hardened.py
+          grep -q 'update failed; previous release and checkpoint were restored' src/genos/lifecycle_release.py
+          grep -q 'release checksum mismatch' scripts/bootstrap.sh
+          ! grep -R -E 'shell=True|os\.system\(' src/genos/lifecycle.py src/genos/lifecycle_hardened.py src/genos/lifecycle_release.py src/genos/reinstall.py src/genos/cli_mvp11.py
+          ! grep -q 'curl |' scripts/bootstrap.sh
+          ! grep -q 'wget |' scripts/bootstrap.sh
+      - name: Shell syntax
+        run: |
+          bash -n scripts/bootstrap.sh
+          bash -n ci/mvp11-fresh-host-e2e.sh
+
+  fresh-host-lifecycle:
+    name: ubuntu-24.04-amd64-native-lifecycle
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout exact reviewed head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Verify exact checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected_sha="${{ github.event.pull_request.head.sha || github.sha }}"
+          test "$(git rev-parse HEAD)" = "$expected_sha"
+      - name: Install isolated VM tooling
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends qemu-system-x86 qemu-utils cloud-image-utils openssh-client curl
+      - name: Full lifecycle on isolated fresh host
+        shell: bash
+        run: bash ci/mvp11-fresh-host-e2e.sh
+      - name: Verify extracted support bundle has no fixture credentials
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          support="${RUNNER_TEMP}/genos-mvp11-fresh-host/genos-support.tar.gz"
+          test -f "$support"
+          mkdir -p "${RUNNER_TEMP}/mvp11-support-scan"
+          tar -xzf "$support" -C "${RUNNER_TEMP}/mvp11-support-scan"
+          ! grep -R -a -F 'MVP11_RAW_SECRET_' "${RUNNER_TEMP}/mvp11-support-scan"
+          ! grep -R -a -E 'genos_mcp_[A-Za-z0-9_-]+' "${RUNNER_TEMP}/mvp11-support-scan"
+      - name: Failure note
+        if: failure()
+        run: echo "MVP-11 fresh-host lifecycle failed; unverified guest artifacts are not uploaded."
+      - name: Upload sanitized lifecycle evidence
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mvp11-lifecycle-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/genos-mvp11-fresh-host/mvp11-evidence.json
+          if-no-files-found: error
+          retention-days: 14
