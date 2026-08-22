@@ -118,6 +118,7 @@ class MVP11LifecycleTests(unittest.TestCase):
             result = service.update(release=release)
             self.assertEqual(result["state"], "SUCCEEDED")
             self.assertEqual(paths.current.resolve(), (paths.releases / new_sha).resolve())
+            self.assertEqual((paths.releases / new_sha).stat().st_mode & 0o777, 0o755)
             self.assertIn(f"GENOS_RELEASE_SHA={new_sha}", (paths.config / "genos.env").read_text(encoding="utf-8"))
             manifest = json.loads((paths.state / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["release"]["git_sha"], new_sha)
