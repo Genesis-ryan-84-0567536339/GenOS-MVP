@@ -1,0 +1,121 @@
+name: MVP Release Package
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/release-package.yml'
+      - 'INSTALL.md'
+      - 'scripts/bootstrap.sh'
+      - 'src/**'
+      - 'pyproject.toml'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/release-package.yml'
+      - 'INSTALL.md'
+      - 'scripts/bootstrap.sh'
+      - 'src/**'
+      - 'pyproject.toml'
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout exact commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Verify checkout
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+
+      - name: Build verified install bundle
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          archive="dist/genos-mvp-${GITHUB_SHA}.tar.gz"
+          git archive --format=tar.gz --output="$archive" HEAD
+          sha256sum "$archive" > dist/SHA256SUMS
+          cp scripts/bootstrap.sh dist/bootstrap.sh
+          chmod 755 dist/bootstrap.sh
+          python3 - "$archive" <<'PY'
+          from pathlib import Path, PurePosixPath
+          import sys, tarfile
+          archive = Path(sys.argv[1])
+          with tarfile.open(archive, 'r:gz') as tf:
+              members = tf.getmembers()
+              names = {member.name for member in members}
+              assert 'src/genos/__init__.py' in names
+              for member in members:
+                  name = PurePosixPath(member.name)
+                  assert not name.is_absolute() and '..' not in name.parts
+                  assert not member.issym() and not member.islnk() and not member.isdev()
+                  assert member.isdir() or member.isfile()
+          PY
+          python3 - <<'PY'
+          import hashlib, json, os
+          from pathlib import Path
+          sha = os.environ['GITHUB_SHA']
+          archive = Path('dist') / f'genos-mvp-{sha}.tar.gz'
+          digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+          metadata = {
+              'schema_version': '1.0',
+              'git_sha': sha,
+              'archive': archive.name,
+              'sha256': digest,
+              'bootstrap': 'bootstrap.sh',
+              'certified_target': 'ubuntu-24.04-amd64-native',
+              'release_state': 'RELEASE_CANDIDATE',
+          }
+          Path('dist/install-metadata.json').write_text(json.dumps(metadata, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          PY
+          grep -F "$(sha256sum "$archive" | awk '{print $1}')" dist/SHA256SUMS
+
+      - name: Upload verified package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: genos-mvp-release-${{ github.sha }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+
+  prerelease:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified package artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: genos-mvp-release-${{ github.sha }}
+          path: dist
+
+      - name: Publish immutable GitHub prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          short="${GITHUB_SHA:0:12}"
+          tag="mvp-rc-${short}"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --target "$GITHUB_SHA" \
+              --prerelease \
+              --title "GenOS MVP Release Candidate ${short}" \
+              --notes "Verified GenOS MVP release candidate for Ubuntu Server 24.04 LTS amd64 native. Download install-metadata.json, the matching tar.gz and bootstrap.sh; verify SHA-256 before installation. External Owner/Google/MCP authorization remains user-driven during final runtime acceptance."
+          fi
