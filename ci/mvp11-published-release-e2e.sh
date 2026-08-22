@@ -84,6 +84,10 @@ scp_guest() {
     -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null "$@"
 }
 
+verify_enabled() {
+  ssh_guest "sudo systemctl is-enabled postgresql.service genos-product-api.service genos-runtime.service genos-worker.service genos-mcp.service genos-mission-control.service"
+}
+
 verify_core() {
   ssh_guest "sudo systemctl is-active postgresql.service genos-product-api.service genos-runtime.service genos-worker.service genos-mcp.service genos-mission-control.service"
   ssh_guest "sudo python3 - <<'PY'
@@ -97,6 +101,28 @@ worker=json.load(open('/var/lib/genos/worker/heartbeat.json', encoding='utf-8'))
 assert worker['status'] == 'ok' and worker['role'] == 'worker', worker
 PY"
   ssh_guest "sudo -u genos psql -d genos -tAc 'SELECT 1' | grep -qx 1"
+}
+
+diagnose_core() {
+  set +e
+  echo "==> GenOS post-reboot diagnostics" >&2
+  ssh_guest "sudo systemctl is-system-running || true; sudo systemctl --failed --no-pager || true" >&2
+  ssh_guest "sudo systemctl is-enabled postgresql.service genos-product-api.service genos-runtime.service genos-worker.service genos-mcp.service genos-mission-control.service || true" >&2
+  ssh_guest "sudo systemctl --no-pager --full status postgresql.service genos-product-api.service genos-runtime.service genos-worker.service genos-mcp.service genos-mission-control.service || true" >&2
+  set -e
+}
+
+wait_for_core() {
+  local attempts="${1:-60}"
+  for _ in $(seq 1 "$attempts"); do
+    if verify_core >/dev/null 2>&1; then
+      verify_core
+      return 0
+    fi
+    sleep 2
+  done
+  diagnose_core
+  return 1
 }
 
 echo "==> Boot pinned Ubuntu 24.04 amd64 fresh target"
@@ -156,7 +182,8 @@ ssh_guest "chmod 700 /tmp/bootstrap.sh"
 
 echo "==> Install from actual GitHub prerelease assets"
 ssh_guest "sudo /tmp/bootstrap.sh --release /tmp/$ARCHIVE_NAME --sha256 $ARCHIVE_SHA --git-sha $RELEASE_SHA"
-verify_core
+verify_enabled
+wait_for_core 30
 FIRST_INSTANCE="$(ssh_guest 'sudo cat /etc/genos/instance-id')"
 FIRST_MCP_PORT="$(ssh_guest 'sudo cat /etc/genos/mcp-port')"
 FIRST_BOOT="$(ssh_guest 'cat /proc/sys/kernel/random/boot_id')"
@@ -175,13 +202,23 @@ PY
 
 echo "==> Reboot published-release instance"
 ssh_guest "sudo reboot" >/dev/null 2>&1 || true
+reboot_ready=0
 for _ in $(seq 1 180); do
   sleep 3
-  if ssh_guest true >/dev/null 2>&1; then break; fi
+  if ssh_guest true >/dev/null 2>&1; then reboot_ready=1; break; fi
 done
+if [[ "$reboot_ready" != 1 ]]; then
+  tail -n 200 "$SERIAL_LOG" || true
+  exit 1
+fi
 SECOND_BOOT="$(ssh_guest 'cat /proc/sys/kernel/random/boot_id')"
 test "$SECOND_BOOT" != "$FIRST_BOOT"
-verify_core
+# SSH can accept connections before multi-user.target and dependent GenOS units
+# have settled. Prove persistence with is-enabled, then allow bounded startup
+# time; this still fails if any service never becomes healthy.
+ssh_guest "sudo systemctl is-system-running --wait >/dev/null 2>&1 || true"
+verify_enabled
+wait_for_core 60
 test "$(ssh_guest 'sudo cat /etc/genos/instance-id')" = "$FIRST_INSTANCE"
 test "$(ssh_guest 'sudo cat /etc/genos/mcp-port')" = "$FIRST_MCP_PORT"
 
@@ -198,7 +235,7 @@ python3 - "$EVIDENCE" "$RELEASE_SHA" "$ARCHIVE_SHA" "$FIRST_INSTANCE" "$FIRST_MC
 import json, sys
 path, sha, archive_sha, instance, mcp_port, boot1, boot2 = sys.argv[1:]
 payload={
-  'schema_version':'1.0',
+  'schema_version':'1.1',
   'gate':'MVP11_PUBLISHED_RELEASE_FRESH_HOST',
   'state':'PASS',
   'release_git_sha':sha,
@@ -207,6 +244,8 @@ payload={
   'instance_id':instance,
   'mcp_port':int(mcp_port),
   'reboot_verified':boot1 != boot2,
+  'service_enablement_verified':True,
+  'post_reboot_readiness_waited':True,
   'local_core_healthy':True,
   'external_auth_fabricated':False,
   'support_bundle_secret_scan':'PASS',
