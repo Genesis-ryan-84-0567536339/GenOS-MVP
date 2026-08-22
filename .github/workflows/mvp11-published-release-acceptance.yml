@@ -26,20 +26,54 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Resolve actual main prerelease
+      - name: Resolve published prerelease
         id: release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_RUN_SHA: ${{ github.event.workflow_run.head_sha || '' }}
         run: |
           set -euo pipefail
-          git fetch --no-tags origin main
+          git fetch --tags --force origin main
           main_sha="$(git rev-parse origin/main)"
-          tag="mvp-rc-${main_sha:0:12}"
+
+          if [[ "$EVENT_NAME" == "workflow_run" ]]; then
+            release_sha="$WORKFLOW_RUN_SHA"
+            test -n "$release_sha"
+            test "$release_sha" = "$main_sha"
+            tag="mvp-rc-${release_sha:0:12}"
+          else
+            # A PR may run after a main-only CI/harness commit that deliberately
+            # does not republish the immutable user payload. In that case test
+            # the newest real prerelease whose target is still an ancestor of
+            # current main. After a release-impacting merge, the workflow_run
+            # path below requires the new exact-main prerelease instead.
+            tag=""
+            release_sha=""
+            while IFS= read -r candidate; do
+              [[ -n "$candidate" ]] || continue
+              candidate_sha="$(git rev-list -n1 "$candidate")"
+              if git merge-base --is-ancestor "$candidate_sha" origin/main; then
+                if gh release view "$candidate" --repo "$GITHUB_REPOSITORY" --json isPrerelease >/dev/null 2>&1; then
+                  prerelease="$(gh release view "$candidate" --repo "$GITHUB_REPOSITORY" --json isPrerelease --jq '.isPrerelease')"
+                  if [[ "$prerelease" == "true" ]]; then
+                    tag="$candidate"
+                    release_sha="$candidate_sha"
+                    break
+                  fi
+                fi
+              fi
+            done < <(git tag --merged origin/main --list 'mvp-rc-*' --sort=-creatordate)
+            test -n "$tag"
+            test -n "$release_sha"
+          fi
+
           echo "main_sha=$main_sha" >> "$GITHUB_OUTPUT"
+          echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           gh release view "$tag" --repo "$GITHUB_REPOSITORY" --json tagName,isPrerelease,targetCommitish,publishedAt > "$RUNNER_TEMP/release.json"
-          python3 - "$RUNNER_TEMP/release.json" "$tag" "$main_sha" <<'PY'
+          python3 - "$RUNNER_TEMP/release.json" "$tag" "$release_sha" <<'PY'
           import json, sys
           p=json.load(open(sys.argv[1], encoding='utf-8'))
           assert p['tagName'] == sys.argv[2], p
@@ -47,13 +81,14 @@ jobs:
           assert p['targetCommitish'] == sys.argv[3], p
           assert p.get('publishedAt'), p
           PY
+          git merge-base --is-ancestor "$release_sha" origin/main
 
       - name: Download immutable prerelease assets
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ steps.release.outputs.tag }}
-          MAIN_SHA: ${{ steps.release.outputs.main_sha }}
+          RELEASE_SHA: ${{ steps.release.outputs.release_sha }}
         run: |
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/published-release"
@@ -62,17 +97,16 @@ jobs:
           test -f SHA256SUMS
           test -f install-metadata.json
           test -f bootstrap.sh
-          test -f "genos-mvp-${MAIN_SHA}.tar.gz"
+          test -f "genos-mvp-${RELEASE_SHA}.tar.gz"
 
-          # Compatibility verification for the already-published RC whose
-          # checksum file used build-time `dist/` paths. The packaging fix in
-          # this PR makes future releases use portable basenames.
+          # Compatibility verification for already-published RCs whose checksum
+          # file used build-time dist/ paths. Future packages use basenames.
           mkdir -p dist
-          ln -sfn "../genos-mvp-${MAIN_SHA}.tar.gz" "dist/genos-mvp-${MAIN_SHA}.tar.gz"
+          ln -sfn "../genos-mvp-${RELEASE_SHA}.tar.gz" "dist/genos-mvp-${RELEASE_SHA}.tar.gz"
           ln -sfn ../bootstrap.sh dist/bootstrap.sh
           sha256sum --check SHA256SUMS
 
-          python3 - "$MAIN_SHA" <<'PY'
+          python3 - "$RELEASE_SHA" <<'PY'
           import json, sys
           p=json.load(open('install-metadata.json', encoding='utf-8'))
           assert p['git_sha'] == sys.argv[1], p
@@ -96,7 +130,7 @@ jobs:
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: mvp11-published-release-${{ steps.release.outputs.main_sha }}
+          name: mvp11-published-release-${{ steps.release.outputs.release_sha }}
           path: ${{ runner.temp }}/genos-published-release-e2e/published-release-evidence.json
           if-no-files-found: error
           retention-days: 30
