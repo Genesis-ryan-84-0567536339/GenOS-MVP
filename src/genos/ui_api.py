@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 import os
 
 from .agent_library import AgentLibraryError, AgentLibraryService
+from .agent_secure_runtime import SecureTmuxController
 from .agent_tasks import AgentTaskService
 from .product_api import ProductAPIHandler
 from .report_history import ReportHistoryStore
@@ -13,7 +13,8 @@ from .state import JsonStateStore
 
 _AGENT_BASE = "/api/v1/agents/agy-gen"
 _AGENT_TASKS = f"{_AGENT_BASE}/tasks"
-_LIBRARY = "/api/v1/library"
+_AGENT_RUNTIME_RESTART = f"{_AGENT_BASE}/runtime/restart"
+_LIBRARY = f"{_AGENT_BASE}/library"
 _LIBRARY_REVISIONS = f"{_LIBRARY}/revisions"
 _LIBRARY_ACTIVATE = f"{_LIBRARY}/activate"
 _LIBRARY_DISABLE = f"{_LIBRARY}/disable"
@@ -22,11 +23,11 @@ _REPORT_HISTORY = "/api/v1/reports/history"
 
 
 class MissionProductAPIHandler(ProductAPIHandler):
-    """MVP-09 Owner-authenticated UI read/write routes.
+    """MVP-09 Owner-authenticated Mission Control routes.
 
-    The routes are projections over existing Product/Agent authorities only:
+    These endpoints are projections/actions over existing Product authorities:
     AgentRuntimeStore, JsonStateStore and ReportHistoryStore. They do not create
-    a second task queue, report authority or memory/skill registry.
+    another queue, report authority, library registry or shell surface.
     """
 
     def do_GET(self) -> None:  # noqa: N802
@@ -37,8 +38,10 @@ class MissionProductAPIHandler(ProductAPIHandler):
                 self._json(
                     200,
                     {
-                        "agent": tasks.current(),
-                        "auth": self.app.agent_auth.status(),
+                        "agent": {
+                            "status": tasks.current(),
+                            "auth": self.app.agent_auth.status(),
+                        }
                     },
                 )
                 return
@@ -56,7 +59,9 @@ class MissionProductAPIHandler(ProductAPIHandler):
                 return
             if self.path == _REPORT_HISTORY:
                 self.app.auth.authenticate(self._bearer_token())
-                self._json(200, {"history": ReportHistoryStore(self._state_root()).list_history(limit=200)})
+                store = ReportHistoryStore(self._state_root())
+                rows = store.list_history(limit=200)
+                self._json(200, {"reports": rows, "latest": store.latest()})
                 return
             super().do_GET()
         except (ValueError, AgentLibraryError) as exc:
@@ -73,6 +78,21 @@ class MissionProductAPIHandler(ProductAPIHandler):
                 if not isinstance(prompt, str):
                     raise ValueError("prompt must be a string")
                 self._json(202, {"task": AgentTaskService(self.app.agent_store).submit(prompt)})
+                return
+            if self.path == _AGENT_RUNTIME_RESTART:
+                self.app.auth.authenticate(self._bearer_token())
+                self._reject_nonempty_body()
+                SecureTmuxController(self.app.agent_store).restart_worker_session()
+                self._json(
+                    200,
+                    {
+                        "runtime": {
+                            "state": "RESTARTED",
+                            "agent_id": "agy-gen",
+                            "identity_preserved": True,
+                        }
+                    },
+                )
                 return
             if self.path == _LIBRARY_REVISIONS:
                 self.app.auth.authenticate(self._bearer_token())
