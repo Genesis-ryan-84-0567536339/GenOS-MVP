@@ -7,6 +7,7 @@ on:
       - 'INSTALL.md'
       - 'scripts/bootstrap.sh'
       - 'src/**'
+      - 'tests/**'
       - 'pyproject.toml'
   push:
     branches: [main]
@@ -15,6 +16,7 @@ on:
       - 'INSTALL.md'
       - 'scripts/bootstrap.sh'
       - 'src/**'
+      - 'tests/**'
       - 'pyproject.toml'
 
 permissions:
@@ -41,32 +43,72 @@ jobs:
 
       - name: Build verified install bundle
         shell: bash
+        env:
+          GOOGLE_DRIVE_OAUTH_CLIENT_ID: ${{ secrets.GENOS_GOOGLE_DRIVE_OAUTH_CLIENT_ID }}
+          GOOGLE_DRIVE_OAUTH_CLIENT_SECRET: ${{ secrets.GENOS_GOOGLE_DRIVE_OAUTH_CLIENT_SECRET }}
         run: |
           set -euo pipefail
           mkdir -p dist
-          archive="dist/genos-mvp-${TARGET_SHA}.tar.gz"
-          git archive --format=tar.gz --output="$archive" HEAD
+          raw_archive="dist/genos-mvp-${TARGET_SHA}.tar"
+          archive="${raw_archive}.gz"
+          git archive --format=tar --output="$raw_archive" HEAD
+
+          oauth_state="NOT_CONFIGURED_PR_BUILD"
+          if [[ "${GITHUB_EVENT_NAME}" == "push" && "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            if [[ -z "${GOOGLE_DRIVE_OAUTH_CLIENT_ID}" || -z "${GOOGLE_DRIVE_OAUTH_CLIENT_SECRET}" ]]; then
+              echo "::error::Publisher-owned Google Drive OAuth application identity is missing. Refusing to publish a user release that would require per-user technical OAuth setup."
+              exit 1
+            fi
+            generated="$(mktemp -d)"
+            mkdir -p "$generated/distribution"
+            python3 - "$generated/distribution/google-drive-oauth.json" <<'PY'
+          from pathlib import Path
+          import json, os, sys
+
+          output = Path(sys.argv[1])
+          payload = {
+              "schema_version": "1.0",
+              "provider": "google-drive",
+              "flow": "limited-input-device",
+              "client_id": os.environ["GOOGLE_DRIVE_OAUTH_CLIENT_ID"],
+              "client_secret": os.environ["GOOGLE_DRIVE_OAUTH_CLIENT_SECRET"],
+          }
+          for key in ("client_id", "client_secret"):
+              value = payload[key]
+              if not isinstance(value, str) or not value.strip() or len(value) > 4096 or any(ch in value for ch in "\r\n\x00"):
+                  raise SystemExit(f"invalid publisher OAuth {key}")
+          output.write_text(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+          PY
+            tar --append --file="$raw_archive" -C "$generated" distribution/google-drive-oauth.json
+            rm -rf "$generated"
+            oauth_state="CONFIGURED"
+          fi
+
+          gzip -n "$raw_archive"
           cp scripts/bootstrap.sh dist/bootstrap.sh
           chmod 755 dist/bootstrap.sh
           (
             cd dist
             sha256sum "genos-mvp-${TARGET_SHA}.tar.gz" bootstrap.sh > SHA256SUMS
           )
-          python3 - "$archive" <<'PY'
+          python3 - "$archive" "$oauth_state" <<'PY'
           from pathlib import Path, PurePosixPath
-          import sys, tarfile
+          import json, sys, tarfile
+
           archive = Path(sys.argv[1])
+          oauth_state = sys.argv[2]
           with tarfile.open(archive, 'r:gz') as tf:
               members = tf.getmembers()
               names = {member.name for member in members}
               assert 'src/genos/__init__.py' in names
+              assert ('distribution/google-drive-oauth.json' in names) == (oauth_state == 'CONFIGURED')
               for member in members:
                   name = PurePosixPath(member.name)
                   assert not name.is_absolute() and '..' not in name.parts
                   assert not member.issym() and not member.islnk() and not member.isdev()
                   assert member.isdir() or member.isfile()
           PY
-          python3 - <<'PY'
+          OAUTH_STATE="$oauth_state" python3 - <<'PY'
           import hashlib, json, os
           from pathlib import Path
           sha = os.environ['TARGET_SHA']
@@ -75,7 +117,7 @@ jobs:
           digest = hashlib.sha256(archive.read_bytes()).hexdigest()
           bootstrap_digest = hashlib.sha256(bootstrap.read_bytes()).hexdigest()
           metadata = {
-              'schema_version': '1.0',
+              'schema_version': '1.1',
               'git_sha': sha,
               'archive': archive.name,
               'sha256': digest,
@@ -83,6 +125,7 @@ jobs:
               'bootstrap_sha256': bootstrap_digest,
               'certified_target': 'ubuntu-24.04-amd64-native',
               'release_state': 'RELEASE_CANDIDATE',
+              'google_drive_oauth_distribution_state': os.environ['OAUTH_STATE'],
           }
           Path('dist/install-metadata.json').write_text(json.dumps(metadata, indent=2, sort_keys=True) + '\n', encoding='utf-8')
           PY
@@ -125,6 +168,13 @@ jobs:
             cd dist
             sha256sum --check SHA256SUMS
           )
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          metadata = json.loads(Path('dist/install-metadata.json').read_text(encoding='utf-8'))
+          if metadata.get('google_drive_oauth_distribution_state') != 'CONFIGURED':
+              raise SystemExit('refusing to publish user prerelease without distribution Google Drive OAuth identity')
+          PY
           if gh release view "$tag" >/dev/null 2>&1; then
             gh release upload "$tag" dist/* --clobber
           else
@@ -132,5 +182,5 @@ jobs:
               --target "$GITHUB_SHA" \
               --prerelease \
               --title "GenOS MVP Release Candidate ${short}" \
-              --notes "Verified GenOS MVP release candidate for Ubuntu Server 24.04 LTS amd64 native. Download SHA256SUMS, install-metadata.json, the matching tar.gz and bootstrap.sh; verify both the archive and bootstrap checksums before installation. External Owner/Google/MCP authorization remains user-driven during final runtime acceptance."
+              --notes "Verified GenOS MVP release candidate for Ubuntu Server 24.04 LTS amd64 native. Download SHA256SUMS, install-metadata.json, the matching tar.gz and bootstrap.sh; verify both the archive and bootstrap checksums before installation. Google Drive uses the GenOS distribution OAuth application identity; each user only authorizes their own Google account through Mission Control. External Owner/Google/MCP authorization remains user-driven during final runtime acceptance."
           fi
