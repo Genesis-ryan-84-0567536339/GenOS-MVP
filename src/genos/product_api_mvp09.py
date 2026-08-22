@@ -21,6 +21,7 @@ _AGENT_LIBRARY_REVISIONS = f"{_AGENT_LIBRARY}/revisions"
 _AGENT_LIBRARY_ACTIVATE = f"{_AGENT_LIBRARY}/activate"
 _AGENT_LIBRARY_DISABLE = f"{_AGENT_LIBRARY}/disable"
 _AGENT_RUNTIME_RESTART = f"{_AGENT_BASE}/runtime/restart"
+_DRIVE_OAUTH = "/api/v1/drive/oauth"
 _JOBS = "/api/v1/jobs"
 _REPORT_HISTORY = "/api/v1/reports/history"
 _MCP_PRINCIPAL_PREFIX = "/api/v1/mcp/principals/"
@@ -71,6 +72,19 @@ class MVP09ProductAPIHandler(ProductAPIHandler):
                         "reports": history.list_history(limit=50),
                     },
                 )
+                return
+            if self.path == _DRIVE_OAUTH:
+                self.app.auth.authenticate(self._bearer_token())
+                oauth = dict(self.app.drive_oauth_status())
+                # The backend canonical name is verification_url. MVP-09's
+                # approved browser contract originally consumed verification_uri.
+                # Project both aliases to the same sanitized HTTPS URL so old and
+                # new Mission Control assets remain compatible during update.
+                verification_url = oauth.get("verification_url") or oauth.get("verification_uri")
+                if isinstance(verification_url, str) and verification_url:
+                    oauth["verification_url"] = verification_url
+                    oauth["verification_uri"] = verification_url
+                self._json(200, {"oauth": oauth})
                 return
             super().do_GET()
         except Exception as exc:
