@@ -32,6 +32,8 @@ Normal first-run UX:
 5. MCP Hub tự có một endpoint loopback bền vững; tạo Agent principal/token một lần và cấp scope ngay trong Console;
 6. upstream MCP như GitHub/Google Drive được đăng ký tập trung trong Hub, Agent chỉ cần endpoint/token GenOS.
 
+MCP Hub **không hard-code một port cố định**: installer chọn một port loopback không xung đột trong managed range, lưu tại `/etc/genos/mcp-port` và giữ nguyên qua restart/reboot/update/restore. Endpoint chính xác luôn xem trong **Connections & Credentials → Unified MCP Hub**; Agent ngoài chỉ cấu hình endpoint + one-time GenOS token ở đó, không cần cài credential/upstream MCP riêng trên từng Agent.
+
 ## Lifecycle
 
 Các mutation cuối đều là typed command, không nhận arbitrary shell:
